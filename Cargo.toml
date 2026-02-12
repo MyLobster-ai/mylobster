@@ -1,0 +1,112 @@
+[package]
+name = "mylobster"
+version = "2026.2.10"
+edition = "2021"
+description = "Multi-channel AI gateway with extensible messaging integrations"
+license = "MIT"
+rust-version = "1.75"
+
+[[bin]]
+name = "mylobster"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+async-trait = "0.1"
+
+# Web framework
+axum = { version = "0.8", features = ["ws", "multipart", "json"] }
+axum-extra = { version = "0.10", features = ["typed-header"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+json5 = "0.4"
+toml = "0.8"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "stream", "multipart", "rustls-tls"], default-features = false }
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled", "vtab"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.25"
+
+# Authentication
+jsonwebtoken = "9"
+bcrypt = "0.16"
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Configuration
+dotenvy = "0.15"
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+url = { version = "2", features = ["serde"] }
+base64 = "0.22"
+hex = "0.4"
+rand = "0.8"
+regex = "1"
+thiserror = "2"
+anyhow = "1"
+once_cell = "1"
+dashmap = "6"
+parking_lot = "0.12"
+bytes = "1"
+mime = "0.3"
+tempfile = "3"
+
+# Channels - Telegram
+teloxide = { version = "0.13", features = ["macros"] }
+
+# Channels - Discord
+serenity = { version = "0.12", features = ["gateway", "model", "cache"] }
+
+# Channels - Slack
+slack-morphism = { version = "2", features = ["hyper"] }
+
+# WebSocket client
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+
+# Browser automation
+chromiumoxide = { version = "0.7", features = ["tokio-runtime"], default-features = false }
+
+# Markdown
+pulldown-cmark = "0.12"
+
+# Image processing
+image = "0.25"
+
+# Embeddings / Vector search
+ndarray = "0.16"
+
+# Cron
+cron = "0.13"
+
+# Process management
+nix = { version = "0.29", features = ["signal", "process"] }
+portable-pty = "0.8"
+dirs = "6.0.0"
+
+[dev-dependencies]
+tokio-test = "0.4"
+wiremock = "0.6"
+pretty_assertions = "1"
