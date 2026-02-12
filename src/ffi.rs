@@ -44,7 +44,8 @@ thread_local! {
 }
 
 fn set_last_error(msg: &str) {
-    let c = CString::new(msg).unwrap_or_else(|_| CString::new("(error contained null byte)").unwrap());
+    let c =
+        CString::new(msg).unwrap_or_else(|_| CString::new("(error contained null byte)").unwrap());
     LAST_ERROR.with(|cell| {
         *cell.borrow_mut() = Some(c);
     });
@@ -355,9 +356,7 @@ pub unsafe extern "C" fn mylobster_gateway_shutdown(
 /// # Safety
 /// `gateway` must be a valid pointer.
 #[no_mangle]
-pub unsafe extern "C" fn mylobster_gateway_addr(
-    gateway: *const MyLobsterGateway,
-) -> *mut c_char {
+pub unsafe extern "C" fn mylobster_gateway_addr(gateway: *const MyLobsterGateway) -> *mut c_char {
     if gateway.is_null() {
         set_last_error("gateway pointer is null");
         return std::ptr::null_mut();
@@ -523,7 +522,12 @@ pub unsafe extern "C" fn mylobster_channel_send(
         }
     };
 
-    match rt.block_on(crate::channels::send_message(cfg, channel_str, to_str, msg_str)) {
+    match rt.block_on(crate::channels::send_message(
+        cfg,
+        channel_str,
+        to_str,
+        msg_str,
+    )) {
         Ok(()) => MyLobsterStatus::Ok,
         Err(e) => {
             set_last_error(&format!("channel send error: {e}"));
@@ -603,9 +607,8 @@ pub unsafe extern "C" fn mylobster_chat_completion(
 pub extern "C" fn mylobster_version() -> *const c_char {
     // The trailing \0 is included by the concat! + c"..." syntax in older
     // Rust. For maximum compatibility we use a static byte array.
-    static VERSION: once_cell::sync::Lazy<CString> = once_cell::sync::Lazy::new(|| {
-        CString::new(env!("CARGO_PKG_VERSION")).unwrap()
-    });
+    static VERSION: once_cell::sync::Lazy<CString> =
+        once_cell::sync::Lazy::new(|| CString::new(env!("CARGO_PKG_VERSION")).unwrap());
     VERSION.as_ptr()
 }
 
