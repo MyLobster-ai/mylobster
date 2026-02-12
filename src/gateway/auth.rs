@@ -76,9 +76,7 @@ pub fn resolve_gateway_auth(
     let config = auth_config.cloned().unwrap_or_default();
 
     // Token from env overrides config
-    let token = env_token
-        .map(String::from)
-        .or(config.token);
+    let token = env_token.map(String::from).or(config.token);
 
     let password = config.password;
 
@@ -101,7 +99,10 @@ pub fn assert_gateway_auth_configured(auth: &ResolvedGatewayAuth) -> Result<(), 
     match auth.mode {
         GatewayAuthMode::Token => {
             if auth.token.is_none() {
-                return Err("Token auth mode requires MYLOBSTER_GATEWAY_TOKEN or gateway.auth.token".to_string());
+                return Err(
+                    "Token auth mode requires MYLOBSTER_GATEWAY_TOKEN or gateway.auth.token"
+                        .to_string(),
+                );
             }
         }
         GatewayAuthMode::Password => {

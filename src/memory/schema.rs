@@ -76,9 +76,7 @@ fn migrate_v1(conn: &Connection) -> Result<()> {
     )?;
 
     // Index for efficient file-based lookups and joins.
-    conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id);",
-    )?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id);")?;
 
     // ------------------------------------------------------------------
     // embedding_cache — caches raw embedding vectors keyed by content

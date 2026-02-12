@@ -86,9 +86,7 @@ async fn ws_handler(
 // Sessions
 // ============================================================================
 
-async fn sessions_list_handler(
-    State(state): State<GatewayState>,
-) -> Json<Vec<SessionInfo>> {
+async fn sessions_list_handler(State(state): State<GatewayState>) -> Json<Vec<SessionInfo>> {
     let sessions = state.sessions.list_sessions();
     Json(sessions)
 }
@@ -170,9 +168,7 @@ async fn memory_search_handler(
 // Channels
 // ============================================================================
 
-async fn channels_status_handler(
-    State(state): State<GatewayState>,
-) -> Json<serde_json::Value> {
+async fn channels_status_handler(State(state): State<GatewayState>) -> Json<serde_json::Value> {
     let status = state.channels.get_status().await;
     Json(status)
 }

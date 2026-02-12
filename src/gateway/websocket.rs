@@ -114,7 +114,10 @@ pub async fn handle_websocket(
                         handle_request(&state, &client_id, &tx, &seq, request).await;
                     }
                     Err(e) => {
-                        debug!("Failed to parse WebSocket message from {}: {}", client_id, e);
+                        debug!(
+                            "Failed to parse WebSocket message from {}: {}",
+                            client_id, e
+                        );
                         let error_response = ResponseFrame {
                             id: "parse-error".to_string(),
                             result: None,
@@ -356,17 +359,13 @@ async fn handle_sessions_delete(
     Ok(serde_json::json!({ "ok": true }))
 }
 
-async fn handle_tools_list(
-    state: &GatewayState,
-) -> Result<serde_json::Value, ProtocolError> {
+async fn handle_tools_list(state: &GatewayState) -> Result<serde_json::Value, ProtocolError> {
     let config = state.config.read().await;
     let tools = crate::agents::tools::list_available_tools(&config);
     Ok(serde_json::to_value(tools).unwrap())
 }
 
-async fn handle_channels_status(
-    state: &GatewayState,
-) -> Result<serde_json::Value, ProtocolError> {
+async fn handle_channels_status(state: &GatewayState) -> Result<serde_json::Value, ProtocolError> {
     let status = state.channels.get_status().await;
     Ok(status)
 }
@@ -406,9 +405,7 @@ async fn handle_memory_search(
     }
 }
 
-async fn handle_gateway_info(
-    state: &GatewayState,
-) -> Result<serde_json::Value, ProtocolError> {
+async fn handle_gateway_info(state: &GatewayState) -> Result<serde_json::Value, ProtocolError> {
     let uptime = state.start_time.elapsed().as_secs();
     Ok(serde_json::json!({
         "version": state.version,
@@ -418,9 +415,7 @@ async fn handle_gateway_info(
     }))
 }
 
-async fn handle_config_reload(
-    state: &GatewayState,
-) -> Result<serde_json::Value, ProtocolError> {
+async fn handle_config_reload(state: &GatewayState) -> Result<serde_json::Value, ProtocolError> {
     info!("Config reload requested");
     // TODO: Implement hot-reload
     Ok(serde_json::json!({ "ok": true }))
@@ -434,9 +429,7 @@ async fn handle_presence_set(
     Ok(serde_json::json!({ "ok": true }))
 }
 
-async fn handle_cron_list(
-    state: &GatewayState,
-) -> Result<serde_json::Value, ProtocolError> {
+async fn handle_cron_list(state: &GatewayState) -> Result<serde_json::Value, ProtocolError> {
     let jobs = crate::cron::list_jobs();
     Ok(serde_json::to_value(jobs).unwrap())
 }

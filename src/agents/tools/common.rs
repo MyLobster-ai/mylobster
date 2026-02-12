@@ -55,7 +55,9 @@ pub fn read_string_array_param(params: &Value, key: &str) -> Option<Vec<String>>
 }
 
 /// Create an action gate for conditional tool execution.
-pub fn create_action_gate(actions: &Option<HashMap<String, bool>>) -> impl Fn(&str, bool) -> bool + '_ {
+pub fn create_action_gate(
+    actions: &Option<HashMap<String, bool>>,
+) -> impl Fn(&str, bool) -> bool + '_ {
     move |key: &str, default: bool| -> bool {
         actions
             .as_ref()

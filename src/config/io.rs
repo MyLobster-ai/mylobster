@@ -1,6 +1,6 @@
-use std::path::Path;
 use anyhow::Result;
 use serde_json;
+use std::path::Path;
 
 /// Parse a JSON5 configuration string.
 pub fn parse_config_json5(content: &str) -> Result<serde_json::Value> {

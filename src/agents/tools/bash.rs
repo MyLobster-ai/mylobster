@@ -29,7 +29,11 @@ impl AgentTool for BashTool {
         }
     }
 
-    async fn execute(&self, params: serde_json::Value, context: &ToolContext) -> Result<ToolResult> {
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        context: &ToolContext,
+    ) -> Result<ToolResult> {
         let command = params
             .get("command")
             .and_then(|v| v.as_str())
@@ -48,7 +52,9 @@ impl AgentTool for BashTool {
             .unwrap_or("full");
 
         if security == "deny" {
-            return Ok(ToolResult::error("Shell execution is disabled by security policy"));
+            return Ok(ToolResult::error(
+                "Shell execution is disabled by security policy",
+            ));
         }
 
         debug!("Executing command: {}", command);

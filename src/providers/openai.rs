@@ -155,10 +155,9 @@ impl ModelProvider for OpenAiProvider {
         // Parse tool calls
         if let Some(tool_calls) = choice.message.tool_calls {
             for tc in tool_calls {
-                if let (Some(id), Some(function)) = (
-                    tc.get("id").and_then(|v| v.as_str()),
-                    tc.get("function"),
-                ) {
+                if let (Some(id), Some(function)) =
+                    (tc.get("id").and_then(|v| v.as_str()), tc.get("function"))
+                {
                     let name = function
                         .get("name")
                         .and_then(|v| v.as_str())
@@ -168,10 +167,8 @@ impl ModelProvider for OpenAiProvider {
                         .get("arguments")
                         .and_then(|v| v.as_str())
                         .unwrap_or("{}");
-                    let input: serde_json::Value =
-                        serde_json::from_str(arguments).unwrap_or(serde_json::Value::Object(
-                            serde_json::Map::new(),
-                        ));
+                    let input: serde_json::Value = serde_json::from_str(arguments)
+                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
                     content.push(ContentBlock::ToolUse {
                         id: id.to_string(),
                         name,
@@ -238,7 +235,9 @@ impl ModelProvider for OpenAiProvider {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(StreamEvent::Error(format!("Request failed: {}", e))).await;
+                    let _ = tx
+                        .send(StreamEvent::Error(format!("Request failed: {}", e)))
+                        .await;
                     return;
                 }
             };
@@ -259,7 +258,10 @@ impl ModelProvider for OpenAiProvider {
                 Ok(t) => t,
                 Err(e) => {
                     let _ = tx
-                        .send(StreamEvent::Error(format!("Failed to read response: {}", e)))
+                        .send(StreamEvent::Error(format!(
+                            "Failed to read response: {}",
+                            e
+                        )))
                         .await;
                     return;
                 }

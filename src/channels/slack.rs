@@ -19,10 +19,7 @@ impl SlackChannel {
         let sl = &config.channels.slack;
         let bot_token = sl.default_account.bot_token.clone();
         let app_token = sl.default_account.app_token.clone();
-        let enabled = sl
-            .default_account
-            .enabled
-            .unwrap_or(bot_token.is_some());
+        let enabled = sl.default_account.enabled.unwrap_or(bot_token.is_some());
 
         Self {
             enabled,

@@ -22,8 +22,12 @@ async fn main() -> anyhow::Result<()> {
         Commands::Agent(opts) => {
             info!("Running agent for single message");
             let config = Config::load(opts.config.as_deref())?;
-            mylobster::agents::run_single_message(&config, &opts.message, opts.session_key.as_deref())
-                .await?;
+            mylobster::agents::run_single_message(
+                &config,
+                &opts.message,
+                opts.session_key.as_deref(),
+            )
+            .await?;
         }
         Commands::Send(opts) => {
             info!("Sending message via channel");

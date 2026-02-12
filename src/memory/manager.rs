@@ -118,11 +118,7 @@ impl MemoryIndexManager {
 
     /// Execute a hybrid search (BM25 full-text + vector similarity) and return
     /// results sorted by descending score.
-    pub async fn search(
-        &self,
-        query: &str,
-        opts: MemorySearchOptions,
-    ) -> Vec<MemorySearchResult> {
+    pub async fn search(&self, query: &str, opts: MemorySearchOptions) -> Vec<MemorySearchResult> {
         let _ = (query, opts);
         debug!(agent_id = %self.agent_id, "memory search (stub)");
         Vec::new()

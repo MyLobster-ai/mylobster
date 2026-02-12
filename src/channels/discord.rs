@@ -17,10 +17,7 @@ impl DiscordChannel {
     pub fn new(config: &Config) -> Self {
         let dc = &config.channels.discord;
         let bot_token = dc.default_account.token.clone();
-        let enabled = dc
-            .default_account
-            .enabled
-            .unwrap_or(bot_token.is_some());
+        let enabled = dc.default_account.enabled.unwrap_or(bot_token.is_some());
 
         Self { enabled, bot_token }
     }

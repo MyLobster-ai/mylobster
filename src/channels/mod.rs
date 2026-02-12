@@ -36,24 +36,12 @@ mod send {
         message: &str,
     ) -> Result<()> {
         match channel {
-            "telegram" => {
-                super::telegram::send_message(config, to, message).await
-            }
-            "discord" => {
-                super::discord::send_message(config, to, message).await
-            }
-            "slack" => {
-                super::slack::send_message(config, to, message).await
-            }
-            "whatsapp" => {
-                super::whatsapp::send_message(config, to, message).await
-            }
-            "signal" => {
-                super::signal::send_message(config, to, message).await
-            }
-            "imessage" => {
-                super::imessage::send_message(config, to, message).await
-            }
+            "telegram" => super::telegram::send_message(config, to, message).await,
+            "discord" => super::discord::send_message(config, to, message).await,
+            "slack" => super::slack::send_message(config, to, message).await,
+            "whatsapp" => super::whatsapp::send_message(config, to, message).await,
+            "signal" => super::signal::send_message(config, to, message).await,
+            "imessage" => super::imessage::send_message(config, to, message).await,
             other => bail!("unknown channel: {other}"),
         }
     }

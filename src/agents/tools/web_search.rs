@@ -42,7 +42,11 @@ impl AgentTool for WebSearchTool {
         }
     }
 
-    async fn execute(&self, params: serde_json::Value, context: &ToolContext) -> Result<ToolResult> {
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        context: &ToolContext,
+    ) -> Result<ToolResult> {
         let query = params
             .get("query")
             .and_then(|v| v.as_str())
@@ -79,7 +83,10 @@ impl AgentTool for WebSearchTool {
 
         match provider {
             "brave" => search_brave(query, max_results, api_key).await,
-            _ => Ok(ToolResult::error(format!("Unknown search provider: {}", provider))),
+            _ => Ok(ToolResult::error(format!(
+                "Unknown search provider: {}",
+                provider
+            ))),
         }
     }
 }

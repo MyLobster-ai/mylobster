@@ -198,9 +198,7 @@ impl EmbeddingProvider for GeminiEmbeddingProvider {
             let body = GeminiEmbeddingRequest {
                 model: format!("models/{}", self.model),
                 content: GeminiContent {
-                    parts: vec![GeminiPart {
-                        text: text.clone(),
-                    }],
+                    parts: vec![GeminiPart { text: text.clone() }],
                 },
             };
 

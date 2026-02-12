@@ -59,10 +59,7 @@ pub fn normalise_scores(results: &mut [(i64, f64)]) {
         return;
     }
 
-    let min = results
-        .iter()
-        .map(|r| r.1)
-        .fold(f64::INFINITY, f64::min);
+    let min = results.iter().map(|r| r.1).fold(f64::INFINITY, f64::min);
     let max = results
         .iter()
         .map(|r| r.1)

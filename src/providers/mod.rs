@@ -1,7 +1,7 @@
 mod anthropic;
-mod openai;
-mod gemini;
 mod bedrock;
+mod gemini;
+mod openai;
 
 use crate::config::Config;
 use crate::gateway::TokenUsage;
@@ -120,7 +120,9 @@ pub fn resolve_provider(config: &Config, model: &str) -> Result<Box<dyn ModelPro
                 .unwrap_or_else(|| "https://api.anthropic.com".to_string());
 
             Ok(Box::new(anthropic::AnthropicProvider::new(
-                api_key, base_url, model.to_string(),
+                api_key,
+                base_url,
+                model.to_string(),
             )))
         }
         "openai" => {
@@ -140,7 +142,9 @@ pub fn resolve_provider(config: &Config, model: &str) -> Result<Box<dyn ModelPro
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
 
             Ok(Box::new(openai::OpenAiProvider::new(
-                api_key, base_url, model.to_string(),
+                api_key,
+                base_url,
+                model.to_string(),
             )))
         }
         "google" => {
@@ -152,7 +156,10 @@ pub fn resolve_provider(config: &Config, model: &str) -> Result<Box<dyn ModelPro
                 .or_else(|| std::env::var("GOOGLE_API_KEY").ok())
                 .ok_or_else(|| anyhow::anyhow!("No Google API key configured"))?;
 
-            Ok(Box::new(gemini::GeminiProvider::new(api_key, model.to_string())))
+            Ok(Box::new(gemini::GeminiProvider::new(
+                api_key,
+                model.to_string(),
+            )))
         }
         _ => anyhow::bail!("No provider found for model: {}", model),
     }
@@ -162,7 +169,11 @@ fn detect_provider(model: &str) -> &str {
     let lower = model.to_lowercase();
     if lower.contains("claude") || lower.starts_with("anthropic") {
         "anthropic"
-    } else if lower.starts_with("gpt") || lower.starts_with("o1") || lower.starts_with("o3") || lower.starts_with("o4") {
+    } else if lower.starts_with("gpt")
+        || lower.starts_with("o1")
+        || lower.starts_with("o3")
+        || lower.starts_with("o4")
+    {
         "openai"
     } else if lower.starts_with("gemini") {
         "google"

@@ -17,10 +17,7 @@ impl TelegramChannel {
     pub fn new(config: &Config) -> Self {
         let tg = &config.channels.telegram;
         let bot_token = tg.default_account.bot_token.clone();
-        let enabled = tg
-            .default_account
-            .enabled
-            .unwrap_or(bot_token.is_some());
+        let enabled = tg.default_account.enabled.unwrap_or(bot_token.is_some());
 
         Self { enabled, bot_token }
     }

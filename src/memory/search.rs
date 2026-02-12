@@ -65,11 +65,7 @@ pub enum SearchMode {
 /// Perform a BM25 full-text search against the `chunks_fts` table.
 ///
 /// Returns `(chunk_id, bm25_score)` pairs in descending score order.
-pub fn fts_search(
-    _conn: &rusqlite::Connection,
-    _query: &str,
-    _limit: u32,
-) -> Vec<(i64, f64)> {
+pub fn fts_search(_conn: &rusqlite::Connection, _query: &str, _limit: u32) -> Vec<(i64, f64)> {
     // TODO: execute FTS5 MATCH query and return ranked results.
     Vec::new()
 }

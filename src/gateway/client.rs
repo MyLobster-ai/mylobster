@@ -49,7 +49,8 @@ impl Default for GatewayClientOptions {
     }
 }
 
-type PendingMap = Arc<RwLock<HashMap<String, oneshot::Sender<Result<serde_json::Value, ProtocolError>>>>>;
+type PendingMap =
+    Arc<RwLock<HashMap<String, oneshot::Sender<Result<serde_json::Value, ProtocolError>>>>>;
 
 /// A client for connecting to the MyLobster gateway.
 pub struct GatewayClient {
@@ -129,12 +130,13 @@ impl GatewayClient {
                                     if let Some(sender) = pending.remove(id) {
                                         if let Some(error) = frame.get("error") {
                                             let proto_error: ProtocolError =
-                                                serde_json::from_value(error.clone())
-                                                    .unwrap_or(ProtocolError {
+                                                serde_json::from_value(error.clone()).unwrap_or(
+                                                    ProtocolError {
                                                         code: -1,
                                                         message: "Unknown error".to_string(),
                                                         data: None,
-                                                    });
+                                                    },
+                                                );
                                             let _ = sender.send(Err(proto_error));
                                         } else {
                                             let result = frame
@@ -183,7 +185,10 @@ impl GatewayClient {
         method: &str,
         params: Option<serde_json::Value>,
     ) -> Result<T> {
-        let tx = self.tx.as_ref().ok_or_else(|| anyhow::anyhow!("Not connected"))?;
+        let tx = self
+            .tx
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Not connected"))?;
 
         let id = Uuid::new_v4().to_string();
         let (resp_tx, resp_rx) = oneshot::channel();

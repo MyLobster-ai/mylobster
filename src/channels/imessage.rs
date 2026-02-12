@@ -18,11 +18,7 @@ pub struct IMessageChannel {
 
 impl IMessageChannel {
     pub fn new(config: &Config) -> Self {
-        let enabled = config
-            .channels
-            .imessage
-            .enabled
-            .unwrap_or(false);
+        let enabled = config.channels.imessage.enabled.unwrap_or(false);
 
         Self { enabled }
     }
@@ -75,7 +71,10 @@ impl ChannelPlugin for IMessageChannel {
     }
 
     async fn send_message(&self, to: &str, _message: &str) -> Result<()> {
-        info!(to = to, "iMessage: sending message (stub -- not implemented)");
+        info!(
+            to = to,
+            "iMessage: sending message (stub -- not implemented)"
+        );
         // TODO: Forward to iMessage bridge API.
         Ok(())
     }

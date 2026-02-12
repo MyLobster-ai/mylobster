@@ -126,10 +126,7 @@ pub async fn handle_responses_api(
         .unwrap_or("claude-opus-4")
         .to_string();
 
-    let input = req
-        .get("input")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
+    let input = req.get("input").cloned().unwrap_or(serde_json::Value::Null);
 
     let provider = crate::providers::resolve_provider(config, &model)?;
 
@@ -149,10 +146,7 @@ pub async fn handle_responses_api(
                     .and_then(|v| v.as_str())
                     .unwrap_or("user")
                     .to_string(),
-                content: m
-                    .get("content")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
+                content: m.get("content").cloned().unwrap_or(serde_json::Value::Null),
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,

@@ -84,23 +84,16 @@ struct AnthropicUsage {
 #[serde(tag = "type")]
 enum AnthropicSseEvent {
     #[serde(rename = "message_start")]
-    MessageStart {
-        message: Option<serde_json::Value>,
-    },
+    MessageStart { message: Option<serde_json::Value> },
     #[serde(rename = "content_block_start")]
     ContentBlockStart {
         index: u32,
         content_block: Option<serde_json::Value>,
     },
     #[serde(rename = "content_block_delta")]
-    ContentBlockDelta {
-        index: u32,
-        delta: AnthropicDelta,
-    },
+    ContentBlockDelta { index: u32, delta: AnthropicDelta },
     #[serde(rename = "content_block_stop")]
-    ContentBlockStop {
-        index: u32,
-    },
+    ContentBlockStop { index: u32 },
     #[serde(rename = "message_delta")]
     MessageDelta {
         delta: Option<serde_json::Value>,
@@ -111,9 +104,7 @@ enum AnthropicSseEvent {
     #[serde(rename = "ping")]
     Ping {},
     #[serde(rename = "error")]
-    Error {
-        error: Option<serde_json::Value>,
-    },
+    Error { error: Option<serde_json::Value> },
 }
 
 #[derive(Debug, Deserialize)]
@@ -237,7 +228,9 @@ impl ModelProvider for AnthropicProvider {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(StreamEvent::Error(format!("Request failed: {}", e))).await;
+                    let _ = tx
+                        .send(StreamEvent::Error(format!("Request failed: {}", e)))
+                        .await;
                     return;
                 }
             };
@@ -258,7 +251,10 @@ impl ModelProvider for AnthropicProvider {
                 Ok(t) => t,
                 Err(e) => {
                     let _ = tx
-                        .send(StreamEvent::Error(format!("Failed to read response: {}", e)))
+                        .send(StreamEvent::Error(format!(
+                            "Failed to read response: {}",
+                            e
+                        )))
                         .await;
                     return;
                 }

@@ -31,7 +31,11 @@ impl AgentTool for WebFetchTool {
         }
     }
 
-    async fn execute(&self, params: serde_json::Value, context: &ToolContext) -> Result<ToolResult> {
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        context: &ToolContext,
+    ) -> Result<ToolResult> {
         let url_str = params
             .get("url")
             .and_then(|v| v.as_str())
@@ -50,7 +54,9 @@ impl AgentTool for WebFetchTool {
         // SSRF protection
         let url = Url::parse(url_str)?;
         if is_ssrf_target(&url) {
-            return Ok(ToolResult::error("URL targets a private/internal address (SSRF protection)"));
+            return Ok(ToolResult::error(
+                "URL targets a private/internal address (SSRF protection)",
+            ));
         }
 
         let client = reqwest::Client::builder()
@@ -68,10 +74,9 @@ impl AgentTool for WebFetchTool {
             let mut header_map = HeaderMap::new();
             for (key, value) in headers {
                 if let Some(val_str) = value.as_str() {
-                    if let (Ok(name), Ok(val)) = (
-                        HeaderName::from_str(key),
-                        HeaderValue::from_str(val_str),
-                    ) {
+                    if let (Ok(name), Ok(val)) =
+                        (HeaderName::from_str(key), HeaderValue::from_str(val_str))
+                    {
                         header_map.insert(name, val);
                     }
                 }
@@ -97,7 +102,11 @@ impl AgentTool for WebFetchTool {
 
         // Truncate if needed
         let text = if body.len() > max_chars {
-            format!("{}... (truncated, {} chars total)", &body[..max_chars], body.len())
+            format!(
+                "{}... (truncated, {} chars total)",
+                &body[..max_chars],
+                body.len()
+            )
         } else {
             body
         };

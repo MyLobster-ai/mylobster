@@ -208,7 +208,12 @@ fn load_config_file(path: &Path) -> Result<Config> {
         Some("toml") => toml::from_str(&content)?,
         Some("json") | Some("json5") | _ => {
             // Try JSON5 first, then regular JSON
-            json5::from_str(&content).or_else(|_| serde_json::from_str(&content).map_err(|e| json5::Error::Message { msg: e.to_string(), location: None }))?
+            json5::from_str(&content).or_else(|_| {
+                serde_json::from_str(&content).map_err(|e| json5::Error::Message {
+                    msg: e.to_string(),
+                    location: None,
+                })
+            })?
         }
     };
 

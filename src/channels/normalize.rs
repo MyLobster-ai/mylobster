@@ -100,7 +100,7 @@ pub fn strip_markdown(text: &str) -> String {
                 chars.next(); // second `
                 if chars.peek() == Some(&'`') {
                     chars.next(); // third `
-                    // Skip until closing ```
+                                  // Skip until closing ```
                     let mut fence_count = 0;
                     for c in chars.by_ref() {
                         if c == '`' {

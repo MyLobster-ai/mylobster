@@ -1,6 +1,6 @@
 use crate::channels::ChannelManager;
-use crate::config::Config;
 use crate::cli::GatewayOpts;
+use crate::config::Config;
 use crate::gateway::auth::{resolve_gateway_auth, ResolvedGatewayAuth};
 use crate::gateway::routes;
 use crate::plugins::PluginRegistry;
@@ -42,10 +42,7 @@ impl GatewayServer {
 
         info!("Resolving gateway authentication");
         let env_token = std::env::var("MYLOBSTER_GATEWAY_TOKEN").ok();
-        let auth = resolve_gateway_auth(
-            Some(&config.gateway.auth),
-            env_token.as_deref(),
-        );
+        let auth = resolve_gateway_auth(Some(&config.gateway.auth), env_token.as_deref());
 
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
@@ -154,9 +151,11 @@ fn resolve_bind_address(config: &Config, bind_override: Option<&str>, port: u16)
     let host = match bind {
         crate::config::GatewayBindMode::Loopback => "127.0.0.1",
         crate::config::GatewayBindMode::Lan | crate::config::GatewayBindMode::Auto => "0.0.0.0",
-        crate::config::GatewayBindMode::Custom => {
-            config.gateway.custom_bind_host.as_deref().unwrap_or("0.0.0.0")
-        }
+        crate::config::GatewayBindMode::Custom => config
+            .gateway
+            .custom_bind_host
+            .as_deref()
+            .unwrap_or("0.0.0.0"),
         crate::config::GatewayBindMode::Tailnet => "100.64.0.0", // Tailscale CGNAT range
     };
 

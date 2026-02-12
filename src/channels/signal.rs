@@ -18,11 +18,7 @@ pub struct SignalChannel {
 
 impl SignalChannel {
     pub fn new(config: &Config) -> Self {
-        let enabled = config
-            .channels
-            .signal
-            .enabled
-            .unwrap_or(false);
+        let enabled = config.channels.signal.enabled.unwrap_or(false);
 
         Self { enabled }
     }
