@@ -14,3 +14,5 @@ pub mod plugins;
 pub mod providers;
 pub mod routing;
 pub mod sessions;
+
+pub mod ffi;
