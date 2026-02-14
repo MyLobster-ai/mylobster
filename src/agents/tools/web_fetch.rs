@@ -1,7 +1,6 @@
 use super::{AgentTool, ToolContext, ToolInfo, ToolResult};
 use anyhow::Result;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use std::collections::HashMap;
 use std::str::FromStr;
 use tracing::{debug, warn};
 use url::Url;
@@ -98,22 +97,50 @@ impl AgentTool for WebFetchTool {
             .unwrap_or("text/plain")
             .to_string();
 
+        // Log Cloudflare markdown token count if present
+        if let Some(md_tokens) = response
+            .headers()
+            .get("x-markdown-tokens")
+            .and_then(|v| v.to_str().ok())
+        {
+            debug!("Cloudflare x-markdown-tokens: {}", md_tokens);
+        }
+
         let body = response.text().await?;
 
+        // Process content based on content-type
+        let (text, extract_mode) = if content_type.contains("text/markdown") {
+            // Cloudflare Markdown for Agents — already pre-rendered markdown
+            (body, "markdown")
+        } else if content_type.contains("application/json") {
+            // Pretty-print JSON for readability
+            match serde_json::from_str::<serde_json::Value>(&body) {
+                Ok(parsed) => {
+                    let pretty =
+                        serde_json::to_string_pretty(&parsed).unwrap_or_else(|_| body.clone());
+                    (pretty, "json")
+                }
+                Err(_) => (body, "raw"),
+            }
+        } else {
+            (body, "raw")
+        };
+
         // Truncate if needed
-        let text = if body.len() > max_chars {
+        let text = if text.len() > max_chars {
             format!(
                 "{}... (truncated, {} chars total)",
-                &body[..max_chars],
-                body.len()
+                &text[..max_chars],
+                text.len()
             )
         } else {
-            body
+            text
         };
 
         Ok(ToolResult::json(serde_json::json!({
             "status": status.as_u16(),
             "contentType": content_type,
+            "extractMode": extract_mode,
             "text": text
         })))
     }
@@ -121,27 +148,29 @@ impl AgentTool for WebFetchTool {
 
 /// Check if a URL targets a private/internal address.
 fn is_ssrf_target(url: &Url) -> bool {
+    // Block non-HTTP schemes
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return true;
+    }
+
     if let Some(host) = url.host_str() {
-        // Block localhost
+        // Block localhost variants
         if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]" {
+            return true;
+        }
+
+        // Block .localhost suffix (e.g. foo.localhost)
+        let lower = host.to_lowercase();
+        if lower.ends_with(".localhost") {
             return true;
         }
 
         // Block private IP ranges
         if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-            return match ip {
-                std::net::IpAddr::V4(v4) => {
-                    v4.is_private()
-                        || v4.is_loopback()
-                        || v4.is_link_local()
-                        || v4.octets()[0] == 169 && v4.octets()[1] == 254
-                }
-                std::net::IpAddr::V6(v6) => v6.is_loopback(),
-            };
+            return is_private_ip(ip);
         }
 
         // Block common internal hostnames
-        let lower = host.to_lowercase();
         if lower.ends_with(".internal")
             || lower.ends_with(".local")
             || lower.ends_with(".svc.cluster.local")
@@ -156,10 +185,65 @@ fn is_ssrf_target(url: &Url) -> bool {
         }
     }
 
-    // Block non-HTTP schemes
-    if url.scheme() != "http" && url.scheme() != "https" {
-        return true;
-    }
-
     false
+}
+
+/// Check if an IP address is private/internal.
+fn is_private_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                // Link-local / APIPA (169.254.0.0/16)
+                || (octets[0] == 169 && octets[1] == 254)
+                // Carrier-grade NAT (100.64.0.0/10)
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        }
+        std::net::IpAddr::V6(v6) => {
+            let segments = v6.segments();
+
+            // Loopback (::1)
+            if v6.is_loopback() {
+                return true;
+            }
+
+            // Unspecified (::)
+            if v6.is_unspecified() {
+                return true;
+            }
+
+            // Unique local addresses (fc00::/7 — segments[0] starts with 0xfc or 0xfd)
+            if (segments[0] & 0xfe00) == 0xfc00 {
+                return true;
+            }
+
+            // Link-local (fe80::/10)
+            if (segments[0] & 0xffc0) == 0xfe80 {
+                return true;
+            }
+
+            // Deprecated site-local (fec0::/10)
+            if (segments[0] & 0xffc0) == 0xfec0 {
+                return true;
+            }
+
+            // AWS IMDSv2 IPv6 (fd00:ec2::254)
+            if segments[0] == 0xfd00
+                && segments[1] == 0x0ec2
+                && segments[2..7] == [0, 0, 0, 0, 0]
+                && segments[7] == 0x0254
+            {
+                return true;
+            }
+
+            // IPv4-mapped IPv6 (::ffff:x.x.x.x) — apply IPv4 rules
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_private_ip(std::net::IpAddr::V4(mapped));
+            }
+
+            false
+        }
+    }
 }

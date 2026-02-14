@@ -678,6 +678,7 @@ pub enum ModelApi {
     GoogleGenerativeAi,
     GithubCopilot,
     BedrockConverseStream,
+    Ollama,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -780,6 +781,36 @@ impl ModelsConfig {
                 api_key: Some(key.to_string()),
                 auth: None,
                 api: Some(ModelApi::OpenaiCompletions),
+                headers: None,
+                auth_header: None,
+                models: vec![],
+            });
+    }
+
+    pub fn apply_groq_key(&mut self, key: &str) {
+        self.providers
+            .entry("groq".to_string())
+            .and_modify(|p| p.api_key = Some(key.to_string()))
+            .or_insert_with(|| ModelProviderConfig {
+                base_url: "https://api.groq.com/openai/v1".to_string(),
+                api_key: Some(key.to_string()),
+                auth: None,
+                api: Some(ModelApi::OpenaiCompletions),
+                headers: None,
+                auth_header: None,
+                models: vec![],
+            });
+    }
+
+    pub fn apply_ollama_key(&mut self, key: &str) {
+        self.providers
+            .entry("ollama".to_string())
+            .and_modify(|p| p.api_key = Some(key.to_string()))
+            .or_insert_with(|| ModelProviderConfig {
+                base_url: "http://127.0.0.1:11434".to_string(),
+                api_key: Some(key.to_string()),
+                auth: None,
+                api: Some(ModelApi::Ollama),
                 headers: None,
                 auth_header: None,
                 models: vec![],
@@ -1557,6 +1588,24 @@ pub struct WebSearchConfig {
     pub max_results: Option<u32>,
     pub timeout_seconds: Option<u64>,
     pub cache_ttl_minutes: Option<u64>,
+    pub perplexity: Option<PerplexitySearchConfig>,
+    pub grok: Option<GrokSearchConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PerplexitySearchConfig {
+    pub api_key: Option<String>,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GrokSearchConfig {
+    pub api_key: Option<String>,
+    pub model: Option<String>,
+    pub inline_citations: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

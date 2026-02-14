@@ -5,14 +5,14 @@ use async_trait::async_trait;
 use reqwest::Client;
 use tokio::sync::mpsc;
 
-pub struct OpenAiProvider {
+pub struct GroqProvider {
     api_key: String,
     base_url: String,
     model: String,
     client: Client,
 }
 
-impl OpenAiProvider {
+impl GroqProvider {
     pub fn new(api_key: String, base_url: String, model: String) -> Self {
         Self {
             api_key,
@@ -24,16 +24,30 @@ impl OpenAiProvider {
 }
 
 #[async_trait]
-impl ModelProvider for OpenAiProvider {
+impl ModelProvider for GroqProvider {
     async fn chat(&self, request: ProviderRequest) -> Result<ProviderResponse> {
-        openai_compat::openai_compat_chat(&self.client, &self.base_url, &self.api_key, request, "OpenAI").await
+        openai_compat::openai_compat_chat(
+            &self.client,
+            &self.base_url,
+            &self.api_key,
+            request,
+            "Groq",
+        )
+        .await
     }
 
     async fn stream_chat(&self, request: ProviderRequest) -> Result<mpsc::Receiver<StreamEvent>> {
-        openai_compat::openai_compat_stream_chat(&self.client, &self.base_url, &self.api_key, request, "OpenAI").await
+        openai_compat::openai_compat_stream_chat(
+            &self.client,
+            &self.base_url,
+            &self.api_key,
+            request,
+            "Groq",
+        )
+        .await
     }
 
     fn name(&self) -> &str {
-        "openai"
+        "groq"
     }
 }

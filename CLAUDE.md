@@ -66,9 +66,12 @@ src/
 │   ├── telegram.rs, discord.rs, slack.rs, whatsapp.rs
 │   ├── signal.rs, imessage.rs, plugin.rs
 ├── providers/
-│   ├── mod.rs           # ModelProvider trait, ProviderRequest/Response, StreamEvent
+│   ├── mod.rs           # ModelProvider trait, ProviderRequest/Response, StreamEvent, resolve_provider
+│   ├── openai_compat.rs # Shared OpenAI-compatible types and HTTP logic
 │   ├── anthropic.rs     # Anthropic Messages API (SSE streaming)
-│   ├── openai.rs        # OpenAI Chat Completions API (SSE streaming)
+│   ├── openai.rs        # OpenAI Chat Completions API (delegates to openai_compat)
+│   ├── groq.rs          # Groq fast inference (delegates to openai_compat)
+│   ├── ollama.rs        # Ollama native API (NDJSON streaming via /api/chat)
 │   ├── gemini.rs        # Google Generative AI
 │   └── bedrock.rs       # AWS Bedrock (stub)
 ├── memory/
@@ -114,14 +117,14 @@ JSON config file loaded via `Config::load()`. All config types use `#[serde(rena
 
 Default gateway port: **18789** (loopback bind).
 
-Key env vars: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `BRAVE_SEARCH_API_KEY`, `TELEGRAM_BOT_TOKEN`, `DISCORD_BOT_TOKEN`, `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`.
+Key env vars: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GROQ_API_KEY`, `OLLAMA_API_KEY`, `BRAVE_SEARCH_API_KEY`, `PERPLEXITY_API_KEY`, `XAI_API_KEY`, `TELEGRAM_BOT_TOKEN`, `DISCORD_BOT_TOKEN`, `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`.
 
 ## Architecture Notes
 
 - **Gateway** is the main server component — handles WebSocket connections (JSON-RPC protocol), HTTP endpoints (OpenAI-compatible chat completions + responses API), and auth.
 - **Agents** are the AI processing layer — receive messages, select tools, call providers, return responses.
 - **Tools** implement the `Tool` trait (`name()`, `description()`, `parameters()`, `execute()`). Registered in `tools/mod.rs`.
-- **Providers** implement `ModelProvider` trait with streaming SSE support. Anthropic and OpenAI are fully implemented.
+- **Providers** implement `ModelProvider` trait with streaming support. Anthropic, OpenAI, Gemini, Groq, and Ollama are fully implemented. OpenAI and Groq share a common `openai_compat` base. Ollama uses NDJSON streaming.
 - **Channels** integrate with messaging platforms. Each channel normalizes inbound messages and formats outbound responses.
 - **Memory** uses SQLite with FTS5 for full-text search and a vector table for semantic search. Hybrid scoring via Reciprocal Rank Fusion.
 - **Sessions** are in-memory (DashMap). No persistence yet.

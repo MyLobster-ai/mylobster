@@ -38,7 +38,7 @@ The TypeScript OpenClaw remains the upstream reference implementation. MyLobster
 
 ## Features
 
-- **Multi-provider AI** — Anthropic Claude, OpenAI GPT, Google Gemini, AWS Bedrock
+- **Multi-provider AI** — Anthropic Claude, OpenAI GPT, Google Gemini, Groq, Ollama (local models), AWS Bedrock
 - **WebSocket gateway** — JSON-RPC protocol with OpenAI-compatible HTTP endpoints (chat completions + responses API)
 - **16+ agent tools** — shell execution, web fetch/search, browser automation, cron, TTS, image processing, memory, messaging actions, and more
 - **8 channel integrations** — Telegram, Discord, Slack, WhatsApp, Signal, iMessage, plugin channels
@@ -200,7 +200,7 @@ Output: `mylobster 2026.2.10`
               ▼              ▼                   ▼
         ┌──────────┐  ┌───────────┐     ┌────────────┐
         │  Agents  │  │ Channels  │     │  Providers │
-        │ (tools)  │  │ (8 plat.) │     │  (4 LLMs)  │
+        │ (tools)  │  │ (8 plat.) │     │  (6 LLMs)  │
         └────┬─────┘  └───────────┘     └────────────┘
              │
      ┌───────┼────────┐
@@ -214,7 +214,7 @@ Output: `mylobster 2026.2.10`
 - **Gateway** — WebSocket (JSON-RPC) + HTTP server with auth (JWT, password, Tailscale). Built on axum 0.8 with tower middleware.
 - **Agents** — AI processing layer; receives messages, selects tools, calls providers, returns responses. Supports the OpenAI-compatible chat completions and responses APIs.
 - **Tools** — implement the `Tool` trait (`name()`, `description()`, `parameters()`, `execute()`). 16+ tools registered in `src/agents/tools/mod.rs`: bash, web_fetch, web_search, browser, canvas, cron, image, memory, message, sessions, TTS, and platform-specific actions for Discord, Slack, Telegram, and WhatsApp.
-- **Providers** — implement `ModelProvider` with SSE streaming. Anthropic and OpenAI are fully implemented; Gemini and Bedrock are stubs.
+- **Providers** — implement `ModelProvider` with SSE streaming. Anthropic, OpenAI, Gemini, Groq, and Ollama are fully implemented; Bedrock is a stub. OpenAI and Groq share a common `openai_compat` base module. Ollama uses native NDJSON streaming via `/api/chat`.
 - **Channels** — messaging platform integrations with normalized message handling. Telegram (teloxide), Discord (serenity), Slack (slack-morphism), WhatsApp, Signal, iMessage, and plugin channels.
 - **Memory** — SQLite with FTS5 for full-text search + vector table for semantic search. Hybrid scoring via Reciprocal Rank Fusion (RRF). Supports OpenAI, Gemini, Voyage, and local embedding providers.
 - **Sessions** — in-memory via DashMap. Per-session conversation state.
@@ -233,7 +233,7 @@ MyLobster is a Rust port of [OpenClaw](https://github.com/openclaw/openclaw). Th
 | **Package manager** | pnpm + npm | Cargo |
 | **Config formats** | JSON5, YAML, TOML | JSON, YAML, TOML, JSON5 |
 | **Database** | SQLite (better-sqlite3) | SQLite (rusqlite, bundled) |
-| **AI providers** | Anthropic, OpenAI, Gemini, Bedrock, GitHub Copilot, Qwen | Anthropic, OpenAI, Gemini, Bedrock |
+| **AI providers** | Anthropic, OpenAI, Gemini, Bedrock, GitHub Copilot, Qwen | Anthropic, OpenAI, Gemini, Groq, Ollama, Bedrock |
 | **Channels** | 12+ (WhatsApp, Telegram, Slack, Discord, Signal, iMessage, Google Chat, Teams, Matrix, Zalo, WebChat) | 8 (Telegram, Discord, Slack, WhatsApp, Signal, iMessage, plugin) |
 | **Tools** | 40+ | 16+ |
 | **Plugin system** | JS plugin SDK with runtime loading | Rust trait-based plugins |
@@ -265,7 +265,12 @@ Default gateway port: **18789** (loopback bind).
 |----------|-------------|
 | `ANTHROPIC_API_KEY` | Anthropic Claude API key |
 | `OPENAI_API_KEY` | OpenAI API key |
+| `GROQ_API_KEY` | Groq fast inference API key |
+| `OLLAMA_API_KEY` | Ollama API key (optional, for authenticated instances) |
 | `BRAVE_SEARCH_API_KEY` | Brave Search API key (for web_search tool) |
+| `PERPLEXITY_API_KEY` | Perplexity Sonar API key (for web_search tool) |
+| `XAI_API_KEY` | xAI / Grok API key (for web_search tool) |
+| `OPENROUTER_API_KEY` | OpenRouter API key (fallback for Perplexity search) |
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token |
 | `DISCORD_BOT_TOKEN` | Discord bot token |
 | `SLACK_BOT_TOKEN` | Slack bot token |
@@ -288,6 +293,25 @@ Default gateway port: **18789** (loopback bind).
     },
     "openai": {
       "apiKey": "sk-..."
+    },
+    "groq": {
+      "apiKey": "gsk_..."
+    },
+    "ollama": {
+      "baseUrl": "http://127.0.0.1:11434"
+    }
+  },
+  "tools": {
+    "web": {
+      "search": {
+        "provider": "brave",
+        "perplexity": {
+          "apiKey": "pplx-..."
+        },
+        "grok": {
+          "apiKey": "xai-..."
+        }
+      }
     }
   },
   "channels": {
