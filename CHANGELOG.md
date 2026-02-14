@@ -8,6 +8,19 @@ All notable changes to the MyLobster Rust agent are documented in this file.
 
 This release brings the Rust port up to date with key features from the OpenClaw v2026.2.13 TypeScript release.
 
+### Documentation
+
+- **docs/providers.md** — Provider architecture: three tiers (custom protocol, OpenAI-compatible, stub), provider resolution logic, configuration reference
+- **docs/web-tools.md** — Web tools architecture: multi-provider search (Brave, Perplexity, Grok), freshness parameter, web.fetch content processing modes
+- **docs/ssrf-protection.md** — SSRF protection: blocked categories, IPv4/IPv6 private ranges, carrier-grade NAT, IPv4-mapped IPv6, design decisions
+- **docs/memory.md** — Memory/RAG system: MemoryIndexManager, SQLite schema (FTS5 + vector), hybrid RRF scoring, embedding providers, text chunking
+- **docs/channels.md** — Channel integrations: ChannelPlugin trait, 14 capabilities, message normalization, 8 platform implementations
+- **docs/gateway-protocol.md** — Gateway protocol: WebSocket frame types, JSON-RPC methods, chat streaming protocol, HTTP endpoints, authentication modes
+- **docs/tools.md** — Agent tools reference: 26 tools across 8 categories, AgentTool trait, tool policy, parameter parsing, how to add new tools
+- **docs/configuration.md** — Configuration reference: 18 top-level sections, all config formats, environment variable overrides, CLI config commands
+- **docs/sessions.md** — Sessions: in-memory DashMap store, SessionHandle, WebSocket/HTTP access, limitations
+- Updated **README.md** with documentation index linking to all docs
+
 ### Added
 
 - **Ollama provider** (`src/providers/ollama.rs`) — Native Ollama API support via `/api/chat` with NDJSON streaming. Automatically detects models with tag separators (e.g. `llama3.3:latest`). Sets `num_ctx=65536` to override Ollama's small default context window. Strips `/v1` suffix from configured base URL. API key is optional (Ollama typically runs unauthenticated locally).

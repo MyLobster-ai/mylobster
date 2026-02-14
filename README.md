@@ -14,6 +14,7 @@
   <a href="#build--run">Build & Run</a> &middot;
   <a href="#cli-reference">CLI Reference</a> &middot;
   <a href="#architecture">Architecture</a> &middot;
+  <a href="#documentation">Documentation</a> &middot;
   <a href="#comparison-with-openclaw-typescript">OpenClaw Comparison</a> &middot;
   <a href="#configuration">Configuration</a>
 </p>
@@ -186,7 +187,7 @@ Print the version string and exit.
 mylobster version
 ```
 
-Output: `mylobster 2026.2.10`
+Output: `mylobster 2026.2.14`
 
 ## Architecture
 
@@ -218,6 +219,23 @@ Output: `mylobster 2026.2.10`
 - **Channels** — messaging platform integrations with normalized message handling. Telegram (teloxide), Discord (serenity), Slack (slack-morphism), WhatsApp, Signal, iMessage, and plugin channels.
 - **Memory** — SQLite with FTS5 for full-text search + vector table for semantic search. Hybrid scoring via Reciprocal Rank Fusion (RRF). Supports OpenAI, Gemini, Voyage, and local embedding providers.
 - **Sessions** — in-memory via DashMap. Per-session conversation state.
+
+## Documentation
+
+Detailed documentation for each subsystem is in the [`docs/`](docs/) directory:
+
+| Document | Description |
+|----------|-------------|
+| [Provider Architecture](docs/providers.md) | 6 AI providers: Anthropic, OpenAI, Gemini, Groq, Ollama, Bedrock. Provider trait, resolution logic, OpenAI-compatible base. |
+| [Gateway Protocol](docs/gateway-protocol.md) | WebSocket JSON-RPC protocol, frame types, chat streaming, HTTP endpoints, OpenAI-compatible API, authentication. |
+| [Agent Tools](docs/tools.md) | 26 tools across 8 categories. AgentTool trait, tool policy, parameter parsing, guide to adding new tools. |
+| [Web Tools](docs/web-tools.md) | `web.search` (Brave, Perplexity, Grok) and `web.fetch` with content-type detection and freshness filtering. |
+| [SSRF Protection](docs/ssrf-protection.md) | URL and IP-level blocking: IPv4/IPv6 private ranges, cloud metadata, carrier-grade NAT, IPv4-mapped IPv6. |
+| [Memory / RAG](docs/memory.md) | SQLite with FTS5 + vector search, hybrid RRF scoring, 4 embedding providers, text chunking. |
+| [Channel Integrations](docs/channels.md) | 8 platforms: Telegram, Discord, Slack, WhatsApp, Signal, iMessage, plugin. ChannelPlugin trait, capabilities, message normalization. |
+| [Configuration](docs/configuration.md) | 18 config sections, JSON/YAML/TOML/JSON5 formats, environment variable overrides. |
+| [Sessions](docs/sessions.md) | In-memory session store, SessionHandle, WebSocket/HTTP access. |
+| [Changelog](CHANGELOG.md) | All notable changes by version. |
 
 ## Comparison with OpenClaw (TypeScript)
 
