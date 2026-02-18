@@ -24,7 +24,7 @@ pub async fn run_single_message(
         .agent
         .model
         .primary_model()
-        .unwrap_or_else(|| "claude-opus-4".to_string());
+        .unwrap_or_else(|| "claude-opus-4-6".to_string());
 
     info!("Running agent with model: {}", model);
 
@@ -123,7 +123,7 @@ pub async fn handle_responses_api(
     let model = req
         .get("model")
         .and_then(|v| v.as_str())
-        .unwrap_or("claude-opus-4")
+        .unwrap_or("claude-opus-4-6")
         .to_string();
 
     let input = req.get("input").cloned().unwrap_or(serde_json::Value::Null);

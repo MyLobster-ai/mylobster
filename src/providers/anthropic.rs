@@ -5,11 +5,17 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+/// Check if a model supports the 1M context beta.
+fn is_1m_eligible_model(model: &str) -> bool {
+    model.starts_with("claude-opus-4") || model.starts_with("claude-sonnet-4")
+}
+
 pub struct AnthropicProvider {
     api_key: String,
     base_url: String,
     model: String,
     client: Client,
+    context1m: bool,
 }
 
 impl AnthropicProvider {
@@ -19,7 +25,13 @@ impl AnthropicProvider {
             base_url,
             model,
             client: Client::new(),
+            context1m: false,
         }
+    }
+
+    pub fn with_context1m(mut self, enabled: bool) -> Self {
+        self.context1m = enabled;
+        self
     }
 }
 
@@ -142,15 +154,18 @@ impl ModelProvider for AnthropicProvider {
             tool_choice: request.tool_choice,
         };
 
-        let resp = self
+        let mut req_builder = self
             .client
             .post(format!("{}/v1/messages", self.base_url))
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
+            .header("content-type", "application/json");
+
+        if self.context1m && is_1m_eligible_model(&body.model) {
+            req_builder = req_builder.header("anthropic-beta", "context-1m-2025-08-07");
+        }
+
+        let resp = req_builder.json(&body).send().await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -215,13 +230,20 @@ impl ModelProvider for AnthropicProvider {
         let client = self.client.clone();
         let base_url = self.base_url.clone();
         let api_key = self.api_key.clone();
+        let context1m = self.context1m;
 
         tokio::spawn(async move {
-            let resp = match client
+            let mut req_builder = client
                 .post(format!("{}/v1/messages", base_url))
                 .header("x-api-key", &api_key)
                 .header("anthropic-version", "2023-06-01")
-                .header("content-type", "application/json")
+                .header("content-type", "application/json");
+
+            if context1m && is_1m_eligible_model(&body.model) {
+                req_builder = req_builder.header("anthropic-beta", "context-1m-2025-08-07");
+            }
+
+            let resp = match req_builder
                 .json(&body)
                 .send()
                 .await

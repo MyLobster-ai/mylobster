@@ -414,6 +414,7 @@ pub struct AgentModelEntryConfig {
     pub alias: Option<String>,
     pub params: Option<HashMap<String, serde_json::Value>>,
     pub streaming: Option<bool>,
+    pub context1m: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -529,6 +530,8 @@ pub struct SubagentsConfig {
     pub archive_after_minutes: Option<u32>,
     pub allow_agents: Option<Vec<String>>,
     pub model: Option<String>,
+    pub max_spawn_depth: Option<u8>,
+    pub max_children_per_agent: Option<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -562,6 +565,7 @@ pub struct AgentDefaultsConfig {
     pub block_streaming_coalesce: Option<BlockStreamingCoalesceConfig>,
     pub human_delay: Option<HumanDelayConfig>,
     pub timeout_seconds: Option<u64>,
+    pub image_max_dimension_px: Option<u32>,
     pub media_max_mb: Option<u64>,
     pub typing_interval_seconds: Option<u64>,
     pub typing_mode: Option<String>,
@@ -2466,6 +2470,7 @@ pub struct CronConfig {
     pub store: Option<String>,
     pub max_concurrent_runs: Option<u32>,
     pub session_retention: Option<String>,
+    pub default_stagger_ms: Option<u64>,
 }
 
 // ============================================================================
