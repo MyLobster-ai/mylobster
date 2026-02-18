@@ -17,3 +17,28 @@ pub fn resolve_limits(config_dim: Option<u32>) -> ImageSanitizationLimits {
         max_bytes: DEFAULT_IMAGE_MAX_BYTES,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_constants() {
+        assert_eq!(DEFAULT_IMAGE_MAX_DIMENSION_PX, 1200);
+        assert_eq!(DEFAULT_IMAGE_MAX_BYTES, 5 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_resolve_limits_with_config() {
+        let limits = resolve_limits(Some(800));
+        assert_eq!(limits.max_dimension_px, 800);
+        assert_eq!(limits.max_bytes, DEFAULT_IMAGE_MAX_BYTES);
+    }
+
+    #[test]
+    fn test_resolve_limits_without_config() {
+        let limits = resolve_limits(None);
+        assert_eq!(limits.max_dimension_px, DEFAULT_IMAGE_MAX_DIMENSION_PX);
+        assert_eq!(limits.max_bytes, DEFAULT_IMAGE_MAX_BYTES);
+    }
+}

@@ -53,3 +53,100 @@ impl HookRegistry {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn test_hook_registry_new_is_empty() {
+        let registry = HookRegistry::new();
+        // Emitting on an unknown event type should be a no-op
+        registry.emit(
+            "nonexistent",
+            HookEvent::MessageReceived {
+                from: "test".into(),
+                content: "msg".into(),
+                timestamp: None,
+            },
+        );
+    }
+
+    #[test]
+    fn test_hook_registry_on_and_emit() {
+        let mut registry = HookRegistry::new();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = counter.clone();
+
+        registry.on(
+            "message_received",
+            Arc::new(move |_event| {
+                counter_clone.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        registry.emit(
+            "message_received",
+            HookEvent::MessageReceived {
+                from: "user1".into(),
+                content: "hello".into(),
+                timestamp: Some(12345),
+            },
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_hook_registry_multiple_handlers() {
+        let mut registry = HookRegistry::new();
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..3 {
+            let c = counter.clone();
+            registry.on(
+                "message_sent",
+                Arc::new(move |_| {
+                    c.fetch_add(1, Ordering::SeqCst);
+                }),
+            );
+        }
+
+        registry.emit(
+            "message_sent",
+            HookEvent::MessageSent {
+                to: "user2".into(),
+                content: "bye".into(),
+                success: true,
+                error: None,
+            },
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn test_hook_event_clone() {
+        let event = HookEvent::MessageReceived {
+            from: "sender".into(),
+            content: "test".into(),
+            timestamp: Some(999),
+        };
+        let cloned = event.clone();
+        match cloned {
+            HookEvent::MessageReceived {
+                from,
+                content,
+                timestamp,
+            } => {
+                assert_eq!(from, "sender");
+                assert_eq!(content, "test");
+                assert_eq!(timestamp, Some(999));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+}

@@ -366,3 +366,41 @@ impl ModelProvider for AnthropicProvider {
         "anthropic"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_1m_eligible_opus_4() {
+        assert!(is_1m_eligible_model("claude-opus-4-20250514"));
+    }
+
+    #[test]
+    fn test_1m_eligible_opus_46() {
+        assert!(is_1m_eligible_model("claude-opus-4-6-20250514"));
+    }
+
+    #[test]
+    fn test_1m_eligible_sonnet_4() {
+        assert!(is_1m_eligible_model("claude-sonnet-4-20250514"));
+    }
+
+    #[test]
+    fn test_1m_eligible_sonnet_46() {
+        assert!(is_1m_eligible_model("claude-sonnet-4-6-20250514"));
+    }
+
+    #[test]
+    fn test_not_1m_eligible_claude_3() {
+        assert!(!is_1m_eligible_model("claude-3-5-sonnet-20241022"));
+        assert!(!is_1m_eligible_model("claude-3-opus-20240229"));
+        assert!(!is_1m_eligible_model("claude-haiku-3-5-20241022"));
+    }
+
+    #[test]
+    fn test_not_1m_eligible_other_providers() {
+        assert!(!is_1m_eligible_model("gpt-4"));
+        assert!(!is_1m_eligible_model("gemini-pro"));
+    }
+}
