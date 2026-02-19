@@ -122,7 +122,7 @@ impl SessionStore {
             .agent
             .model
             .primary_model()
-            .unwrap_or_else(|| "claude-opus-4".to_string());
+            .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
 
         let info = SessionInfo {
             id: Uuid::new_v4().to_string(),

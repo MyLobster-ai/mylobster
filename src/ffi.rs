@@ -439,7 +439,7 @@ pub unsafe extern "C" fn mylobster_agent_message(
             .agent
             .model
             .primary_model()
-            .unwrap_or_else(|| "claude-opus-4".to_string());
+            .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
 
         let provider = crate::providers::resolve_provider(cfg, &model)?;
 

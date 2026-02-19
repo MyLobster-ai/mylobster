@@ -56,4 +56,4 @@ pub const SLACK_TEXT_CHUNK_LIMIT: u32 = 4000;
 pub const WHATSAPP_TEXT_CHUNK_LIMIT: u32 = 4000;
 
 /// Default model.
-pub const DEFAULT_MODEL: &str = "claude-opus-4";
+pub const DEFAULT_MODEL: &str = "claude-sonnet-4-6";

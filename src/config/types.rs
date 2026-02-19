@@ -396,7 +396,7 @@ pub enum AgentModelConfig {
 
 impl Default for AgentModelConfig {
     fn default() -> Self {
-        Self::Simple("claude-opus-4".to_string())
+        Self::Simple("claude-sonnet-4-6".to_string())
     }
 }
 
