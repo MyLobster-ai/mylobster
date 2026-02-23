@@ -679,6 +679,7 @@ pub enum ModelApi {
     OpenaiCompletions,
     OpenaiResponses,
     AnthropicMessages,
+    MistralMessages,
     GoogleGenerativeAi,
     GithubCopilot,
     BedrockConverseStream,
@@ -820,6 +821,21 @@ impl ModelsConfig {
                 models: vec![],
             });
     }
+
+    pub fn apply_mistral_key(&mut self, key: &str) {
+        self.providers
+            .entry("mistral".to_string())
+            .and_modify(|p| p.api_key = Some(key.to_string()))
+            .or_insert_with(|| ModelProviderConfig {
+                base_url: "https://api.mistral.ai/v1".to_string(),
+                api_key: Some(key.to_string()),
+                auth: None,
+                api: Some(ModelApi::MistralMessages),
+                headers: None,
+                auth_header: None,
+                models: vec![],
+            });
+    }
 }
 
 // ============================================================================
@@ -880,6 +896,7 @@ pub struct ChannelsConfig {
     pub googlechat: Option<GoogleChatConfig>,
     pub msteams: Option<MsTeamsConfig>,
     pub irc: Option<IrcConfig>,
+    pub synology_chat: Option<SynologyChatConfig>,
     /// Extension channels loaded via plugins.
     #[serde(flatten)]
     pub extensions: HashMap<String, serde_json::Value>,
@@ -1540,6 +1557,33 @@ pub struct IrcConfig {
 }
 
 // ============================================================================
+// Synology Chat Configuration
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SynologyChatAccountConfig {
+    pub enabled: Option<bool>,
+    pub token: Option<String>,
+    pub incoming_url: Option<String>,
+    pub nas_host: Option<String>,
+    pub webhook_path: Option<String>,
+    pub dm_policy: Option<DmPolicy>,
+    pub allowed_user_ids: Option<Vec<String>>,
+    pub rate_limit_per_minute: Option<u32>,
+    pub bot_name: Option<String>,
+    pub allow_insecure_ssl: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SynologyChatConfig {
+    pub accounts: Option<HashMap<String, SynologyChatAccountConfig>>,
+    #[serde(flatten)]
+    pub default_account: SynologyChatAccountConfig,
+}
+
+// ============================================================================
 // Tools Configuration
 // ============================================================================
 
@@ -1567,6 +1611,16 @@ pub struct ToolPolicyConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+pub struct SafeBinProfile {
+    pub max_positional: Option<u32>,
+    #[serde(default)]
+    pub allowed_value_flags: Vec<String>,
+    #[serde(default)]
+    pub denied_flags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct ExecToolConfig {
     pub host: Option<String>,
     pub security: Option<String>,
@@ -1576,6 +1630,7 @@ pub struct ExecToolConfig {
     pub path_prepend: Vec<String>,
     #[serde(default)]
     pub safe_bins: Vec<String>,
+    pub safe_bin_profiles: Option<HashMap<String, SafeBinProfile>>,
     pub background_ms: Option<u64>,
     pub timeout_sec: Option<u64>,
     pub approval_running_notice_ms: Option<u64>,
@@ -1800,6 +1855,7 @@ pub enum EmbeddingProvider {
     #[default]
     Openai,
     Gemini,
+    Mistral,
     Local,
     Voyage,
 }

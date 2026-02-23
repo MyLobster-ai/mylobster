@@ -118,6 +118,10 @@ impl Config {
             self.models.apply_openai_key(&key);
         }
 
+        if let Ok(key) = std::env::var("MISTRAL_API_KEY") {
+            self.models.apply_mistral_key(&key);
+        }
+
         if let Ok(token) = std::env::var("DISCORD_BOT_TOKEN") {
             self.channels.discord.apply_token(&token);
         }
@@ -159,6 +163,52 @@ impl Default for Config {
             web: WebConfig::default(),
             state_dir: resolve_state_dir(),
         }
+    }
+}
+
+// ============================================================================
+// Prototype-Pollution Protection
+// ============================================================================
+
+/// Keys that must be rejected during config merge/patch operations.
+///
+/// These correspond to JavaScript prototype pollution vectors. While Rust is
+/// not vulnerable to prototype pollution, blocking these keys maintains
+/// consistency with the OpenClaw TypeScript implementation and prevents any
+/// unexpected behaviour when configs are shared between the Rust and TS
+/// codebases.
+const BLOCKED_CONFIG_KEYS: &[&str] = &["__proto__", "prototype", "constructor"];
+
+/// Check if a config key is a blocked prototype-pollution key.
+pub fn is_blocked_key(key: &str) -> bool {
+    BLOCKED_CONFIG_KEYS.contains(&key)
+}
+
+/// Recursively merge `patch` into `base`, rejecting blocked keys.
+///
+/// Returns the merged value.  Keys listed in [`BLOCKED_CONFIG_KEYS`] are
+/// silently dropped from the patch.
+pub fn merge_json_values(
+    base: serde_json::Value,
+    patch: serde_json::Value,
+) -> serde_json::Value {
+    match (base, patch) {
+        (serde_json::Value::Object(mut base_map), serde_json::Value::Object(patch_map)) => {
+            for (key, value) in patch_map {
+                if is_blocked_key(&key) {
+                    tracing::warn!(key = %key, "Blocked prototype-pollution key in config merge");
+                    continue;
+                }
+                let merged = if let Some(existing) = base_map.remove(&key) {
+                    merge_json_values(existing, value)
+                } else {
+                    value
+                };
+                base_map.insert(key, merged);
+            }
+            serde_json::Value::Object(base_map)
+        }
+        (_, patch) => patch,
     }
 }
 

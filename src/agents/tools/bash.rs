@@ -1,9 +1,93 @@
 use super::{AgentTool, ToolContext, ToolInfo, ToolResult};
 use anyhow::Result;
+use std::collections::HashSet;
 use std::process::Stdio;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tracing::{debug, warn};
+
+/// Environment variable names that must never be passed to child processes.
+/// These can be used for code injection, credential theft, or privilege escalation.
+const DANGEROUS_ENV_VARS: &[&str] = &[
+    "NODE_OPTIONS",
+    "BASH_ENV",
+    "SHELLOPTS",
+    "PS4",
+    "SSLKEYLOGFILE",
+    "ENV",
+    "BASH_FUNC_%%",
+    "PROMPT_COMMAND",
+    "PERL5OPT",
+    "PERL5LIB",
+    "RUBYOPT",
+    "PYTHONSTARTUP",
+    "PYTHONPATH",
+    "NODE_PATH",
+    "CDPATH",
+    "GLOBIGNORE",
+    "HISTFILE",
+    "HISTFILESIZE",
+    "HISTCONTROL",
+    "COMP_WORDBREAKS",
+    "MAILPATH",
+    "FPATH",
+    "GIT_EXEC_PATH",
+];
+
+/// Environment variable prefixes that indicate dangerous variables.
+const DANGEROUS_ENV_PREFIXES: &[&str] = &["DYLD_", "LD_", "BASH_FUNC_"];
+
+/// Environment variables that cannot be overridden via tool parameters.
+const DANGEROUS_ENV_OVERRIDES: &[&str] = &["HOME", "ZDOTDIR"];
+
+/// Check if an environment variable name is dangerous and should be blocked.
+fn is_dangerous_env_var(name: &str) -> bool {
+    if DANGEROUS_ENV_VARS.contains(&name) {
+        return true;
+    }
+    for prefix in DANGEROUS_ENV_PREFIXES {
+        if name.starts_with(prefix) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Validate a command against safe-bin profile constraints.
+fn validate_safe_bin(
+    command_name: &str,
+    args: &[&str],
+    profile: &crate::config::SafeBinProfile,
+) -> Option<String> {
+    // Check max positional args
+    if let Some(max) = profile.max_positional {
+        let positional_count = args.iter().filter(|a| !a.starts_with('-')).count();
+        if positional_count > max as usize {
+            return Some(format!(
+                "Safe-bin '{}': too many positional arguments ({}, max {})",
+                command_name, positional_count, max
+            ));
+        }
+    }
+
+    // Check denied flags
+    for arg in args {
+        if arg.starts_with('-') {
+            for denied in &profile.denied_flags {
+                if *arg == denied.as_str()
+                    || (arg.starts_with("--") && arg.split('=').next() == Some(denied.as_str()))
+                {
+                    return Some(format!(
+                        "Safe-bin '{}': denied flag '{}' used",
+                        command_name, denied
+                    ));
+                }
+            }
+        }
+    }
+
+    None
+}
 
 /// Bash/shell command execution tool.
 pub struct BashTool;
@@ -71,6 +155,21 @@ impl AgentTool for BashTool {
             "-c"
         };
 
+        // Safe-bin profile validation: extract the first word of the command as the binary name
+        if let Some(ref exec) = context.config.tools.exec {
+            if let Some(ref profiles) = exec.safe_bin_profiles {
+                let cmd_name = command.split_whitespace().next().unwrap_or("");
+                // Strip path prefix to get bare binary name
+                let bare_name = cmd_name.rsplit('/').next().unwrap_or(cmd_name);
+                if let Some(profile) = profiles.get(bare_name) {
+                    let args: Vec<&str> = command.split_whitespace().skip(1).collect();
+                    if let Some(err) = validate_safe_bin(bare_name, &args, profile) {
+                        return Ok(ToolResult::error(err));
+                    }
+                }
+            }
+        }
+
         let mut cmd = Command::new(shell);
         cmd.arg(shell_flag)
             .arg(command)
@@ -79,6 +178,14 @@ impl AgentTool for BashTool {
 
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
+        }
+
+        // Security: clear all env vars and selectively re-add only safe ones
+        cmd.env_clear();
+        for (key, value) in std::env::vars() {
+            if !is_dangerous_env_var(&key) {
+                cmd.env(&key, &value);
+            }
         }
 
         // Apply PATH prepends

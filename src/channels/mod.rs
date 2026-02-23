@@ -4,6 +4,7 @@ mod normalize;
 mod plugin;
 mod signal;
 mod slack;
+mod synology_chat;
 mod telegram;
 mod whatsapp;
 
@@ -42,6 +43,7 @@ mod send {
             "whatsapp" => super::whatsapp::send_message(config, to, message).await,
             "signal" => super::signal::send_message(config, to, message).await,
             "imessage" => super::imessage::send_message(config, to, message).await,
+            "synology_chat" => super::synology_chat::send_message(config, to, message).await,
             other => bail!("unknown channel: {other}"),
         }
     }
@@ -86,6 +88,10 @@ impl ChannelManager {
         plugins.insert(
             "imessage".to_string(),
             Arc::new(imessage::IMessageChannel::new(config)),
+        );
+        plugins.insert(
+            "synology_chat".to_string(),
+            Arc::new(synology_chat::SynologyChatChannel::new(config)),
         );
 
         Self {

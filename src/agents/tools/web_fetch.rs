@@ -188,19 +188,118 @@ fn is_ssrf_target(url: &Url) -> bool {
     false
 }
 
+/// Extract an embedded IPv4 address from IPv6 transition mechanism addresses.
+///
+/// Supports: NAT64 (64:ff9b::/96 and 64:ff9b:1::/48), 6to4 (2002::/16),
+/// Teredo (2001:0000::/32), and ISATAP (IID marker 0000:5efe).
+fn extract_ipv6_embedded_ipv4(v6: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    let segments = v6.segments();
+    let octets128 = v6.octets();
+
+    // NAT64 well-known prefix (64:ff9b::/96) — IPv4 in last 32 bits
+    if segments[0] == 0x0064
+        && segments[1] == 0xff9b
+        && segments[2] == 0
+        && segments[3] == 0
+        && segments[4] == 0
+        && segments[5] == 0
+    {
+        return Some(std::net::Ipv4Addr::new(
+            octets128[12],
+            octets128[13],
+            octets128[14],
+            octets128[15],
+        ));
+    }
+
+    // NAT64 local-use prefix (64:ff9b:1::/48) — IPv4 in last 32 bits
+    if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001 {
+        return Some(std::net::Ipv4Addr::new(
+            octets128[12],
+            octets128[13],
+            octets128[14],
+            octets128[15],
+        ));
+    }
+
+    // 6to4 (2002::/16) — IPv4 embedded in bits 16–47 (segments[1] and segments[2])
+    if segments[0] == 0x2002 {
+        return Some(std::net::Ipv4Addr::new(
+            (segments[1] >> 8) as u8,
+            (segments[1] & 0xff) as u8,
+            (segments[2] >> 8) as u8,
+            (segments[2] & 0xff) as u8,
+        ));
+    }
+
+    // Teredo (2001:0000::/32) — IPv4 server in segments[2..3], client in XOR of segments[6..7]
+    if segments[0] == 0x2001 && segments[1] == 0x0000 {
+        // Server address (segments 2-3)
+        let server = std::net::Ipv4Addr::new(
+            (segments[2] >> 8) as u8,
+            (segments[2] & 0xff) as u8,
+            (segments[3] >> 8) as u8,
+            (segments[3] & 0xff) as u8,
+        );
+        // Client address — XOR of hextets 6-7 with 0xffff
+        let client = std::net::Ipv4Addr::new(
+            ((segments[6] ^ 0xffff) >> 8) as u8,
+            ((segments[6] ^ 0xffff) & 0xff) as u8,
+            ((segments[7] ^ 0xffff) >> 8) as u8,
+            ((segments[7] ^ 0xffff) & 0xff) as u8,
+        );
+        // Check both: if either is private, return it for blocking
+        if is_private_ipv4(&server) {
+            return Some(server);
+        }
+        return Some(client);
+    }
+
+    // ISATAP — IID marker 0000:5efe in segments[5..6], IPv4 in last 32 bits
+    if segments[5] == 0x0000 && segments[6] == 0x5efe {
+        return Some(std::net::Ipv4Addr::new(
+            octets128[12],
+            octets128[13],
+            octets128[14],
+            octets128[15],
+        ));
+    }
+
+    None
+}
+
+/// Check if an IPv4 address is private/internal.
+fn is_private_ipv4(v4: &std::net::Ipv4Addr) -> bool {
+    let octets = v4.octets();
+    v4.is_private()
+        || v4.is_loopback()
+        || v4.is_link_local()
+        // Unspecified (0.0.0.0/8)
+        || octets[0] == 0
+        // Link-local / APIPA (169.254.0.0/16)
+        || (octets[0] == 169 && octets[1] == 254)
+        // Carrier-grade NAT (100.64.0.0/10)
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        // Broadcast (255.255.255.255)
+        || (octets[0] == 255 && octets[1] == 255 && octets[2] == 255 && octets[3] == 255)
+        // Multicast (224.0.0.0/4)
+        || (octets[0] >= 224 && octets[0] <= 239)
+        // Reserved (240.0.0.0/4, excluding 255.255.255.255 already covered)
+        || (octets[0] >= 240)
+        // Benchmarking (198.18.0.0/15)
+        || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+        // TEST-NET-1 (192.0.2.0/24)
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+        // TEST-NET-2 (198.51.100.0/24)
+        || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+        // TEST-NET-3 (203.0.113.0/24)
+        || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+}
+
 /// Check if an IP address is private/internal.
 fn is_private_ip(ip: std::net::IpAddr) -> bool {
     match ip {
-        std::net::IpAddr::V4(v4) => {
-            let octets = v4.octets();
-            v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                // Link-local / APIPA (169.254.0.0/16)
-                || (octets[0] == 169 && octets[1] == 254)
-                // Carrier-grade NAT (100.64.0.0/10)
-                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
-        }
+        std::net::IpAddr::V4(v4) => is_private_ipv4(&v4),
         std::net::IpAddr::V6(v6) => {
             let segments = v6.segments();
 
@@ -229,6 +328,11 @@ fn is_private_ip(ip: std::net::IpAddr) -> bool {
                 return true;
             }
 
+            // Multicast (ff00::/8)
+            if (segments[0] & 0xff00) == 0xff00 {
+                return true;
+            }
+
             // AWS IMDSv2 IPv6 (fd00:ec2::254)
             if segments[0] == 0xfd00
                 && segments[1] == 0x0ec2
@@ -242,6 +346,16 @@ fn is_private_ip(ip: std::net::IpAddr) -> bool {
             if let Some(mapped) = v6.to_ipv4_mapped() {
                 return is_private_ip(std::net::IpAddr::V4(mapped));
             }
+
+            // IPv6 transition mechanism embedded IPv4 addresses
+            // (NAT64, 6to4, Teredo, ISATAP)
+            if let Some(embedded) = extract_ipv6_embedded_ipv4(&v6) {
+                return is_private_ipv4(&embedded);
+            }
+
+            // TODO: Add DNS re-check — currently we only check the URL hostname,
+            // not the resolved IP. A future enhancement should perform async DNS
+            // resolution and re-validate the resolved address.
 
             false
         }

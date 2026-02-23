@@ -59,6 +59,15 @@ pub fn create_provider(config: &Config) -> Option<EmbeddingProviderBox> {
                 .and_then(|p| p.api_key.clone())?;
             Some(Box::new(GeminiEmbeddingProvider::new(api_key, None)))
         }
+        EmbeddingProviderKind::Mistral => {
+            let api_key = config
+                .models
+                .providers
+                .get("mistral")
+                .and_then(|p| p.api_key.clone())
+                .or_else(|| std::env::var("MISTRAL_API_KEY").ok())?;
+            Some(Box::new(MistralEmbeddingProvider::new(api_key, None)))
+        }
         EmbeddingProviderKind::Voyage => {
             let api_key = config
                 .models
@@ -228,6 +237,78 @@ impl EmbeddingProvider for GeminiEmbeddingProvider {
 
     fn dimensions(&self) -> usize {
         768
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mistral
+// ---------------------------------------------------------------------------
+
+/// Calls the Mistral `/v1/embeddings` endpoint.
+pub struct MistralEmbeddingProvider {
+    api_key: String,
+    model: String,
+    client: reqwest::Client,
+}
+
+impl MistralEmbeddingProvider {
+    pub fn new(api_key: String, model: Option<String>) -> Self {
+        Self {
+            api_key,
+            model: model.unwrap_or_else(|| "mistral-embed".to_string()),
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct MistralEmbeddingRequest {
+    model: String,
+    input: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct MistralEmbeddingResponse {
+    data: Vec<MistralEmbeddingData>,
+}
+
+#[derive(Deserialize)]
+struct MistralEmbeddingData {
+    embedding: Vec<f64>,
+}
+
+#[async_trait]
+impl EmbeddingProvider for MistralEmbeddingProvider {
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f64>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let body = MistralEmbeddingRequest {
+            model: self.model.clone(),
+            input: texts.to_vec(),
+        };
+
+        let resp = self
+            .client
+            .post("https://api.mistral.ai/v1/embeddings")
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<MistralEmbeddingResponse>()
+            .await?;
+
+        Ok(resp.data.into_iter().map(|d| d.embedding).collect())
+    }
+
+    fn model_name(&self) -> String {
+        self.model.clone()
+    }
+
+    fn dimensions(&self) -> usize {
+        1024
     }
 }
 

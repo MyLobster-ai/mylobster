@@ -2,6 +2,7 @@ mod anthropic;
 mod bedrock;
 mod gemini;
 mod groq;
+mod mistral;
 mod ollama;
 mod openai;
 mod openai_compat;
@@ -186,6 +187,28 @@ pub fn resolve_provider(config: &Config, model: &str) -> Result<Box<dyn ModelPro
                 model.to_string(),
             )))
         }
+        "mistral" => {
+            let api_key = config
+                .models
+                .providers
+                .get("mistral")
+                .and_then(|p| p.api_key.clone())
+                .or_else(|| std::env::var("MISTRAL_API_KEY").ok())
+                .ok_or_else(|| anyhow::anyhow!("No Mistral API key configured"))?;
+
+            let base_url = config
+                .models
+                .providers
+                .get("mistral")
+                .map(|p| p.base_url.clone())
+                .unwrap_or_else(|| "https://api.mistral.ai/v1".to_string());
+
+            Ok(Box::new(mistral::MistralProvider::new(
+                api_key,
+                base_url,
+                model.to_string(),
+            )))
+        }
         "ollama" => {
             let api_key = config
                 .models
@@ -231,6 +254,14 @@ fn detect_provider(config: &Config, model: &str) -> &'static str {
     // Gemini models
     if lower.starts_with("gemini") {
         return "google";
+    }
+
+    // Mistral models
+    if lower.starts_with("mistral")
+        || lower.starts_with("pixtral")
+        || lower.starts_with("codestral")
+    {
+        return "mistral";
     }
 
     // Groq models (only when groq provider is explicitly configured)

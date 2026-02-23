@@ -2,6 +2,56 @@
 
 All notable changes to the MyLobster Rust agent are documented in this file.
 
+## [2026.2.22] - 2026-02-23
+
+### Synced with OpenClaw v2026.2.22
+
+This release ports features from OpenClaw v2026.2.14 through v2026.2.22 to the Rust codebase.
+
+### Added
+
+- **Mistral provider** (`src/providers/mistral.rs`) — Mistral AI support via their OpenAI-compatible API (`/v1/chat/completions`). Delegates to the shared `openai_compat` module. Default base URL: `https://api.mistral.ai/v1`. Detects model names starting with `mistral`, `pixtral`, or `codestral`. Resolves API key from config or `MISTRAL_API_KEY` env var.
+
+- **`ModelApi::MistralMessages` config variant** — New enum variant for Mistral-specific API routing.
+
+- **`ModelsConfig::apply_mistral_key()`** — Convenience method for programmatic Mistral provider configuration, following the existing pattern.
+
+- **Mistral embedding provider** (`src/memory/embeddings.rs`) — Calls `https://api.mistral.ai/v1/embeddings` with model `mistral-embed`, producing 1024-dimension vectors. Resolves API key from config or `MISTRAL_API_KEY` env var.
+
+- **`EmbeddingProvider::Mistral` variant** — New embedding provider option in configuration.
+
+- **Synology Chat channel** (`src/channels/synology_chat.rs`) — New channel integration for Synology NAS Chat via webhooks. Supports outbound messages via incoming webhook URL with `payload={"text":"...","user_ids":[...]}` format. Inbound webhook validation uses constant-time token comparison. Configurable DM policy (`open`, `allowlist`, `disabled`), rate limiting, and per-user allowlists. Supports `allow_insecure_ssl` for self-signed NAS certificates.
+
+- **`SynologyChatConfig` and `SynologyChatAccountConfig`** — Configuration types for Synology Chat with multi-account support.
+
+- **Exec security hardening** (`src/agents/tools/bash.rs`) — Comprehensive environment variable sanitization for child processes:
+  - `DANGEROUS_ENV_VARS` constant: blocks `NODE_OPTIONS`, `BASH_ENV`, `SHELLOPTS`, `PS4`, `SSLKEYLOGFILE`, `PROMPT_COMMAND`, `PYTHONSTARTUP`, `RUBYOPT`, and 20+ other injection vectors.
+  - `DANGEROUS_ENV_PREFIXES`: blocks all `DYLD_*`, `LD_*`, `BASH_FUNC_*` variables.
+  - `DANGEROUS_ENV_OVERRIDES`: `HOME` and `ZDOTDIR` cannot be set via tool params.
+  - Child processes now start with `env_clear()` and selectively re-add only safe vars.
+  - **Safe-bin profiles**: when a command matches a configured safe-bin name, args are validated against profile constraints (`max_positional`, `denied_flags`, `allowed_value_flags`).
+
+- **`SafeBinProfile` config type** — New struct with `max_positional`, `allowed_value_flags`, `denied_flags` fields.
+
+- **`ExecToolConfig::safe_bin_profiles`** — Optional map of binary name to `SafeBinProfile` for per-command arg validation.
+
+- **Config merge prototype-pollution protection** (`src/config/mod.rs`) — `is_blocked_key()` helper rejects `__proto__`, `prototype`, and `constructor` keys. `merge_json_values()` recursively merges JSON objects while silently dropping blocked keys with a warning log.
+
+### Changed
+
+- **Enhanced SSRF protection** (`src/agents/tools/web_fetch.rs`) — Significantly expanded IP blocking:
+  - **New IPv4 ranges**: unspecified (`0.0.0.0/8`), broadcast (`255.255.255.255`), multicast (`224.0.0.0/4`), reserved (`240.0.0.0/4`), benchmarking (`198.18.0.0/15`), TEST-NET-1/2/3 (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`).
+  - **IPv6 transition literal extraction**: NAT64 (`64:ff9b::/96` and `64:ff9b:1::/48`), 6to4 (`2002::/16`), Teredo (`2001:0000::/32` with XOR client extraction), ISATAP (IID marker `0000:5efe`). Embedded IPv4 addresses are extracted and validated against all IPv4 rules.
+  - **IPv6 multicast blocking** (`ff00::/8`).
+  - Refactored `is_private_ip` into `is_private_ipv4` + `is_private_ip` for reuse by transition extractors.
+  - Added TODO note for future async DNS re-check of resolved IPs.
+
+- **`detect_provider()` expanded** — Now handles Mistral model detection before Groq. Models starting with `mistral`, `pixtral`, or `codestral` route to the Mistral provider.
+
+- **`resolve_provider()` expanded** — Now handles 6 providers (anthropic, openai, google, groq, mistral, ollama).
+
+- **`MISTRAL_API_KEY` environment override** — Added to `Config::apply_env_overrides()` alongside existing Anthropic and OpenAI key overrides.
+
 ## [2026.2.14] - 2026-02-14
 
 ### Synced with OpenClaw v2026.2.13
