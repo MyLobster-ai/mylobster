@@ -2,16 +2,127 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Protocol version for WebSocket communication.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Version 3 matches OpenClaw v2026.2.22.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Maximum WebSocket payload size (25 MB).
 pub const MAX_WS_PAYLOAD: usize = 25 * 1024 * 1024;
 
 // ============================================================================
-// Frame Types
+// OC-Compatible Frame Types (OpenClaw v2026.2.22 wire protocol)
+// ============================================================================
+//
+// The bridge sends `type:"req"` and expects `type:"res"` with `ok`/`payload`
+// fields and `type:"event"` with `event`/`payload` fields.
+
+/// Incoming frame from bridge — accepts both `type:"req"` (OC) and
+/// `type:"request"` (legacy MyLobster) for backwards compatibility.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type")]
+pub enum IncomingFrame {
+    /// OC-format request: `{type:"req", id, method, params}`
+    #[serde(rename = "req")]
+    OcRequest(RequestFrame),
+    /// Legacy MyLobster format: `{type:"request", id, method, params}`
+    #[serde(rename = "request")]
+    Request(RequestFrame),
+}
+
+impl IncomingFrame {
+    pub fn into_request(self) -> RequestFrame {
+        match self {
+            IncomingFrame::OcRequest(r) | IncomingFrame::Request(r) => r,
+        }
+    }
+}
+
+/// A request from client to gateway (shared fields for both OC and legacy).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestFrame {
+    pub id: String,
+    pub method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+}
+
+/// OC-format response: `{type:"res", id, ok, payload?, error?}`
+/// This is what the bridge expects.
+#[derive(Debug, Clone, Serialize)]
+pub struct OcResponseFrame {
+    #[serde(rename = "type")]
+    pub frame_type: &'static str, // always "res"
+    pub id: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<OcError>,
+}
+
+impl OcResponseFrame {
+    pub fn success(id: String, payload: serde_json::Value) -> Self {
+        Self {
+            frame_type: "res",
+            id,
+            ok: true,
+            payload: Some(payload),
+            error: None,
+        }
+    }
+
+    pub fn error(id: String, message: String, code: Option<i32>) -> Self {
+        Self {
+            frame_type: "res",
+            id,
+            ok: false,
+            payload: None,
+            error: Some(OcError {
+                message,
+                code: code.unwrap_or(-32603),
+            }),
+        }
+    }
+}
+
+/// Error object in OC response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OcError {
+    pub message: String,
+    #[serde(skip_serializing_if = "is_default_error_code")]
+    pub code: i32,
+}
+
+fn is_default_error_code(code: &i32) -> bool {
+    *code == 0
+}
+
+/// OC-format event: `{type:"event", event, payload?}`
+#[derive(Debug, Clone, Serialize)]
+pub struct OcEventFrame {
+    #[serde(rename = "type")]
+    pub frame_type: &'static str, // always "event"
+    pub event: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
+}
+
+impl OcEventFrame {
+    pub fn new(event: impl Into<String>, payload: serde_json::Value) -> Self {
+        Self {
+            frame_type: "event",
+            event: event.into(),
+            payload: Some(payload),
+        }
+    }
+}
+
+// ============================================================================
+// Legacy Frame Types (kept for backwards compat / internal use)
 // ============================================================================
 
-/// A WebSocket frame in the gateway protocol.
+/// A WebSocket frame in the legacy gateway protocol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Frame {
@@ -25,18 +136,7 @@ pub enum Frame {
     Hello(HelloFrame),
 }
 
-/// A request from client to gateway.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RequestFrame {
-    pub id: String,
-    pub method: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub params: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub seq: Option<u64>,
-}
-
-/// A response from gateway to client.
+/// A legacy response from gateway to client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseFrame {
     pub id: String,
@@ -48,7 +148,7 @@ pub struct ResponseFrame {
     pub seq: Option<u64>,
 }
 
-/// An unsolicited event from gateway.
+/// A legacy unsolicited event from gateway.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventFrame {
     pub event: String,
@@ -58,7 +158,7 @@ pub struct EventFrame {
     pub seq: Option<u64>,
 }
 
-/// Initial handshake frame.
+/// Initial handshake frame (unused in OC protocol — replaced by connect.challenge).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelloFrame {
     pub protocol: u32,
@@ -70,7 +170,7 @@ pub struct HelloFrame {
     pub challenge: Option<String>,
 }
 
-/// A protocol error.
+/// A protocol error (legacy format).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProtocolError {
     pub code: i32,
@@ -86,6 +186,116 @@ impl std::fmt::Display for ProtocolError {
 }
 
 impl std::error::Error for ProtocolError {}
+
+// ============================================================================
+// Connect / Handshake Protocol (OC v2026.2.22)
+// ============================================================================
+
+/// Parameters sent in the `connect` request.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectParams {
+    pub min_protocol: Option<u32>,
+    pub max_protocol: Option<u32>,
+    pub client: Option<ConnectClientInfo>,
+    pub role: Option<String>,
+    pub scopes: Option<Vec<String>>,
+    pub caps: Option<Vec<String>>,
+    pub auth: Option<ConnectAuthField>,
+    pub device: Option<DeviceParams>,
+}
+
+/// Client info sent during connect.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectClientInfo {
+    pub id: Option<String>,
+    pub display_name: Option<String>,
+    pub version: Option<String>,
+    pub platform: Option<String>,
+    pub mode: Option<String>,
+}
+
+/// Auth field in connect request.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConnectAuthField {
+    pub token: Option<String>,
+    pub password: Option<String>,
+}
+
+/// Device identity params sent during connect handshake.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceParams {
+    /// Device ID (SHA256 of raw public key).
+    pub id: String,
+    /// Raw 32-byte Ed25519 public key in base64url encoding.
+    pub public_key: String,
+    /// Ed25519 signature over the v2 payload in base64url encoding.
+    pub signature: String,
+    /// Timestamp when signature was created (milliseconds since epoch).
+    pub signed_at: u64,
+    /// Challenge nonce echoed back.
+    pub nonce: String,
+}
+
+// ============================================================================
+// Gateway Scopes
+// ============================================================================
+
+/// Scopes that control what a connection can do.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum GatewayScope {
+    OperatorAdmin,
+    OperatorWrite,
+    OperatorRead,
+    OperatorPairing,
+}
+
+impl GatewayScope {
+    /// Parse a scope string into a GatewayScope.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "operator.admin" => Some(Self::OperatorAdmin),
+            "operator.write" => Some(Self::OperatorWrite),
+            "operator.read" => Some(Self::OperatorRead),
+            "operator.pairing" => Some(Self::OperatorPairing),
+            _ => None,
+        }
+    }
+
+    /// Resolve scope implications: admin implies write+read+pairing.
+    pub fn resolve_scopes(requested: &[String]) -> Vec<GatewayScope> {
+        let mut resolved = Vec::new();
+        for s in requested {
+            if let Some(scope) = Self::from_str(s) {
+                match scope {
+                    GatewayScope::OperatorAdmin => {
+                        resolved.push(GatewayScope::OperatorAdmin);
+                        resolved.push(GatewayScope::OperatorWrite);
+                        resolved.push(GatewayScope::OperatorRead);
+                        resolved.push(GatewayScope::OperatorPairing);
+                    }
+                    other => resolved.push(other),
+                }
+            }
+        }
+        resolved.sort_by_key(|s| format!("{:?}", s));
+        resolved.dedup();
+        resolved
+    }
+}
+
+/// State tracked per WebSocket connection.
+#[derive(Debug, Clone)]
+pub struct ConnectionState {
+    pub client_id: String,
+    pub handshake_complete: bool,
+    pub challenge_nonce: String,
+    pub scopes: Vec<GatewayScope>,
+    pub user_id: Option<String>,
+    pub session_id: String,
+}
 
 // ============================================================================
 // Chat Protocol
@@ -226,13 +436,6 @@ pub struct ChannelAccountSnapshot {
 // ============================================================================
 // Connect Protocol
 // ============================================================================
-
-/// Authentication sent during WebSocket connect.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConnectAuth {
-    pub token: Option<String>,
-    pub password: Option<String>,
-}
 
 /// Hello response sent after successful auth.
 #[derive(Debug, Clone, Serialize, Deserialize)]

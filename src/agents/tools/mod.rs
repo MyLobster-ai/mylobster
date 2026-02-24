@@ -1,4 +1,4 @@
-mod bash;
+pub mod bash;
 mod browser_tool;
 mod canvas;
 mod common;
@@ -11,8 +11,8 @@ mod sessions_tool;
 mod slack_actions;
 mod telegram_actions;
 mod tts_tool;
-mod web_fetch;
-mod web_search;
+pub mod web_fetch;
+pub mod web_search;
 mod whatsapp_actions;
 
 pub use common::*;

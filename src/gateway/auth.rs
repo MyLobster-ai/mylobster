@@ -1,7 +1,9 @@
 use crate::config::{GatewayAuthConfig, GatewayAuthMode};
+use crate::gateway::protocol::{ConnectAuthField, DeviceParams};
+use ed25519_dalek::{Signature, VerifyingKey, Verifier};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
-use tracing::{debug, warn};
+use tracing::debug;
 
 // ============================================================================
 // Types
@@ -210,4 +212,179 @@ pub fn describe_gateway_close_code(code: u16) -> Option<&'static str> {
         1012 => Some("service restart"),
         _ => None,
     }
+}
+
+// ============================================================================
+// Connect Auth (OC protocol)
+// ============================================================================
+
+/// Authorize a connect request using the OC auth field.
+pub fn authorize_connect_auth(
+    auth: &ResolvedGatewayAuth,
+    connect_auth: Option<&ConnectAuthField>,
+    is_local: bool,
+) -> GatewayAuthResult {
+    // Convert ConnectAuthField to ConnectAuth for reuse
+    let legacy = connect_auth.map(|ca| ConnectAuth {
+        token: ca.token.clone(),
+        password: ca.password.clone(),
+    });
+    authorize_gateway_connect(auth, legacy.as_ref(), is_local)
+}
+
+// ============================================================================
+// Ed25519 Device Identity Verification
+// ============================================================================
+
+/// Maximum allowed clock skew for device signatures (2 minutes).
+const MAX_SIGNATURE_SKEW_MS: u64 = 120_000;
+
+/// Result of device identity verification.
+#[derive(Debug)]
+pub struct DeviceVerifyResult {
+    pub valid: bool,
+    pub device_id: Option<String>,
+    pub reason: Option<String>,
+}
+
+/// Verify an Ed25519 device identity from the connect handshake.
+///
+/// The bridge signs a v2 payload:
+///   `"v2|deviceId|clientId|clientMode|role|scopes|signedAtMs|token|nonce"`
+///
+/// We reconstruct this payload and verify the Ed25519 signature.
+pub fn verify_device_identity(
+    device: &DeviceParams,
+    client_id: &str,
+    client_mode: &str,
+    role: &str,
+    scopes: &[String],
+    token: Option<&str>,
+    expected_nonce: &str,
+) -> DeviceVerifyResult {
+    // 1. Validate nonce matches challenge
+    if device.nonce != expected_nonce {
+        return DeviceVerifyResult {
+            valid: false,
+            device_id: None,
+            reason: Some("nonce mismatch".to_string()),
+        };
+    }
+
+    // 2. Check signature freshness (within 2-minute skew)
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+
+    let skew = if now_ms > device.signed_at {
+        now_ms - device.signed_at
+    } else {
+        device.signed_at - now_ms
+    };
+
+    if skew > MAX_SIGNATURE_SKEW_MS {
+        return DeviceVerifyResult {
+            valid: false,
+            device_id: None,
+            reason: Some(format!("signature too old: {}ms skew", skew)),
+        };
+    }
+
+    // 3. Decode raw 32-byte Ed25519 public key from base64url
+    let pub_key_bytes = match base64url_decode(&device.public_key) {
+        Some(bytes) => bytes,
+        None => {
+            return DeviceVerifyResult {
+                valid: false,
+                device_id: None,
+                reason: Some("invalid base64url public key".to_string()),
+            }
+        }
+    };
+
+    if pub_key_bytes.len() != 32 {
+        return DeviceVerifyResult {
+            valid: false,
+            device_id: None,
+            reason: Some(format!(
+                "public key must be 32 bytes, got {}",
+                pub_key_bytes.len()
+            )),
+        };
+    }
+
+    let verifying_key = match VerifyingKey::from_bytes(
+        pub_key_bytes.as_slice().try_into().unwrap(),
+    ) {
+        Ok(k) => k,
+        Err(e) => {
+            return DeviceVerifyResult {
+                valid: false,
+                device_id: None,
+                reason: Some(format!("invalid Ed25519 public key: {}", e)),
+            }
+        }
+    };
+
+    // 4. Decode signature from base64url
+    let sig_bytes = match base64url_decode(&device.signature) {
+        Some(bytes) => bytes,
+        None => {
+            return DeviceVerifyResult {
+                valid: false,
+                device_id: None,
+                reason: Some("invalid base64url signature".to_string()),
+            }
+        }
+    };
+
+    let signature = match Signature::from_slice(&sig_bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            return DeviceVerifyResult {
+                valid: false,
+                device_id: None,
+                reason: Some(format!("invalid Ed25519 signature: {}", e)),
+            }
+        }
+    };
+
+    // 5. Reconstruct v2 payload exactly as bridge builds it:
+    //    "v2|deviceId|clientId|clientMode|role|scopes|signedAtMs|token|nonce"
+    let scopes_str = scopes.join(",");
+    let token_str = token.unwrap_or("");
+    let payload = format!(
+        "v2|{}|{}|{}|{}|{}|{}|{}|{}",
+        device.id,
+        client_id,
+        client_mode,
+        role,
+        scopes_str,
+        device.signed_at,
+        token_str,
+        device.nonce,
+    );
+
+    // 6. Verify Ed25519 signature over UTF-8 payload bytes
+    match verifying_key.verify(payload.as_bytes(), &signature) {
+        Ok(()) => DeviceVerifyResult {
+            valid: true,
+            device_id: Some(device.id.clone()),
+            reason: None,
+        },
+        Err(e) => DeviceVerifyResult {
+            valid: false,
+            device_id: None,
+            reason: Some(format!("signature verification failed: {}", e)),
+        },
+    }
+}
+
+/// Decode a base64url-encoded string (no padding) into bytes.
+fn base64url_decode(input: &str) -> Option<Vec<u8>> {
+    use data_encoding::BASE64URL_NOPAD;
+    // The bridge strips trailing '=' so we use no-pad variant.
+    // base64url uses A-Z, a-z, 0-9, -, _ and is case-sensitive.
+    BASE64URL_NOPAD.decode(input.as_bytes()).ok()
 }
