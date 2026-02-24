@@ -388,3 +388,565 @@ fn base64url_decode(input: &str) -> Option<Vec<u8>> {
     // base64url uses A-Z, a-z, 0-9, -, _ and is case-sensitive.
     BASE64URL_NOPAD.decode(input.as_bytes()).ok()
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::GatewayAuthMode;
+    use data_encoding::BASE64URL_NOPAD;
+    use ed25519_dalek::{SigningKey, Signer};
+
+    // --- Helper: generate Ed25519 key pair and sign a v2 payload ---
+    fn make_device_params(
+        device_id: &str,
+        client_id: &str,
+        client_mode: &str,
+        role: &str,
+        scopes: &[&str],
+        token: Option<&str>,
+        nonce: &str,
+    ) -> (DeviceParams, SigningKey) {
+        let signing_key = {
+            let mut secret = [0u8; 32];
+            use rand::RngCore;
+            rand::thread_rng().fill_bytes(&mut secret);
+            SigningKey::from_bytes(&secret)
+        };
+        let public_key_bytes = signing_key.verifying_key().to_bytes();
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let scopes_str = scopes.join(",");
+        let token_str = token.unwrap_or("");
+        let payload = format!(
+            "v2|{}|{}|{}|{}|{}|{}|{}|{}",
+            device_id, client_id, client_mode, role, scopes_str, now_ms, token_str, nonce
+        );
+
+        let signature = signing_key.sign(payload.as_bytes());
+
+        let params = DeviceParams {
+            id: device_id.to_string(),
+            public_key: BASE64URL_NOPAD.encode(&public_key_bytes),
+            signature: BASE64URL_NOPAD.encode(&signature.to_bytes()),
+            signed_at: now_ms,
+            nonce: nonce.to_string(),
+        };
+
+        (params, signing_key)
+    }
+
+    // =====================================================================
+    // resolve_gateway_auth
+    // =====================================================================
+
+    #[test]
+    fn resolve_auth_env_token_overrides_config_token() {
+        let cfg = GatewayAuthConfig {
+            mode: GatewayAuthMode::Token,
+            token: Some("config-token".into()),
+            password: None,
+            allow_tailscale: false,
+        };
+        let resolved = resolve_gateway_auth(Some(&cfg), Some("env-token"));
+        assert_eq!(resolved.token.as_deref(), Some("env-token"));
+    }
+
+    #[test]
+    fn resolve_auth_password_only_switches_to_password_mode() {
+        let cfg = GatewayAuthConfig {
+            mode: GatewayAuthMode::Token, // default
+            token: None,
+            password: Some("secret".into()),
+            allow_tailscale: false,
+        };
+        let resolved = resolve_gateway_auth(Some(&cfg), None);
+        assert!(matches!(resolved.mode, GatewayAuthMode::Password));
+        assert_eq!(resolved.password.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn resolve_auth_defaults_when_no_config() {
+        let resolved = resolve_gateway_auth(None, None);
+        assert!(resolved.token.is_none());
+        assert!(resolved.password.is_none());
+    }
+
+    // =====================================================================
+    // assert_gateway_auth_configured
+    // =====================================================================
+
+    #[test]
+    fn assert_configured_token_mode_without_token_fails() {
+        let auth = ResolvedGatewayAuth {
+            mode: GatewayAuthMode::Token,
+            token: None,
+            password: None,
+            allow_tailscale: false,
+        };
+        assert!(assert_gateway_auth_configured(&auth).is_err());
+    }
+
+    #[test]
+    fn assert_configured_token_mode_with_token_ok() {
+        let auth = ResolvedGatewayAuth {
+            mode: GatewayAuthMode::Token,
+            token: Some("t".into()),
+            password: None,
+            allow_tailscale: false,
+        };
+        assert!(assert_gateway_auth_configured(&auth).is_ok());
+    }
+
+    #[test]
+    fn assert_configured_password_mode_without_password_fails() {
+        let auth = ResolvedGatewayAuth {
+            mode: GatewayAuthMode::Password,
+            token: None,
+            password: None,
+            allow_tailscale: false,
+        };
+        assert!(assert_gateway_auth_configured(&auth).is_err());
+    }
+
+    // =====================================================================
+    // authorize_gateway_connect — token mode
+    // =====================================================================
+
+    #[test]
+    fn token_auth_correct_token_succeeds() {
+        let auth = ResolvedGatewayAuth {
+            mode: GatewayAuthMode::Token,
+            token: Some("my-secret".into()),
+            password: None,
+            allow_tailscale: false,
+        };
+        let creds = ConnectAuth {
+            token: Some("my-secret".into()),
+            password: None,
+        };
+        let result = authorize_gateway_connect(&auth, Some(&creds), false);
+        assert!(result.ok);
+        assert_eq!(result.method.as_deref(), Some("token"));
+    }
+
+    #[test]
+    fn token_auth_wrong_token_fails() {
+        let auth = ResolvedGatewayAuth {
+            mode: GatewayAuthMode::Token,
+            token: Some("my-secret".into()),
+            password: None,
+            allow_tailscale: false,
+        };
+        let creds = ConnectAuth {
+            token: Some("wrong".into()),
+            password: None,
+        };
+        let result = authorize_gateway_connect(&auth, Some(&creds), false);
+        assert!(!result.ok);
+    }
+
+    #[test]
+    fn token_auth_password_field_fallback() {
+        // Bridge sometimes sends token in the "password" field
+        let auth = ResolvedGatewayAuth {
+            mode: GatewayAuthMode::Token,
+            token: Some("my-secret".into()),
+            password: None,
+            allow_tailscale: false,
+        };
+        let creds = ConnectAuth {
+            token: None,
+            password: Some("my-secret".into()),
+        };
+        let result = authorize_gateway_connect(&auth, Some(&creds), false);
+        assert!(result.ok);
+        assert_eq!(result.method.as_deref(), Some("token"));
+    }
+
+    #[test]
+    fn no_auth_configured_allows_local() {
+        let auth = ResolvedGatewayAuth {
+            mode: GatewayAuthMode::Token,
+            token: None,
+            password: None,
+            allow_tailscale: false,
+        };
+        let result = authorize_gateway_connect(&auth, None, true);
+        assert!(result.ok);
+        assert_eq!(result.method.as_deref(), Some("local"));
+    }
+
+    #[test]
+    fn no_auth_configured_rejects_remote() {
+        let auth = ResolvedGatewayAuth {
+            mode: GatewayAuthMode::Token,
+            token: None,
+            password: None,
+            allow_tailscale: false,
+        };
+        let result = authorize_gateway_connect(&auth, None, false);
+        assert!(!result.ok);
+    }
+
+    // =====================================================================
+    // authorize_gateway_connect — password mode
+    // =====================================================================
+
+    #[test]
+    fn password_auth_correct_password_succeeds() {
+        let auth = ResolvedGatewayAuth {
+            mode: GatewayAuthMode::Password,
+            token: None,
+            password: Some("pass123".into()),
+            allow_tailscale: false,
+        };
+        let creds = ConnectAuth {
+            token: None,
+            password: Some("pass123".into()),
+        };
+        let result = authorize_gateway_connect(&auth, Some(&creds), false);
+        assert!(result.ok);
+        assert_eq!(result.method.as_deref(), Some("password"));
+    }
+
+    #[test]
+    fn password_auth_wrong_password_fails() {
+        let auth = ResolvedGatewayAuth {
+            mode: GatewayAuthMode::Password,
+            token: None,
+            password: Some("pass123".into()),
+            allow_tailscale: false,
+        };
+        let creds = ConnectAuth {
+            token: None,
+            password: Some("wrong".into()),
+        };
+        let result = authorize_gateway_connect(&auth, Some(&creds), false);
+        assert!(!result.ok);
+    }
+
+    // =====================================================================
+    // authorize_connect_auth (OC ConnectAuthField wrapper)
+    // =====================================================================
+
+    #[test]
+    fn connect_auth_field_token_succeeds() {
+        let auth = ResolvedGatewayAuth {
+            mode: GatewayAuthMode::Token,
+            token: Some("tok".into()),
+            password: None,
+            allow_tailscale: false,
+        };
+        let field = ConnectAuthField {
+            token: Some("tok".into()),
+            password: None,
+        };
+        let result = authorize_connect_auth(&auth, Some(&field), false);
+        assert!(result.ok);
+    }
+
+    // =====================================================================
+    // extract_bearer_token
+    // =====================================================================
+
+    #[test]
+    fn extract_bearer_standard() {
+        assert_eq!(extract_bearer_token("Bearer abc123"), Some("abc123"));
+    }
+
+    #[test]
+    fn extract_bearer_case_insensitive() {
+        assert_eq!(extract_bearer_token("bearer abc123"), Some("abc123"));
+        assert_eq!(extract_bearer_token("BEARER abc123"), Some("abc123"));
+    }
+
+    #[test]
+    fn extract_bearer_not_bearer() {
+        assert!(extract_bearer_token("Basic abc123").is_none());
+        assert!(extract_bearer_token("").is_none());
+        assert!(extract_bearer_token("Bearer").is_none());
+    }
+
+    // =====================================================================
+    // extract_query_token
+    // =====================================================================
+
+    #[test]
+    fn extract_query_token_found() {
+        assert_eq!(
+            extract_query_token("foo=bar&token=abc123&baz=1"),
+            Some("abc123".into())
+        );
+    }
+
+    #[test]
+    fn extract_query_token_not_found() {
+        assert!(extract_query_token("foo=bar&baz=1").is_none());
+    }
+
+    #[test]
+    fn extract_query_token_first_param() {
+        assert_eq!(
+            extract_query_token("token=first"),
+            Some("first".into())
+        );
+    }
+
+    // =====================================================================
+    // is_local_request
+    // =====================================================================
+
+    #[test]
+    fn localhost_is_local() {
+        let addr: std::net::SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert!(is_local_request(&addr));
+    }
+
+    #[test]
+    fn ipv6_loopback_is_local() {
+        let addr: std::net::SocketAddr = "[::1]:8080".parse().unwrap();
+        assert!(is_local_request(&addr));
+    }
+
+    #[test]
+    fn remote_ip_is_not_local() {
+        let addr: std::net::SocketAddr = "1.2.3.4:8080".parse().unwrap();
+        assert!(!is_local_request(&addr));
+    }
+
+    // =====================================================================
+    // describe_gateway_close_code
+    // =====================================================================
+
+    #[test]
+    fn known_close_codes() {
+        assert_eq!(describe_gateway_close_code(1000), Some("normal closure"));
+        assert_eq!(describe_gateway_close_code(1006), Some("abnormal closure (no close frame)"));
+        assert_eq!(describe_gateway_close_code(1008), Some("policy violation"));
+        assert_eq!(describe_gateway_close_code(1012), Some("service restart"));
+    }
+
+    #[test]
+    fn unknown_close_code() {
+        assert!(describe_gateway_close_code(9999).is_none());
+    }
+
+    // =====================================================================
+    // Ed25519 device identity verification
+    // =====================================================================
+
+    #[test]
+    fn valid_device_identity_verification() {
+        let nonce = "challenge-nonce-abc";
+        let (device, _signing_key) = make_device_params(
+            "device-123",
+            "gateway-client",
+            "bridge",
+            "operator",
+            &["operator.admin"],
+            Some("tok123"),
+            nonce,
+        );
+
+        let result = verify_device_identity(
+            &device,
+            "gateway-client",
+            "bridge",
+            "operator",
+            &["operator.admin".to_string()],
+            Some("tok123"),
+            nonce,
+        );
+
+        assert!(result.valid, "Expected valid, got: {:?}", result.reason);
+        assert_eq!(result.device_id.as_deref(), Some("device-123"));
+    }
+
+    #[test]
+    fn device_identity_nonce_mismatch_fails() {
+        let (device, _) = make_device_params(
+            "dev1", "gc", "bridge", "operator", &["operator.admin"], None, "nonce-A",
+        );
+        let result = verify_device_identity(
+            &device, "gc", "bridge", "operator",
+            &["operator.admin".to_string()], None, "nonce-B",
+        );
+        assert!(!result.valid);
+        assert!(result.reason.as_deref().unwrap().contains("nonce mismatch"));
+    }
+
+    #[test]
+    fn device_identity_stale_signature_fails() {
+        let nonce = "test-nonce";
+        let signing_key = {
+            let mut secret = [0u8; 32];
+            use rand::RngCore;
+            rand::thread_rng().fill_bytes(&mut secret);
+            SigningKey::from_bytes(&secret)
+        };
+        let public_key_bytes = signing_key.verifying_key().to_bytes();
+
+        // 5 minutes ago — beyond 2-minute skew
+        let stale_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            - 300_000;
+
+        let payload = format!("v2|dev1|gc|bridge|operator||{}||{}", stale_ms, nonce);
+        let signature = signing_key.sign(payload.as_bytes());
+
+        let device = DeviceParams {
+            id: "dev1".to_string(),
+            public_key: BASE64URL_NOPAD.encode(&public_key_bytes),
+            signature: BASE64URL_NOPAD.encode(&signature.to_bytes()),
+            signed_at: stale_ms,
+            nonce: nonce.to_string(),
+        };
+
+        let result = verify_device_identity(
+            &device, "gc", "bridge", "operator", &[], None, nonce,
+        );
+        assert!(!result.valid);
+        assert!(result.reason.as_deref().unwrap().contains("too old"));
+    }
+
+    #[test]
+    fn device_identity_wrong_payload_fails() {
+        let nonce = "test-nonce";
+        let (mut device, _) = make_device_params(
+            "dev1", "gc", "bridge", "operator", &["operator.admin"], None, nonce,
+        );
+        // Tamper with device ID after signing
+        device.id = "tampered-id".to_string();
+
+        let result = verify_device_identity(
+            &device, "gc", "bridge", "operator",
+            &["operator.admin".to_string()], None, nonce,
+        );
+        assert!(!result.valid);
+        assert!(result.reason.as_deref().unwrap().contains("verification failed"));
+    }
+
+    #[test]
+    fn device_identity_invalid_public_key() {
+        let device = DeviceParams {
+            id: "dev1".to_string(),
+            public_key: "not-valid-base64url!!!".to_string(),
+            signature: "AAAA".to_string(),
+            signed_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            nonce: "n".to_string(),
+        };
+        let result = verify_device_identity(&device, "gc", "bridge", "op", &[], None, "n");
+        assert!(!result.valid);
+        assert!(result.reason.as_deref().unwrap().contains("base64url"));
+    }
+
+    #[test]
+    fn device_identity_wrong_key_length() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        // 16 bytes instead of 32
+        let short_key = BASE64URL_NOPAD.encode(&[0u8; 16]);
+        let device = DeviceParams {
+            id: "dev1".to_string(),
+            public_key: short_key,
+            signature: BASE64URL_NOPAD.encode(&[0u8; 64]),
+            signed_at: now_ms,
+            nonce: "n".to_string(),
+        };
+        let result = verify_device_identity(&device, "gc", "bridge", "op", &[], None, "n");
+        assert!(!result.valid);
+        assert!(result.reason.as_deref().unwrap().contains("32 bytes"));
+    }
+
+    #[test]
+    fn device_identity_multiple_scopes() {
+        let nonce = "scope-nonce";
+        let (device, _) = make_device_params(
+            "dev1", "gc", "bridge", "operator",
+            &["operator.read", "operator.write"],
+            Some("t"),
+            nonce,
+        );
+        let result = verify_device_identity(
+            &device, "gc", "bridge", "operator",
+            &["operator.read".to_string(), "operator.write".to_string()],
+            Some("t"),
+            nonce,
+        );
+        assert!(result.valid, "Expected valid, got: {:?}", result.reason);
+    }
+
+    #[test]
+    fn device_identity_empty_token() {
+        let nonce = "no-tok";
+        let (device, _) = make_device_params(
+            "dev1", "gc", "bridge", "operator", &[], None, nonce,
+        );
+        let result = verify_device_identity(
+            &device, "gc", "bridge", "operator", &[], None, nonce,
+        );
+        assert!(result.valid, "Expected valid, got: {:?}", result.reason);
+    }
+
+    // =====================================================================
+    // base64url_decode
+    // =====================================================================
+
+    #[test]
+    fn base64url_decode_valid() {
+        // "hello" in base64url = "aGVsbG8"
+        let decoded = base64url_decode("aGVsbG8").unwrap();
+        assert_eq!(decoded, b"hello");
+    }
+
+    #[test]
+    fn base64url_decode_invalid() {
+        assert!(base64url_decode("!!!invalid!!!").is_none());
+    }
+
+    // =====================================================================
+    // GatewayAuthResult serialization (parity with OC)
+    // =====================================================================
+
+    #[test]
+    fn auth_result_success_serialization() {
+        let r = GatewayAuthResult::success("token");
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["method"], "token");
+        // user and reason should be absent (skip_serializing_if)
+        assert!(v.get("user").is_none());
+        assert!(v.get("reason").is_none());
+    }
+
+    #[test]
+    fn auth_result_failure_serialization() {
+        let r = GatewayAuthResult::failure("bad token");
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["reason"], "bad token");
+        assert!(v.get("method").is_none());
+    }
+
+    #[test]
+    fn auth_result_success_with_user() {
+        let r = GatewayAuthResult::success_with_user("token", "user@example.com");
+        assert!(r.ok);
+        assert_eq!(r.user.as_deref(), Some("user@example.com"));
+    }
+}

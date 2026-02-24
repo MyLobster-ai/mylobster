@@ -2,7 +2,7 @@ mod auth;
 mod chat;
 mod client;
 mod protocol;
-mod routes;
+pub mod routes;
 mod server;
 mod websocket;
 
