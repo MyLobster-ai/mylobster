@@ -7,6 +7,23 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 // ============================================================================
+// Turn-Source Binding (v2026.2.24)
+// ============================================================================
+
+/// Identifies the originating channel/target for the current turn.
+///
+/// When a shared session is used by multiple channels, the turn source
+/// records which channel initiated the current turn so that the reply
+/// can be routed back to the correct destination.
+#[derive(Debug, Clone, Default)]
+pub struct TurnSource {
+    pub channel: Option<String>,
+    pub to: Option<String>,
+    pub account_id: Option<String>,
+    pub thread_id: Option<String>,
+}
+
+// ============================================================================
 // Session Handle
 // ============================================================================
 
@@ -19,6 +36,8 @@ pub struct SessionHandle {
 struct SessionInner {
     info: parking_lot::RwLock<SessionInfo>,
     history: parking_lot::RwLock<Vec<ProviderMessage>>,
+    /// Turn-source binding for reply routing (v2026.2.24).
+    turn_source: parking_lot::RwLock<Option<TurnSource>>,
 }
 
 impl SessionHandle {
@@ -27,6 +46,7 @@ impl SessionHandle {
             inner: Arc::new(SessionInner {
                 info: parking_lot::RwLock::new(info),
                 history: parking_lot::RwLock::new(Vec::new()),
+                turn_source: parking_lot::RwLock::new(None),
             }),
         }
     }
@@ -59,6 +79,21 @@ impl SessionHandle {
             info.thinking = Some(String::clone(thinking));
         }
         info.updated_at = chrono::Utc::now().to_rfc3339();
+    }
+
+    /// Get the current turn source for reply routing.
+    pub fn get_turn_source(&self) -> Option<TurnSource> {
+        self.inner.turn_source.read().clone()
+    }
+
+    /// Set the turn source for the current turn.
+    pub fn set_turn_source(&self, source: TurnSource) {
+        *self.inner.turn_source.write() = Some(source);
+    }
+
+    /// Clear the turn source (e.g. at end of turn).
+    pub fn clear_turn_source(&self) {
+        *self.inner.turn_source.write() = None;
     }
 }
 

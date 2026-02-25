@@ -2,14 +2,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Protocol version for WebSocket communication.
-/// Version 3 matches OpenClaw v2026.2.22.
+/// Version 3 matches OpenClaw v2026.2.24.
 pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Maximum WebSocket payload size (25 MB).
 pub const MAX_WS_PAYLOAD: usize = 25 * 1024 * 1024;
 
 // ============================================================================
-// OC-Compatible Frame Types (OpenClaw v2026.2.22 wire protocol)
+// OC-Compatible Frame Types (OpenClaw v2026.2.24 wire protocol)
 // ============================================================================
 //
 // The bridge sends `type:"req"` and expects `type:"res"` with `ok`/`payload`
@@ -188,7 +188,7 @@ impl std::fmt::Display for ProtocolError {
 impl std::error::Error for ProtocolError {}
 
 // ============================================================================
-// Connect / Handshake Protocol (OC v2026.2.22)
+// Connect / Handshake Protocol (OC v2026.2.24)
 // ============================================================================
 
 /// Parameters sent in the `connect` request.
@@ -317,6 +317,9 @@ pub struct ChatSendParams {
     pub timeout_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    /// When true, delivery failures are silently ignored (v2026.2.24).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_effort_deliver: Option<bool>,
 }
 
 /// Chat event streamed back to client.
@@ -566,7 +569,7 @@ pub struct ChatCompletionDelta {
 }
 
 // ============================================================================
-// Tests — OpenClaw v2026.2.22 Protocol Parity
+// Tests — OpenClaw v2026.2.24 Protocol Parity
 // ============================================================================
 
 #[cfg(test)]
@@ -930,7 +933,7 @@ mod tests {
     // ====================================================================
 
     #[test]
-    fn protocol_version_matches_openclaw_v2026_2_22() {
+    fn protocol_version_matches_openclaw_v2026_2_24() {
         assert_eq!(PROTOCOL_VERSION, 3);
     }
 
@@ -988,5 +991,65 @@ mod tests {
         assert_eq!(params.session_key, "s1");
         assert_eq!(params.title.as_deref(), Some("New Title"));
         assert_eq!(params.model.as_deref(), Some("claude-opus-4-6"));
+    }
+
+    // ====================================================================
+    // v2026.2.24 — ChatSendParams.bestEffortDeliver
+    // ====================================================================
+
+    #[test]
+    fn chat_send_params_best_effort_deliver() {
+        let raw = json!({
+            "sessionKey": "s1",
+            "message": "hello",
+            "bestEffortDeliver": true
+        });
+        let params: ChatSendParams = serde_json::from_value(raw).unwrap();
+        assert_eq!(params.best_effort_deliver, Some(true));
+    }
+
+    #[test]
+    fn chat_send_params_best_effort_deliver_absent() {
+        let raw = json!({
+            "sessionKey": "s1",
+            "message": "hello"
+        });
+        let params: ChatSendParams = serde_json::from_value(raw).unwrap();
+        assert!(params.best_effort_deliver.is_none());
+    }
+
+    #[test]
+    fn chat_send_params_best_effort_deliver_roundtrip() {
+        let params = ChatSendParams {
+            session_key: "s1".into(),
+            message: "hi".into(),
+            thinking: None,
+            deliver: None,
+            attachments: None,
+            timeout_ms: None,
+            idempotency_key: None,
+            best_effort_deliver: Some(true),
+        };
+        let v = serde_json::to_value(&params).unwrap();
+        assert_eq!(v["bestEffortDeliver"], true);
+
+        let back: ChatSendParams = serde_json::from_value(v).unwrap();
+        assert_eq!(back.best_effort_deliver, Some(true));
+    }
+
+    #[test]
+    fn chat_send_params_best_effort_deliver_skipped_when_none() {
+        let params = ChatSendParams {
+            session_key: "s1".into(),
+            message: "hi".into(),
+            thinking: None,
+            deliver: None,
+            attachments: None,
+            timeout_ms: None,
+            idempotency_key: None,
+            best_effort_deliver: None,
+        };
+        let v = serde_json::to_value(&params).unwrap();
+        assert!(v.get("bestEffortDeliver").is_none());
     }
 }

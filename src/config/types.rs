@@ -447,6 +447,46 @@ pub struct AgentContextPruningConfig {
     pub min_prunable_tool_chars: Option<u64>,
 }
 
+/// Heartbeat delivery target.
+///
+/// In OpenClaw v2026.2.24, the default was flipped from "last" to "none".
+/// - `None` — heartbeat runs but does not deliver to any channel (default).
+/// - `Last` — deliver to the last-active channel.
+/// - `Channel(name)` — deliver to a specific channel (e.g. "telegram", "discord").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeartbeatTarget {
+    None,
+    Last,
+    Channel(String),
+}
+
+impl Serialize for HeartbeatTarget {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            HeartbeatTarget::None => serializer.serialize_str("none"),
+            HeartbeatTarget::Last => serializer.serialize_str("last"),
+            HeartbeatTarget::Channel(ch) => serializer.serialize_str(ch),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for HeartbeatTarget {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "none" => Ok(HeartbeatTarget::None),
+            "last" => Ok(HeartbeatTarget::Last),
+            other => Ok(HeartbeatTarget::Channel(other.to_string())),
+        }
+    }
+}
+
+impl Default for HeartbeatTarget {
+    fn default() -> Self {
+        HeartbeatTarget::None
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HeartbeatConfig {
@@ -454,7 +494,7 @@ pub struct HeartbeatConfig {
     pub active_hours: Option<HeartbeatActiveHours>,
     pub model: Option<String>,
     pub session: Option<String>,
-    pub target: Option<String>,
+    pub target: Option<HeartbeatTarget>,
     pub to: Option<String>,
     pub account_id: Option<String>,
     pub prompt: Option<String>,
@@ -532,6 +572,8 @@ pub struct SubagentsConfig {
     pub model: Option<String>,
     pub max_spawn_depth: Option<u8>,
     pub max_children_per_agent: Option<u8>,
+    /// Maximum time in seconds a subagent run is allowed to execute (v2026.2.24).
+    pub run_timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2343,6 +2385,12 @@ pub struct SandboxDockerSettings {
     pub dns: Option<Vec<String>>,
     pub extra_hosts: Option<Vec<String>>,
     pub binds: Option<Vec<String>>,
+    /// Allow reserved container target names in sandbox (v2026.2.24 security).
+    pub dangerously_allow_reserved_container_targets: Option<bool>,
+    /// Allow external bind mount sources outside workspace (v2026.2.24 security).
+    pub dangerously_allow_external_bind_sources: Option<bool>,
+    /// Allow `network: "container:<id>"` namespace joins (v2026.2.24 security).
+    pub dangerously_allow_container_namespace_join: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2437,6 +2485,41 @@ impl Default for BrowserConfig {
             snapshot_defaults: None,
         }
     }
+}
+
+// ============================================================================
+// Talk Configuration (provider-agnostic voice, v2026.2.24)
+// ============================================================================
+
+/// Per-provider talk voice configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TalkProviderConfig {
+    pub voice_id: Option<String>,
+    pub voice_aliases: Option<HashMap<String, String>>,
+    pub model_id: Option<String>,
+    pub output_format: Option<String>,
+    pub api_key: Option<String>,
+}
+
+/// Multi-provider talk configuration.
+///
+/// Supports both legacy (top-level voice fields) and new (per-provider) formats.
+/// The `provider` field selects the active provider; `providers` holds per-provider
+/// settings. Legacy top-level fields are kept for migration compatibility.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TalkConfig {
+    /// Active provider id (e.g. "elevenlabs", "openai").
+    pub provider: Option<String>,
+    /// Per-provider configurations keyed by provider id.
+    pub providers: Option<HashMap<String, TalkProviderConfig>>,
+    // Legacy top-level fields (migrated into providers["elevenlabs"] by normalize).
+    pub voice_id: Option<String>,
+    pub voice_aliases: Option<HashMap<String, String>>,
+    pub model_id: Option<String>,
+    pub output_format: Option<String>,
+    pub api_key: Option<String>,
 }
 
 // ============================================================================
@@ -2677,4 +2760,165 @@ fn default_retry_min_delay() -> u64 {
 
 fn default_retry_max_delay() -> u64 {
     10_000
+}
+
+// ============================================================================
+// Tests — v2026.2.24 Config Type Parity
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ====================================================================
+    // HeartbeatTarget serde
+    // ====================================================================
+
+    #[test]
+    fn heartbeat_target_none_serializes_as_string() {
+        let target = HeartbeatTarget::None;
+        let v = serde_json::to_value(&target).unwrap();
+        assert_eq!(v, json!("none"));
+    }
+
+    #[test]
+    fn heartbeat_target_last_serializes_as_string() {
+        let target = HeartbeatTarget::Last;
+        let v = serde_json::to_value(&target).unwrap();
+        assert_eq!(v, json!("last"));
+    }
+
+    #[test]
+    fn heartbeat_target_channel_serializes_as_channel_name() {
+        let target = HeartbeatTarget::Channel("telegram".to_string());
+        let v = serde_json::to_value(&target).unwrap();
+        assert_eq!(v, json!("telegram"));
+    }
+
+    #[test]
+    fn heartbeat_target_roundtrip_none() {
+        let v = json!("none");
+        let target: HeartbeatTarget = serde_json::from_value(v).unwrap();
+        assert_eq!(target, HeartbeatTarget::None);
+    }
+
+    #[test]
+    fn heartbeat_target_roundtrip_last() {
+        let v = json!("last");
+        let target: HeartbeatTarget = serde_json::from_value(v).unwrap();
+        assert_eq!(target, HeartbeatTarget::Last);
+    }
+
+    #[test]
+    fn heartbeat_target_roundtrip_channel() {
+        let v = json!("discord");
+        let target: HeartbeatTarget = serde_json::from_value(v).unwrap();
+        assert_eq!(target, HeartbeatTarget::Channel("discord".to_string()));
+    }
+
+    #[test]
+    fn heartbeat_config_default_target_is_none() {
+        let config = HeartbeatConfig::default();
+        assert!(config.target.is_none());
+    }
+
+    #[test]
+    fn heartbeat_config_with_target() {
+        let raw = json!({
+            "target": "telegram",
+            "every": "15m"
+        });
+        let config: HeartbeatConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(
+            config.target,
+            Some(HeartbeatTarget::Channel("telegram".to_string()))
+        );
+    }
+
+    // ====================================================================
+    // SandboxDockerSettings with dangerous_* fields
+    // ====================================================================
+
+    #[test]
+    fn sandbox_docker_settings_with_dangerous_fields() {
+        let raw = json!({
+            "image": "node:22",
+            "dangerouslyAllowContainerNamespaceJoin": true,
+            "dangerouslyAllowExternalBindSources": false,
+            "dangerouslyAllowReservedContainerTargets": true
+        });
+        let settings: SandboxDockerSettings = serde_json::from_value(raw).unwrap();
+        assert_eq!(settings.dangerously_allow_container_namespace_join, Some(true));
+        assert_eq!(settings.dangerously_allow_external_bind_sources, Some(false));
+        assert_eq!(settings.dangerously_allow_reserved_container_targets, Some(true));
+    }
+
+    #[test]
+    fn sandbox_docker_settings_dangerous_fields_absent() {
+        let raw = json!({ "image": "node:22" });
+        let settings: SandboxDockerSettings = serde_json::from_value(raw).unwrap();
+        assert!(settings.dangerously_allow_container_namespace_join.is_none());
+        assert!(settings.dangerously_allow_external_bind_sources.is_none());
+        assert!(settings.dangerously_allow_reserved_container_targets.is_none());
+    }
+
+    // ====================================================================
+    // SubagentsConfig.runTimeoutSeconds
+    // ====================================================================
+
+    #[test]
+    fn subagents_config_run_timeout() {
+        let raw = json!({
+            "maxConcurrent": 4,
+            "runTimeoutSeconds": 300
+        });
+        let config: SubagentsConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(config.run_timeout_seconds, Some(300));
+    }
+
+    // ====================================================================
+    // TalkConfig / TalkProviderConfig
+    // ====================================================================
+
+    #[test]
+    fn talk_config_multi_provider() {
+        let raw = json!({
+            "provider": "elevenlabs",
+            "providers": {
+                "elevenlabs": {
+                    "voiceId": "abc123",
+                    "modelId": "eleven_multilingual_v2"
+                },
+                "openai": {
+                    "voiceId": "alloy",
+                    "outputFormat": "mp3"
+                }
+            }
+        });
+        let config: TalkConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(config.provider.as_deref(), Some("elevenlabs"));
+        let providers = config.providers.unwrap();
+        assert_eq!(providers.len(), 2);
+        assert_eq!(
+            providers["elevenlabs"].voice_id.as_deref(),
+            Some("abc123")
+        );
+        assert_eq!(
+            providers["openai"].output_format.as_deref(),
+            Some("mp3")
+        );
+    }
+
+    #[test]
+    fn talk_config_legacy_top_level() {
+        let raw = json!({
+            "voiceId": "legacy-voice",
+            "apiKey": "sk-xxx"
+        });
+        let config: TalkConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(config.voice_id.as_deref(), Some("legacy-voice"));
+        assert_eq!(config.api_key.as_deref(), Some("sk-xxx"));
+        assert!(config.providers.is_none());
+    }
 }

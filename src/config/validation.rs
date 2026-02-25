@@ -68,3 +68,111 @@ pub fn validate_config_object(config: &Config) -> Result<()> {
         anyhow::bail!("Configuration validation failed:\n{}", messages.join("\n"));
     }
 }
+
+// ============================================================================
+// Sandbox Network Mode Validation (v2026.2.24)
+// ============================================================================
+
+/// Reason a Docker network mode is blocked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkModeBlockReason {
+    /// `network: "host"` — always blocked.
+    Host,
+    /// `network: "container:<id>"` — blocked unless explicitly allowed.
+    ContainerNamespaceJoin,
+}
+
+/// Check whether a Docker network mode string should be blocked.
+///
+/// Returns `Some(reason)` if the mode is dangerous, `None` if safe.
+///
+/// - `"host"` is always blocked.
+/// - `"container:<id>"` is blocked unless `allow_container_namespace_join` is true.
+/// - All other values (`"bridge"`, `"none"`, custom networks) are allowed.
+pub fn get_blocked_network_mode_reason(
+    network: Option<&str>,
+    allow_container_namespace_join: bool,
+) -> Option<NetworkModeBlockReason> {
+    let network = match network {
+        Some(n) => n.trim().to_lowercase(),
+        None => return None,
+    };
+
+    if network == "host" {
+        return Some(NetworkModeBlockReason::Host);
+    }
+
+    if network.starts_with("container:") && !allow_container_namespace_join {
+        return Some(NetworkModeBlockReason::ContainerNamespaceJoin);
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_network_always_blocked() {
+        assert_eq!(
+            get_blocked_network_mode_reason(Some("host"), false),
+            Some(NetworkModeBlockReason::Host)
+        );
+        assert_eq!(
+            get_blocked_network_mode_reason(Some("host"), true),
+            Some(NetworkModeBlockReason::Host)
+        );
+    }
+
+    #[test]
+    fn host_network_case_insensitive() {
+        assert_eq!(
+            get_blocked_network_mode_reason(Some("HOST"), false),
+            Some(NetworkModeBlockReason::Host)
+        );
+        assert_eq!(
+            get_blocked_network_mode_reason(Some(" Host "), false),
+            Some(NetworkModeBlockReason::Host)
+        );
+    }
+
+    #[test]
+    fn container_namespace_blocked_by_default() {
+        assert_eq!(
+            get_blocked_network_mode_reason(Some("container:abc123"), false),
+            Some(NetworkModeBlockReason::ContainerNamespaceJoin)
+        );
+    }
+
+    #[test]
+    fn container_namespace_allowed_when_flag_set() {
+        assert_eq!(
+            get_blocked_network_mode_reason(Some("container:abc123"), true),
+            None
+        );
+    }
+
+    #[test]
+    fn bridge_network_allowed() {
+        assert_eq!(get_blocked_network_mode_reason(Some("bridge"), false), None);
+    }
+
+    #[test]
+    fn none_network_allowed() {
+        assert_eq!(get_blocked_network_mode_reason(Some("none"), false), None);
+    }
+
+    #[test]
+    fn custom_network_allowed() {
+        assert_eq!(
+            get_blocked_network_mode_reason(Some("my-custom-net"), false),
+            None
+        );
+    }
+
+    #[test]
+    fn no_network_allowed() {
+        assert_eq!(get_blocked_network_mode_reason(None, false), None);
+    }
+}

@@ -48,6 +48,8 @@ pub struct Config {
     #[serde(default)]
     pub browser: BrowserConfig,
     #[serde(default)]
+    pub talk: TalkConfig,
+    #[serde(default)]
     pub tts: TtsConfig,
     #[serde(default)]
     pub cron: CronConfig,
@@ -158,6 +160,7 @@ impl Default for Config {
             diagnostics: DiagnosticsConfig::default(),
             sandbox: SandboxConfig::default(),
             browser: BrowserConfig::default(),
+            talk: TalkConfig::default(),
             tts: TtsConfig::default(),
             cron: CronConfig::default(),
             web: WebConfig::default(),
