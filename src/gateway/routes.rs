@@ -42,6 +42,20 @@ pub fn build_routes(state: GatewayState) -> Router {
         .route("/api/channels/status", get(channels_status_handler))
         // Gateway info
         .route("/api/gateway/info", get(gateway_info_handler))
+        // Models
+        .route("/api/models", get(models_list_handler))
+        // Config
+        .route("/api/config/schema", get(config_schema_handler))
+        // Agents
+        .route("/api/agents", get(agents_list_handler))
+        .route("/api/agents/{id}", get(agent_get_handler))
+        // Cron
+        .route("/api/cron/jobs", get(cron_jobs_handler))
+        .route("/api/cron/status", get(cron_status_handler))
+        // Usage
+        .route("/api/usage", get(usage_handler))
+        // Status
+        .route("/api/status", get(status_handler))
         // OpenAI-compatible endpoints
         .route("/v1/chat/completions", post(chat_completions_handler))
         .route("/v1/responses", post(responses_handler))
@@ -186,6 +200,130 @@ async fn gateway_info_handler(State(state): State<GatewayState>) -> Json<Gateway
         sessions_active: state.sessions.active_count() as u32,
         clients_connected: 0, // TODO: track connected clients
     })
+}
+
+// ============================================================================
+// Models
+// ============================================================================
+
+async fn models_list_handler(State(state): State<GatewayState>) -> Json<serde_json::Value> {
+    let config = state.config.read().await;
+    let mut models = Vec::new();
+    for (provider, provider_config) in &config.models.providers {
+        if provider_config.api_key.is_some() || provider == "ollama" {
+            let provider_models = crate::gateway::websocket_models(provider);
+            models.extend(provider_models);
+        }
+    }
+    if models.is_empty() {
+        models = crate::gateway::websocket_models("anthropic");
+    }
+    Json(serde_json::json!({ "models": models }))
+}
+
+// ============================================================================
+// Config Schema
+// ============================================================================
+
+async fn config_schema_handler() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "schema": {
+            "type": "object",
+            "properties": {
+                "agents": { "type": "object" },
+                "models": { "type": "object" },
+                "channels": { "type": "object" },
+                "gateway": { "type": "object" },
+                "memory": { "type": "object" },
+                "tools": { "type": "object" },
+                "browser": { "type": "object" },
+                "cron": { "type": "object" },
+                "plugins": { "type": "object" },
+            }
+        }
+    }))
+}
+
+// ============================================================================
+// Agents
+// ============================================================================
+
+async fn agents_list_handler(State(state): State<GatewayState>) -> Json<serde_json::Value> {
+    let agents: Vec<serde_json::Value> = state.rpc.agents.read().values().cloned().collect();
+    let mut result = vec![serde_json::json!({
+        "id": "default",
+        "name": "Default Agent",
+    })];
+    result.extend(agents);
+    Json(serde_json::json!({ "agents": result }))
+}
+
+async fn agent_get_handler(
+    State(state): State<GatewayState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if id == "default" {
+        return Ok(Json(serde_json::json!({
+            "id": "default",
+            "name": "Default Agent",
+            "version": state.version,
+        })));
+    }
+    state
+        .rpc
+        .agents
+        .read()
+        .get(&id)
+        .cloned()
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+// ============================================================================
+// Cron
+// ============================================================================
+
+async fn cron_jobs_handler(State(state): State<GatewayState>) -> Json<serde_json::Value> {
+    let jobs: Vec<serde_json::Value> = state.rpc.cron_jobs.read().values().cloned().collect();
+    Json(serde_json::json!({ "jobs": jobs }))
+}
+
+async fn cron_status_handler(State(state): State<GatewayState>) -> Json<serde_json::Value> {
+    let job_count = state.rpc.cron_jobs.read().len();
+    Json(serde_json::json!({
+        "running": true,
+        "jobCount": job_count,
+    }))
+}
+
+// ============================================================================
+// Usage
+// ============================================================================
+
+async fn usage_handler(State(state): State<GatewayState>) -> Json<serde_json::Value> {
+    let input = *state.rpc.usage_input_tokens.read();
+    let output = *state.rpc.usage_output_tokens.read();
+    let requests = *state.rpc.usage_requests.read();
+    Json(serde_json::json!({
+        "totalInputTokens": input,
+        "totalOutputTokens": output,
+        "totalRequests": requests,
+    }))
+}
+
+// ============================================================================
+// Status
+// ============================================================================
+
+async fn status_handler(State(state): State<GatewayState>) -> Json<serde_json::Value> {
+    let uptime = state.start_time.elapsed().as_secs();
+    let session_count = state.sessions.active_count();
+    Json(serde_json::json!({
+        "version": state.version,
+        "uptime": uptime,
+        "sessions": session_count,
+        "status": "ok",
+    }))
 }
 
 // ============================================================================

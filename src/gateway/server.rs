@@ -8,11 +8,87 @@ use crate::sessions::SessionStore;
 
 use anyhow::Result;
 use axum::Router;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{error, info};
+
+// ============================================================================
+// RPC State — in-memory stores for OpenClaw-compatible RPC methods
+// ============================================================================
+
+/// Extended RPC state for full OpenClaw API parity.
+/// Each subsystem uses `parking_lot::RwLock` for synchronous access from
+/// both sync and async handler functions.
+pub struct RpcState {
+    // Cron
+    pub cron_jobs: parking_lot::RwLock<HashMap<String, serde_json::Value>>,
+    pub cron_runs: parking_lot::RwLock<Vec<serde_json::Value>>,
+    // Agents
+    pub agents: parking_lot::RwLock<HashMap<String, serde_json::Value>>,
+    pub agent_files: parking_lot::RwLock<HashMap<String, HashMap<String, String>>>,
+    // Device pairing
+    pub device_pairs: parking_lot::RwLock<Vec<serde_json::Value>>,
+    // Node management
+    pub nodes: parking_lot::RwLock<HashMap<String, serde_json::Value>>,
+    pub node_pairs: parking_lot::RwLock<Vec<serde_json::Value>>,
+    pub node_invoke_results: parking_lot::RwLock<HashMap<String, serde_json::Value>>,
+    // Exec approvals
+    pub exec_policies: parking_lot::RwLock<Vec<serde_json::Value>>,
+    pub exec_node_policies: parking_lot::RwLock<Vec<serde_json::Value>>,
+    pub exec_requests: parking_lot::RwLock<HashMap<String, serde_json::Value>>,
+    // TTS
+    pub tts_enabled: parking_lot::RwLock<bool>,
+    pub tts_provider: parking_lot::RwLock<Option<String>>,
+    // Voice wake
+    pub voice_wake_triggers: parking_lot::RwLock<Vec<String>>,
+    // Wizard
+    pub wizard_active: parking_lot::RwLock<bool>,
+    pub wizard_step: parking_lot::RwLock<u32>,
+    // Usage tracking
+    pub usage_input_tokens: parking_lot::RwLock<u64>,
+    pub usage_output_tokens: parking_lot::RwLock<u64>,
+    pub usage_requests: parking_lot::RwLock<u64>,
+    // Heartbeat
+    pub last_heartbeat_ms: parking_lot::RwLock<Option<u64>>,
+    pub heartbeat_mode: parking_lot::RwLock<String>,
+}
+
+impl RpcState {
+    pub fn new() -> Self {
+        Self {
+            cron_jobs: parking_lot::RwLock::new(HashMap::new()),
+            cron_runs: parking_lot::RwLock::new(Vec::new()),
+            agents: parking_lot::RwLock::new(HashMap::new()),
+            agent_files: parking_lot::RwLock::new(HashMap::new()),
+            device_pairs: parking_lot::RwLock::new(Vec::new()),
+            nodes: parking_lot::RwLock::new(HashMap::new()),
+            node_pairs: parking_lot::RwLock::new(Vec::new()),
+            node_invoke_results: parking_lot::RwLock::new(HashMap::new()),
+            exec_policies: parking_lot::RwLock::new(Vec::new()),
+            exec_node_policies: parking_lot::RwLock::new(Vec::new()),
+            exec_requests: parking_lot::RwLock::new(HashMap::new()),
+            tts_enabled: parking_lot::RwLock::new(false),
+            tts_provider: parking_lot::RwLock::new(None),
+            voice_wake_triggers: parking_lot::RwLock::new(Vec::new()),
+            wizard_active: parking_lot::RwLock::new(false),
+            wizard_step: parking_lot::RwLock::new(0),
+            usage_input_tokens: parking_lot::RwLock::new(0),
+            usage_output_tokens: parking_lot::RwLock::new(0),
+            usage_requests: parking_lot::RwLock::new(0),
+            last_heartbeat_ms: parking_lot::RwLock::new(None),
+            heartbeat_mode: parking_lot::RwLock::new("auto".to_string()),
+        }
+    }
+}
+
+impl Default for RpcState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Shared state for the gateway server.
 #[derive(Clone)]
@@ -22,6 +98,7 @@ pub struct GatewayState {
     pub sessions: Arc<SessionStore>,
     pub channels: Arc<ChannelManager>,
     pub plugins: Arc<PluginRegistry>,
+    pub rpc: Arc<RpcState>,
     pub shutdown_tx: broadcast::Sender<()>,
     pub start_time: std::time::Instant,
     pub version: String,
@@ -50,12 +127,15 @@ impl GatewayServer {
         let channels = ChannelManager::new(&config);
         let plugins = PluginRegistry::new(&config);
 
+        let rpc = RpcState::new();
+
         let state = GatewayState {
             config: Arc::new(RwLock::new(config)),
             auth: Arc::new(auth),
             sessions: Arc::new(sessions),
             channels: Arc::new(channels),
             plugins: Arc::new(plugins),
+            rpc: Arc::new(rpc),
             shutdown_tx,
             start_time: std::time::Instant::now(),
             version: env!("CARGO_PKG_VERSION").to_string(),

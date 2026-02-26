@@ -146,6 +146,84 @@ impl SessionStore {
         }
     }
 
+    /// Get a session handle by its key (for direct access to history etc.).
+    pub fn get_session_handle(&self, key: &str) -> Option<SessionHandle> {
+        self.sessions.get(key).map(|entry| entry.value().clone())
+    }
+
+    /// Reset a session, clearing its conversation history.
+    pub fn reset_session(&self, key: &str) -> bool {
+        if let Some(entry) = self.sessions.get(key) {
+            entry.value().inner.history.write().clear();
+            entry.value().inner.turn_source.write().take();
+            let mut info = entry.value().inner.info.write();
+            info.updated_at = chrono::Utc::now().to_rfc3339();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Preview sessions — returns session info with message count.
+    pub fn preview_sessions(&self) -> Vec<serde_json::Value> {
+        self.sessions
+            .iter()
+            .map(|entry| {
+                let info = entry.value().info();
+                let msg_count = entry.value().inner.history.read().len();
+                serde_json::json!({
+                    "sessionKey": info.session_key,
+                    "title": info.title,
+                    "model": info.model,
+                    "messageCount": msg_count,
+                    "createdAt": info.created_at,
+                    "updatedAt": info.updated_at,
+                })
+            })
+            .collect()
+    }
+
+    /// Get usage stats for a session.
+    pub fn get_session_usage(&self, key: &str) -> Option<serde_json::Value> {
+        self.sessions.get(key).map(|entry| {
+            let msg_count = entry.value().inner.history.read().len();
+            serde_json::json!({
+                "sessionKey": key,
+                "messageCount": msg_count,
+                "inputTokens": 0,
+                "outputTokens": 0,
+            })
+        })
+    }
+
+    /// Resolve a session reference to a session key.
+    /// Accepts session key, session ID, or partial match.
+    pub fn resolve_session(&self, reference: &str) -> Option<String> {
+        // Exact session key match
+        if self.sessions.contains_key(reference) {
+            return Some(reference.to_string());
+        }
+        // Match by session ID
+        for entry in self.sessions.iter() {
+            let info = entry.value().info();
+            if info.id == reference {
+                return Some(info.session_key);
+            }
+        }
+        // Partial key match
+        for entry in self.sessions.iter() {
+            if entry.key().contains(reference) {
+                return Some(entry.key().clone());
+            }
+        }
+        None
+    }
+
+    /// Compact a session — no-op for in-memory store, but returns success.
+    pub fn compact_session(&self, key: &str) -> bool {
+        self.sessions.contains_key(key)
+    }
+
     /// Get an existing session or create a new one for the given key.
     pub fn get_or_create_session(&self, key: &str, config: &Config) -> SessionHandle {
         if let Some(entry) = self.sessions.get(key) {
