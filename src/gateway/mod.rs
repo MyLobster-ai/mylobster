@@ -1,6 +1,7 @@
 mod auth;
 mod chat;
 mod client;
+pub mod connect_policy;
 mod protocol;
 pub mod routes;
 mod server;

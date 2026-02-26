@@ -425,7 +425,50 @@ pub fn list_available_tools(config: &Config) -> Vec<ToolInfo> {
     });
 
     // Filter by tool policy
-    filter_tools_by_policy(tools, config)
+    let tools = filter_tools_by_policy(tools, config);
+
+    // Apply message-provider tool filtering (no message_provider context
+    // in this path — full filtering happens at the agent runtime level).
+    tools
+}
+
+// ============================================================================
+// Message-provider tool filtering (v2026.2.25)
+// ============================================================================
+
+/// Tools denied for specific message providers.
+///
+/// When a message originates from a voice channel, TTS tools are redundant
+/// and potentially harmful (echo loops).
+fn tool_deny_by_message_provider() -> HashMap<&'static str, Vec<&'static str>> {
+    let mut map = HashMap::new();
+    map.insert("voice", vec!["tts.speak"]);
+    map
+}
+
+/// Filter tools based on the originating message provider.
+///
+/// For example, voice-originated messages should not have access to TTS
+/// tools (which would cause echo loops).
+pub fn apply_message_provider_tool_policy(
+    tools: Vec<ToolInfo>,
+    message_provider: Option<&str>,
+) -> Vec<ToolInfo> {
+    let provider = match message_provider {
+        Some(p) => p,
+        None => return tools,
+    };
+
+    let deny_map = tool_deny_by_message_provider();
+    let denied = match deny_map.get(provider) {
+        Some(d) => d,
+        None => return tools,
+    };
+
+    tools
+        .into_iter()
+        .filter(|t| !denied.iter().any(|d| t.name == *d))
+        .collect()
 }
 
 /// Filter tools based on configuration policy.

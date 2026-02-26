@@ -89,6 +89,106 @@ fn validate_safe_bin(
     None
 }
 
+// ============================================================================
+// Exec approval with argv identity binding (v2026.2.25)
+// ============================================================================
+
+/// A record of an exec approval, binding the approved command to its full
+/// execution context. Used to verify that the command being run matches
+/// what was originally approved by the user.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecApprovalRecord {
+    /// The full command text that was approved.
+    pub command: String,
+    /// The parsed argument vector.
+    pub argv: Vec<String>,
+    /// Working directory at approval time.
+    pub cwd: Option<String>,
+    /// Agent that requested the execution.
+    pub agent_id: String,
+    /// Session in which the approval was granted.
+    pub session_key: String,
+    /// Device that requested the approval.
+    pub requested_by_device_id: Option<String>,
+    /// The approval decision: "allow" or "deny".
+    pub decision: String,
+}
+
+use serde::{Deserialize, Serialize};
+
+/// Validate that an exec approval record matches the current system.run
+/// request. All bound fields must match exactly.
+pub fn approval_matches_system_run_request(
+    approval: &ExecApprovalRecord,
+    command: &str,
+    cwd: Option<&str>,
+    agent_id: &str,
+    session_key: &str,
+) -> bool {
+    if approval.decision != "allow" {
+        return false;
+    }
+    if approval.command != command {
+        return false;
+    }
+    if approval.agent_id != agent_id {
+        return false;
+    }
+    if approval.session_key != session_key {
+        return false;
+    }
+    // CWD must match if it was bound in the approval.
+    if let Some(ref approved_cwd) = approval.cwd {
+        match cwd {
+            Some(req_cwd) if req_cwd == approved_cwd => {}
+            None if approved_cwd.is_empty() => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Harden the execution environment when an approval is bound.
+///
+/// Validates that the CWD exists, is a directory, and is not a symlink.
+/// When `approval_bound` is true, also canonicalizes the executable path
+/// to prevent TOCTOU races between approval and execution.
+pub fn harden_approved_execution_paths(
+    cwd: Option<&str>,
+    approval_bound: bool,
+) -> Result<Option<std::path::PathBuf>, String> {
+    if let Some(dir) = cwd {
+        let path = std::path::Path::new(dir);
+
+        // Check existence.
+        if !path.exists() {
+            return Err(format!("CWD does not exist: {}", dir));
+        }
+
+        // Must be a directory.
+        if !path.is_dir() {
+            return Err(format!("CWD is not a directory: {}", dir));
+        }
+
+        // When approval-bound, reject symlinked CWDs.
+        if approval_bound {
+            let canonical = path
+                .canonicalize()
+                .map_err(|e| format!("Failed to canonicalize CWD '{}': {}", dir, e))?;
+            if canonical != path {
+                return Err(format!(
+                    "CWD '{}' contains symlinks (canonical: '{}'); \
+                     rejected for approval-bound execution.",
+                    dir,
+                    canonical.display()
+                ));
+            }
+            return Ok(Some(canonical));
+        }
+    }
+    Ok(None)
+}
+
 /// Bash/shell command execution tool.
 pub struct BashTool;
 

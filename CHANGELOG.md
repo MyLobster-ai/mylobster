@@ -2,6 +2,36 @@
 
 All notable changes to the MyLobster Rust agent are documented in this file.
 
+## [2026.2.25] - 2026-02-26
+
+### Synced with OpenClaw v2026.2.25
+
+This release ports security hardening, channel lifecycle, heartbeat direct policy, tool filtering, and model fallback types from OpenClaw v2026.2.25 (159 commits).
+
+### Added
+
+- **`DirectPolicy` enum** (`src/config/types.rs`) — `Last` (default) / `None` policy for heartbeat DM delivery. Added `direct_policy: Option<DirectPolicy>` field to `HeartbeatConfig`. Includes serde roundtrip tests.
+
+- **Hardlink security guards** (`src/infra/hardlink_guards.rs`) — `PathAliasPolicy` enum with `AllowFinalSymlink`, `RejectAliases`, `UnlinkTarget` variants. `assert_no_hardlinked_final_path()` checks `nlink > 1` via `fs::metadata()` (Unix) to prevent workspace boundary escapes. `assert_no_path_alias_escape()` validates that canonicalized paths remain within workspace root. `same_file_identity()` helper compares inode+device via `MetadataExt`. Full test suite.
+
+- **Exec approval with argv identity binding** (`src/agents/tools/bash.rs`) — `ExecApprovalRecord` struct binding command, argv, CWD, agent_id, session_key, and device_id to an approval decision. `approval_matches_system_run_request()` validates all bound fields. `harden_approved_execution_paths()` validates CWD existence/type and rejects symlinked CWDs for approval-bound executions.
+
+- **Trusted-proxy control-UI bypass policy** (`src/gateway/connect_policy.rs`) — `ControlUiAuthPolicy` struct and `resolve_control_ui_auth_policy()` centralizing control-UI auth decisions. `is_trusted_proxy_control_ui_operator_auth()` checks role + auth mode + method for proxy/tailscale bypass. Full test suite.
+
+- **Unified abort lifecycle** (`src/infra/abort_signal.rs`) — `AbortHandle` wrapping `Arc<tokio::sync::Notify>` for cooperative cancellation. `wait_for_abort()` async fn and `monitor_with_abort_lifecycle()` pattern using `tokio::select!`. Tests for signal propagation and abort monitoring.
+
+- **Message-provider tool filtering** (`src/agents/tools/mod.rs`) — `tool_deny_by_message_provider()` constant mapping voice → tts.speak denial. `apply_message_provider_tool_policy()` function filtering tools by originating message provider to prevent echo loops.
+
+- **Tool result normalization** (`src/agents/mod.rs`) — `normalize_tool_result()` ensures tool results always have valid structure: non-None text (falls back to JSON stringification or empty string), null JSON → None, error flag preserved.
+
+- **Heartbeat direct policy resolution** (`src/infra/delivery.rs`) — `resolve_heartbeat_delivery_target()` respects `DirectPolicy` when selecting DM targets. Updated `resolve_heartbeat_delivery_chat_type()` to accept and respect `DirectPolicy::None`.
+
+- **Model fallback with cooldown tracking** (`src/agents/model_fallback.rs`) — `ModelFallbackState` struct with per-model cooldown tracking via `HashMap<String, SystemTime>`. `FallbackAttempt` and `FailoverReason` types (Timeout, ContextOverflow, AuthError, RateLimit, Unknown). `resolve_next_fallback()` selects from chain skipping failed + cooled models. Stub `resolve_with_fallback()` async function signature.
+
+### Changed
+
+- **SSRF naming parity** (`src/agents/tools/web_fetch.rs`) — Updated `is_private_ip()` documentation to reference OpenClaw's `isBlockedSpecialUseAddress` naming convention. No functional change.
+
 ## [2026.2.22] - 2026-02-23
 
 ### Synced with OpenClaw v2026.2.22

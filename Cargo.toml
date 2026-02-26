@@ -1,6 +1,6 @@
 [package]
 name = "mylobster"
-version = "2026.2.24"
+version = "2026.2.25"
 edition = "2021"
 description = "Multi-channel AI gateway with extensible messaging integrations"
 license = "MIT"

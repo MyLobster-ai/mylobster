@@ -1,3 +1,4 @@
+pub mod model_fallback;
 pub mod tools;
 
 use crate::config::Config;
@@ -111,6 +112,43 @@ pub async fn handle_chat_completion(
     };
 
     Ok(completion)
+}
+
+/// Normalize a tool result to ensure it always has valid structure.
+///
+/// Guarantees:
+/// - `text` is never `None` (falls back to empty string).
+/// - `json` is valid (null → None).
+/// - `is_error` is preserved.
+///
+/// This prevents malformed tool results from crashing downstream
+/// serialization or provider formatting.
+pub fn normalize_tool_result(result: tools::ToolResult) -> tools::ToolResult {
+    let text = result.text.or_else(|| {
+        // If json is present, stringify it as the text fallback.
+        result
+            .json
+            .as_ref()
+            .map(|j| serde_json::to_string(j).unwrap_or_default())
+    });
+
+    let text = text.or(Some(String::new()));
+
+    // Validate JSON — if it's serde_json::Value::Null, treat as None.
+    let json = result.json.and_then(|j| {
+        if j.is_null() {
+            None
+        } else {
+            Some(j)
+        }
+    });
+
+    tools::ToolResult {
+        text,
+        json,
+        image: result.image,
+        is_error: result.is_error,
+    }
 }
 
 /// Handle an OpenResponses API request.

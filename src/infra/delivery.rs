@@ -60,16 +60,41 @@ pub enum ChatType {
     Group,
 }
 
+/// Resolve the delivery target for a heartbeat based on `DirectPolicy`.
+///
+/// - `DirectPolicy::Last` → deliver to `last_channel` if available.
+/// - `DirectPolicy::None` → no direct delivery; returns `None`.
+/// - If no policy is set (default), falls back to `Last` behaviour.
+pub fn resolve_heartbeat_delivery_target(
+    policy: Option<crate::config::DirectPolicy>,
+    last_channel: Option<&str>,
+) -> Option<String> {
+    match policy.unwrap_or(crate::config::DirectPolicy::Last) {
+        crate::config::DirectPolicy::Last => last_channel.map(|s| s.to_string()),
+        crate::config::DirectPolicy::None => None,
+    }
+}
+
 /// Resolve the chat type for heartbeat delivery based on channel-specific
 /// target parsing.
 ///
 /// This is a stub — full implementation requires per-channel target format
 /// knowledge (e.g. Telegram chat IDs are negative for groups, Discord has
 /// guild channels vs DMs, etc.).
+///
+/// When a `DirectPolicy` is set to `None`, this function returns
+/// `ChatType::Channel` regardless of the channel, since DM delivery is
+/// suppressed.
 pub fn resolve_heartbeat_delivery_chat_type(
     channel: &str,
     _to: Option<&str>,
+    direct_policy: Option<crate::config::DirectPolicy>,
 ) -> ChatType {
+    // If direct policy is None, heartbeats are never DMs.
+    if direct_policy == Some(crate::config::DirectPolicy::None) {
+        return ChatType::Channel;
+    }
+
     // Default heuristic: heartbeats are typically direct messages.
     // Per-channel refinement would go here.
     match channel {

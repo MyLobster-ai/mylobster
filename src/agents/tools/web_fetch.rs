@@ -296,7 +296,11 @@ fn is_private_ipv4(v4: &std::net::Ipv4Addr) -> bool {
         || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
 }
 
-/// Check if an IP address is private/internal.
+/// Check if an IP address is private/internal or a blocked special-use address.
+///
+/// This covers both RFC 1918 private ranges and special-use addresses
+/// (multicast, link-local, benchmarking, etc.) for SSRF protection.
+/// Named for parity with OpenClaw's `isBlockedSpecialUseAddress`.
 fn is_private_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => is_private_ipv4(&v4),

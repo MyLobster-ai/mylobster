@@ -487,6 +487,20 @@ impl Default for HeartbeatTarget {
     }
 }
 
+/// Policy for heartbeat direct-message delivery.
+///
+/// Controls how the heartbeat chooses its DM target when `target` is set
+/// to a channel that supports direct messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DirectPolicy {
+    /// Deliver to the last user who interacted (default).
+    #[default]
+    Last,
+    /// Do not deliver heartbeats as DMs.
+    None,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HeartbeatConfig {
@@ -502,6 +516,7 @@ pub struct HeartbeatConfig {
     pub ack_max_chars: u32,
     #[serde(default)]
     pub include_reasoning: bool,
+    pub direct_policy: Option<DirectPolicy>,
 }
 
 impl Default for HeartbeatConfig {
@@ -517,6 +532,7 @@ impl Default for HeartbeatConfig {
             prompt: None,
             ack_max_chars: 30,
             include_reasoning: false,
+            direct_policy: None,
         }
     }
 }
@@ -2834,6 +2850,48 @@ mod tests {
             config.target,
             Some(HeartbeatTarget::Channel("telegram".to_string()))
         );
+    }
+
+    // ====================================================================
+    // DirectPolicy serde (v2026.2.25)
+    // ====================================================================
+
+    #[test]
+    fn direct_policy_last_roundtrip() {
+        let v = serde_json::to_value(DirectPolicy::Last).unwrap();
+        assert_eq!(v, json!("last"));
+        let parsed: DirectPolicy = serde_json::from_value(v).unwrap();
+        assert_eq!(parsed, DirectPolicy::Last);
+    }
+
+    #[test]
+    fn direct_policy_none_roundtrip() {
+        let v = serde_json::to_value(DirectPolicy::None).unwrap();
+        assert_eq!(v, json!("none"));
+        let parsed: DirectPolicy = serde_json::from_value(v).unwrap();
+        assert_eq!(parsed, DirectPolicy::None);
+    }
+
+    #[test]
+    fn direct_policy_default_is_last() {
+        assert_eq!(DirectPolicy::default(), DirectPolicy::Last);
+    }
+
+    #[test]
+    fn heartbeat_config_with_direct_policy() {
+        let raw = json!({
+            "every": "10m",
+            "directPolicy": "none"
+        });
+        let config: HeartbeatConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(config.direct_policy, Some(DirectPolicy::None));
+    }
+
+    #[test]
+    fn heartbeat_config_without_direct_policy() {
+        let raw = json!({ "every": "10m" });
+        let config: HeartbeatConfig = serde_json::from_value(raw).unwrap();
+        assert!(config.direct_policy.is_none());
     }
 
     // ====================================================================
