@@ -167,9 +167,12 @@ impl GatewayServer {
         // Print startup banner
         print_startup_banner(&state, &self.addr);
 
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal(self.state.shutdown_tx.clone()))
-            .await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal(self.state.shutdown_tx.clone()))
+        .await?;
 
         info!("Gateway server shut down gracefully");
         Ok(())
