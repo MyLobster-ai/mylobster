@@ -345,9 +345,9 @@ async fn execute_tool(
 
     // Resolve tool by name and execute
     let tool: Box<dyn AgentTool> = match tool_name {
-        "web.fetch" => Box::new(crate::agents::tools::web_fetch::WebFetchTool),
-        "web.search" => Box::new(crate::agents::tools::web_search::WebSearchTool),
-        "system.run" => Box::new(crate::agents::tools::bash::BashTool),
+        "web_fetch" => Box::new(crate::agents::tools::web_fetch::WebFetchTool),
+        "web_search" => Box::new(crate::agents::tools::web_search::WebSearchTool),
+        "system_run" => Box::new(crate::agents::tools::bash::BashTool),
         _ => {
             // For tools that don't have full implementations yet,
             // return an error result rather than crashing

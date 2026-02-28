@@ -109,7 +109,7 @@ pub fn list_available_tools(config: &Config) -> Vec<ToolInfo> {
 
     // Web tools
     tools.push(ToolInfo {
-        name: "web.fetch".to_string(),
+        name: "web_fetch".to_string(),
         description: "Fetch content from a URL with SSRF protection".to_string(),
         category: "web".to_string(),
         hidden: false,
@@ -126,7 +126,7 @@ pub fn list_available_tools(config: &Config) -> Vec<ToolInfo> {
     });
 
     tools.push(ToolInfo {
-        name: "web.search".to_string(),
+        name: "web_search".to_string(),
         description: "Search the web using a search engine".to_string(),
         category: "web".to_string(),
         hidden: false,
@@ -149,7 +149,7 @@ pub fn list_available_tools(config: &Config) -> Vec<ToolInfo> {
 
     // Memory tools
     tools.push(ToolInfo {
-        name: "memory.store".to_string(),
+        name: "memory_store".to_string(),
         description: "Store information in long-term memory".to_string(),
         category: "memory".to_string(),
         hidden: false,
@@ -164,7 +164,7 @@ pub fn list_available_tools(config: &Config) -> Vec<ToolInfo> {
     });
 
     tools.push(ToolInfo {
-        name: "memory.search".to_string(),
+        name: "memory_search".to_string(),
         description: "Search long-term memory using RAG".to_string(),
         category: "memory".to_string(),
         hidden: false,
@@ -180,7 +180,7 @@ pub fn list_available_tools(config: &Config) -> Vec<ToolInfo> {
 
     // Bash tool
     tools.push(ToolInfo {
-        name: "system.run".to_string(),
+        name: "system_run".to_string(),
         description: "Execute a shell command".to_string(),
         category: "system".to_string(),
         hidden: false,
@@ -197,7 +197,7 @@ pub fn list_available_tools(config: &Config) -> Vec<ToolInfo> {
 
     // Session tools
     tools.push(ToolInfo {
-        name: "sessions.list".to_string(),
+        name: "sessions_list".to_string(),
         description: "List active sessions".to_string(),
         category: "sessions".to_string(),
         hidden: false,
@@ -208,7 +208,7 @@ pub fn list_available_tools(config: &Config) -> Vec<ToolInfo> {
     });
 
     tools.push(ToolInfo {
-        name: "sessions.history".to_string(),
+        name: "sessions_history".to_string(),
         description: "Get session transcript history".to_string(),
         category: "sessions".to_string(),
         hidden: false,
@@ -223,7 +223,7 @@ pub fn list_available_tools(config: &Config) -> Vec<ToolInfo> {
     });
 
     tools.push(ToolInfo {
-        name: "sessions.send".to_string(),
+        name: "sessions_send".to_string(),
         description: "Send a message to another session".to_string(),
         category: "sessions".to_string(),
         hidden: false,
@@ -238,7 +238,7 @@ pub fn list_available_tools(config: &Config) -> Vec<ToolInfo> {
     });
 
     tools.push(ToolInfo {
-        name: "sessions.spawn".to_string(),
+        name: "sessions_spawn".to_string(),
         description: "Create a new session".to_string(),
         category: "sessions".to_string(),
         hidden: false,
@@ -254,7 +254,7 @@ pub fn list_available_tools(config: &Config) -> Vec<ToolInfo> {
 
     // Message tool
     tools.push(ToolInfo {
-        name: "message.send".to_string(),
+        name: "message_send".to_string(),
         description: "Send a formatted message to a channel".to_string(),
         category: "messaging".to_string(),
         hidden: false,
@@ -272,7 +272,7 @@ pub fn list_available_tools(config: &Config) -> Vec<ToolInfo> {
 
     // Channel action tools
     tools.push(ToolInfo {
-        name: "discord.send".to_string(),
+        name: "discord_send".to_string(),
         description: "Send a message via Discord".to_string(),
         category: "discord".to_string(),
         hidden: false,
@@ -287,7 +287,7 @@ pub fn list_available_tools(config: &Config) -> Vec<ToolInfo> {
     });
 
     tools.push(ToolInfo {
-        name: "telegram.send".to_string(),
+        name: "telegram_send".to_string(),
         description: "Send a message via Telegram".to_string(),
         category: "telegram".to_string(),
         hidden: false,
@@ -302,7 +302,7 @@ pub fn list_available_tools(config: &Config) -> Vec<ToolInfo> {
     });
 
     tools.push(ToolInfo {
-        name: "slack.send".to_string(),
+        name: "slack_send".to_string(),
         description: "Send a message via Slack".to_string(),
         category: "slack".to_string(),
         hidden: false,
@@ -317,7 +317,7 @@ pub fn list_available_tools(config: &Config) -> Vec<ToolInfo> {
     });
 
     tools.push(ToolInfo {
-        name: "whatsapp.send".to_string(),
+        name: "whatsapp_send".to_string(),
         description: "Send a message via WhatsApp".to_string(),
         category: "whatsapp".to_string(),
         hidden: false,
@@ -333,7 +333,7 @@ pub fn list_available_tools(config: &Config) -> Vec<ToolInfo> {
 
     // Image tool
     tools.push(ToolInfo {
-        name: "image.generate".to_string(),
+        name: "image_generate".to_string(),
         description: "Generate an image from text".to_string(),
         category: "media".to_string(),
         hidden: false,
@@ -349,7 +349,7 @@ pub fn list_available_tools(config: &Config) -> Vec<ToolInfo> {
 
     // TTS tool
     tools.push(ToolInfo {
-        name: "tts.speak".to_string(),
+        name: "tts_speak".to_string(),
         description: "Convert text to speech".to_string(),
         category: "media".to_string(),
         hidden: false,
@@ -365,7 +365,7 @@ pub fn list_available_tools(config: &Config) -> Vec<ToolInfo> {
 
     // Cron tool
     tools.push(ToolInfo {
-        name: "cron.schedule".to_string(),
+        name: "cron_schedule".to_string(),
         description: "Schedule a recurring job".to_string(),
         category: "system".to_string(),
         hidden: false,
@@ -382,7 +382,7 @@ pub fn list_available_tools(config: &Config) -> Vec<ToolInfo> {
 
     // Canvas tool
     tools.push(ToolInfo {
-        name: "canvas.render".to_string(),
+        name: "canvas_render".to_string(),
         description: "Render a visual canvas".to_string(),
         category: "media".to_string(),
         hidden: false,
@@ -398,7 +398,7 @@ pub fn list_available_tools(config: &Config) -> Vec<ToolInfo> {
 
     // Gateway tool
     tools.push(ToolInfo {
-        name: "gateway.invoke".to_string(),
+        name: "gateway_invoke".to_string(),
         description: "Invoke a gateway method".to_string(),
         category: "system".to_string(),
         hidden: true,
@@ -414,7 +414,7 @@ pub fn list_available_tools(config: &Config) -> Vec<ToolInfo> {
 
     // Agents tool
     tools.push(ToolInfo {
-        name: "agents.list".to_string(),
+        name: "agents_list".to_string(),
         description: "List available agents".to_string(),
         category: "system".to_string(),
         hidden: false,
@@ -442,7 +442,7 @@ pub fn list_available_tools(config: &Config) -> Vec<ToolInfo> {
 /// and potentially harmful (echo loops).
 fn tool_deny_by_message_provider() -> HashMap<&'static str, Vec<&'static str>> {
     let mut map = HashMap::new();
-    map.insert("voice", vec!["tts.speak"]);
+    map.insert("voice", vec!["tts_speak"]);
     map
 }
 

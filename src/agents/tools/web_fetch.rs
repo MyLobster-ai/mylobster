@@ -12,7 +12,7 @@ pub struct WebFetchTool;
 impl AgentTool for WebFetchTool {
     fn info(&self) -> ToolInfo {
         ToolInfo {
-            name: "web.fetch".to_string(),
+            name: "web_fetch".to_string(),
             description: "Fetch content from a URL with SSRF protection".to_string(),
             category: "web".to_string(),
             hidden: false,

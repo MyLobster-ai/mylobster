@@ -196,7 +196,7 @@ pub struct BashTool;
 impl AgentTool for BashTool {
     fn info(&self) -> ToolInfo {
         ToolInfo {
-            name: "system.run".to_string(),
+            name: "system_run".to_string(),
             description: "Execute a shell command".to_string(),
             category: "system".to_string(),
             hidden: false,

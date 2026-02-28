@@ -123,7 +123,7 @@ struct GrokAnnotation {
 impl AgentTool for WebSearchTool {
     fn info(&self) -> ToolInfo {
         ToolInfo {
-            name: "web.search".to_string(),
+            name: "web_search".to_string(),
             description: "Search the web using a search engine".to_string(),
             category: "web".to_string(),
             hidden: false,

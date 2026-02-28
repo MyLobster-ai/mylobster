@@ -7,7 +7,7 @@ pub struct BrowserTool;
 pub fn browser_tools() -> Vec<ToolInfo> {
     vec![
         ToolInfo {
-            name: "browser.navigate".to_string(),
+            name: "browser_navigate".to_string(),
             description: "Navigate the browser to a URL".to_string(),
             category: "browser".to_string(),
             hidden: false,
@@ -20,7 +20,7 @@ pub fn browser_tools() -> Vec<ToolInfo> {
             }),
         },
         ToolInfo {
-            name: "browser.click".to_string(),
+            name: "browser_click".to_string(),
             description: "Click an element on the page".to_string(),
             category: "browser".to_string(),
             hidden: false,
@@ -33,7 +33,7 @@ pub fn browser_tools() -> Vec<ToolInfo> {
             }),
         },
         ToolInfo {
-            name: "browser.type".to_string(),
+            name: "browser_type".to_string(),
             description: "Type text into an input element".to_string(),
             category: "browser".to_string(),
             hidden: false,
@@ -47,7 +47,7 @@ pub fn browser_tools() -> Vec<ToolInfo> {
             }),
         },
         ToolInfo {
-            name: "browser.screenshot".to_string(),
+            name: "browser_screenshot".to_string(),
             description: "Take a screenshot of the current page".to_string(),
             category: "browser".to_string(),
             hidden: false,
@@ -59,7 +59,7 @@ pub fn browser_tools() -> Vec<ToolInfo> {
             }),
         },
         ToolInfo {
-            name: "browser.evaluate".to_string(),
+            name: "browser_evaluate".to_string(),
             description: "Evaluate JavaScript in the browser context".to_string(),
             category: "browser".to_string(),
             hidden: false,
@@ -72,7 +72,7 @@ pub fn browser_tools() -> Vec<ToolInfo> {
             }),
         },
         ToolInfo {
-            name: "browser.wait".to_string(),
+            name: "browser_wait".to_string(),
             description: "Wait for a selector or condition".to_string(),
             category: "browser".to_string(),
             hidden: false,
@@ -86,7 +86,7 @@ pub fn browser_tools() -> Vec<ToolInfo> {
             }),
         },
         ToolInfo {
-            name: "browser.snapshot".to_string(),
+            name: "browser_snapshot".to_string(),
             description: "Get an accessibility snapshot of the current page".to_string(),
             category: "browser".to_string(),
             hidden: false,
