@@ -1,3 +1,4 @@
+pub mod acp;
 pub mod model_fallback;
 pub mod tools;
 

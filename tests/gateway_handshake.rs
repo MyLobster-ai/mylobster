@@ -13,7 +13,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use std::sync::Arc;
 
 use mylobster::config::Config;
-use mylobster::gateway::{ResolvedGatewayAuth, GatewayState};
+use mylobster::gateway::{ResolvedGatewayAuth, GatewayState, RpcState};
 use mylobster::channels::ChannelManager;
 use mylobster::plugins::PluginRegistry;
 use mylobster::sessions::SessionStore;
@@ -29,6 +29,7 @@ async fn start_test_gateway(auth: ResolvedGatewayAuth) -> (String, broadcast::Se
         sessions: Arc::new(SessionStore::new(&config)),
         channels: Arc::new(ChannelManager::new(&config)),
         plugins: Arc::new(PluginRegistry::new(&config)),
+        rpc: Arc::new(RpcState::new()),
         shutdown_tx: shutdown_tx.clone(),
         start_time: std::time::Instant::now(),
         version: "test".to_string(),

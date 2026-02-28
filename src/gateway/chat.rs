@@ -38,9 +38,18 @@ pub async fn process_chat(
 
     // Build messages from session history + new user message
     let mut messages = session.get_history();
+
+    // v2026.2.26: Inject message timestamp context for time-aware responses.
+    let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string();
+    let message_with_time = if params.message.len() < 10_000 {
+        format!("[{}] {}", timestamp, params.message)
+    } else {
+        params.message.clone() // Don't prepend to very long messages
+    };
+
     messages.push(ProviderMessage {
         role: "user".to_string(),
-        content: serde_json::Value::String(params.message.clone()),
+        content: serde_json::Value::String(message_with_time),
         name: None,
         tool_call_id: None,
         tool_calls: None,

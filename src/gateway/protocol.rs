@@ -224,6 +224,9 @@ pub struct ConnectAuthField {
 }
 
 /// Device identity params sent during connect handshake.
+///
+/// Supports both v2 and v3 payloads. v3 adds `platform` and `device_family`
+/// fields. The version is auto-detected from field presence (v2026.2.26).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceParams {
@@ -231,12 +234,37 @@ pub struct DeviceParams {
     pub id: String,
     /// Raw 32-byte Ed25519 public key in base64url encoding.
     pub public_key: String,
-    /// Ed25519 signature over the v2 payload in base64url encoding.
+    /// Ed25519 signature over the v2/v3 payload in base64url encoding.
     pub signature: String,
     /// Timestamp when signature was created (milliseconds since epoch).
     pub signed_at: u64,
     /// Challenge nonce echoed back.
     pub nonce: String,
+    /// Platform identifier (v3 only, e.g., "linux", "darwin", "win32").
+    /// Normalized to ASCII lowercase.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    /// Device family (v3 only, e.g., "desktop", "mobile", "server").
+    /// Normalized to ASCII lowercase.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_family: Option<String>,
+}
+
+impl DeviceParams {
+    /// Whether this is a v3 device params (has platform or device_family).
+    pub fn is_v3(&self) -> bool {
+        self.platform.is_some() || self.device_family.is_some()
+    }
+
+    /// Get normalized platform (ASCII lowercase).
+    pub fn normalized_platform(&self) -> Option<String> {
+        self.platform.as_ref().map(|p| p.to_ascii_lowercase())
+    }
+
+    /// Get normalized device family (ASCII lowercase).
+    pub fn normalized_device_family(&self) -> Option<String> {
+        self.device_family.as_ref().map(|f| f.to_ascii_lowercase())
+    }
 }
 
 // ============================================================================
@@ -350,7 +378,7 @@ pub enum ChatEventState {
 }
 
 /// Token usage information.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenUsage {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -935,6 +963,41 @@ mod tests {
     #[test]
     fn protocol_version_matches_openclaw_v2026_2_24() {
         assert_eq!(PROTOCOL_VERSION, 3);
+    }
+
+    // ====================================================================
+    // DeviceParams v3 (v2026.2.26)
+    // ====================================================================
+
+    #[test]
+    fn parse_device_params_v3() {
+        let raw = json!({
+            "id": "device-123",
+            "publicKey": "dGVzdC1rZXk",
+            "signature": "c2lnbmF0dXJl",
+            "signedAt": 1708867200000u64,
+            "nonce": "nonce-xyz",
+            "platform": "Darwin",
+            "deviceFamily": "Desktop"
+        });
+        let params: DeviceParams = serde_json::from_value(raw).unwrap();
+        assert!(params.is_v3());
+        assert_eq!(params.normalized_platform(), Some("darwin".to_string()));
+        assert_eq!(params.normalized_device_family(), Some("desktop".to_string()));
+    }
+
+    #[test]
+    fn parse_device_params_v2_is_not_v3() {
+        let raw = json!({
+            "id": "device-123",
+            "publicKey": "dGVzdC1rZXk",
+            "signature": "c2lnbmF0dXJl",
+            "signedAt": 1708867200000u64,
+            "nonce": "nonce-xyz"
+        });
+        let params: DeviceParams = serde_json::from_value(raw).unwrap();
+        assert!(!params.is_v3());
+        assert_eq!(params.normalized_platform(), None);
     }
 
     // ====================================================================

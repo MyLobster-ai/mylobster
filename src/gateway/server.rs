@@ -1,9 +1,11 @@
+use crate::agents::acp::AcpAgentManager;
 use crate::channels::ChannelManager;
 use crate::cli::GatewayOpts;
 use crate::config::Config;
 use crate::gateway::auth::{resolve_gateway_auth, ResolvedGatewayAuth};
 use crate::gateway::routes;
 use crate::plugins::PluginRegistry;
+use crate::routing::RouteManager;
 use crate::sessions::SessionStore;
 
 use anyhow::Result;
@@ -54,6 +56,10 @@ pub struct RpcState {
     // Heartbeat
     pub last_heartbeat_ms: parking_lot::RwLock<Option<u64>>,
     pub heartbeat_mode: parking_lot::RwLock<String>,
+    // ACP agents (v2026.2.26)
+    pub acp_manager: RwLock<AcpAgentManager>,
+    // Route manager (v2026.2.26)
+    pub route_manager: RwLock<RouteManager>,
 }
 
 impl RpcState {
@@ -80,6 +86,8 @@ impl RpcState {
             usage_requests: parking_lot::RwLock::new(0),
             last_heartbeat_ms: parking_lot::RwLock::new(None),
             heartbeat_mode: parking_lot::RwLock::new("auto".to_string()),
+            acp_manager: RwLock::new(AcpAgentManager::new()),
+            route_manager: RwLock::new(RouteManager::new()),
         }
     }
 }

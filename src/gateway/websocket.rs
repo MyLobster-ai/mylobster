@@ -429,11 +429,8 @@ async fn handle_request(
             send_oc_response(tx, response).await;
         }
         "config.reload" => {
-            send_oc_response(
-                tx,
-                OcResponseFrame::success(request_id, serde_json::json!({ "ok": true })),
-            )
-            .await;
+            let response = handle_config_reload(state, config_hash, &request).await;
+            send_oc_response(tx, response).await;
         }
         "presence.set" => {
             send_oc_response(
@@ -654,7 +651,25 @@ async fn handle_request(
         // Device pairing
         // ================================================================
         "device.pair.list" => {
-            let pairs = state.rpc.device_pairs.read().clone();
+            // Account-scoped: filter pairs visible to requesting account
+            let account_filter = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("accountId"))
+                .and_then(|v| v.as_str());
+            let all_pairs = state.rpc.device_pairs.read().clone();
+            let pairs: Vec<serde_json::Value> = match account_filter {
+                Some(acct) => all_pairs
+                    .into_iter()
+                    .filter(|p| {
+                        p.get("accountId")
+                            .and_then(|v| v.as_str())
+                            .map(|a| a == acct)
+                            .unwrap_or(true) // include pairs without accountId
+                    })
+                    .collect(),
+                None => all_pairs,
+            };
             send_oc_response(
                 tx,
                 OcResponseFrame::success(request_id, serde_json::json!({ "devices": pairs })),
@@ -1244,6 +1259,99 @@ async fn handle_request(
         }
 
         // ================================================================
+        // Secrets management (v2026.2.26)
+        // ================================================================
+        "secrets.reload" => {
+            let response = handle_secrets_reload(state, &request).await;
+            send_oc_response(tx, response).await;
+        }
+
+        // ================================================================
+        // ACP agents (v2026.2.26)
+        // ================================================================
+        "acp.spawn" => {
+            let response = handle_acp_spawn(state, &request).await;
+            send_oc_response(tx, response).await;
+        }
+        "acp.send" => {
+            let response = handle_acp_send(state, &request).await;
+            send_oc_response(tx, response).await;
+        }
+        "acp.stop" => {
+            let response = handle_acp_stop(state, &request).await;
+            send_oc_response(tx, response).await;
+        }
+        "acp.list" => {
+            let response = handle_acp_list(state, &request).await;
+            send_oc_response(tx, response).await;
+        }
+
+        // ================================================================
+        // Agent routing bindings (v2026.2.26)
+        // ================================================================
+        "agents.bindings" => {
+            let response = handle_agents_bindings(state, &request).await;
+            send_oc_response(tx, response).await;
+        }
+        "agents.bind" => {
+            let response = handle_agents_bind(state, &request).await;
+            send_oc_response(tx, response).await;
+        }
+        "agents.unbind" => {
+            let response = handle_agents_unbind(state, &request).await;
+            send_oc_response(tx, response).await;
+        }
+
+        // ================================================================
+        // Device status & info (v2026.2.26)
+        // ================================================================
+        "device.status" => {
+            let uptime = state.start_time.elapsed().as_secs();
+            send_oc_response(
+                tx,
+                OcResponseFrame::success(
+                    request_id,
+                    serde_json::json!({
+                        "ok": true,
+                        "uptime": uptime,
+                        "status": "online",
+                        "version": state.version,
+                    }),
+                ),
+            )
+            .await;
+        }
+        "device.info" => {
+            send_oc_response(
+                tx,
+                OcResponseFrame::success(
+                    request_id,
+                    serde_json::json!({
+                        "platform": std::env::consts::OS,
+                        "arch": std::env::consts::ARCH,
+                        "version": state.version,
+                        "runtime": "rust",
+                    }),
+                ),
+            )
+            .await;
+        }
+
+        // ================================================================
+        // Notifications (v2026.2.26)
+        // ================================================================
+        "notifications.list" => {
+            send_oc_response(
+                tx,
+                OcResponseFrame::success(
+                    request_id,
+                    serde_json::json!({ "notifications": [] }),
+                ),
+            )
+            .await;
+        }
+
+        // ================================================================
         // Unknown method
         // ================================================================
         _ => {
@@ -1816,6 +1924,123 @@ fn build_patch_from_key(key: &str, value: serde_json::Value) -> serde_json::Valu
         result = serde_json::Value::Object(obj);
     }
     result
+}
+
+// ============================================================================
+// Config Reload with Secrets Sync (v2026.2.26)
+// ============================================================================
+
+/// Three-phase config reload: prepare → activate → apply.
+///
+/// 1. Prepare: read config from disk, validate, resolve secrets
+/// 2. Activate: swap the in-memory config with the new one
+/// 3. Apply: update config hash, report results
+///
+/// If secrets resolution is enabled and required secrets fail to resolve,
+/// the reload is rolled back and the old config remains active.
+async fn handle_config_reload(
+    state: &GatewayState,
+    config_hash: &Arc<RwLock<String>>,
+    request: &RequestFrame,
+) -> OcResponseFrame {
+    let resolve_secrets = request
+        .params
+        .as_ref()
+        .and_then(|p| p.get("resolveSecrets"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let fail_on_missing = request
+        .params
+        .as_ref()
+        .and_then(|p| p.get("failOnMissing"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let base_dir = request
+        .params
+        .as_ref()
+        .and_then(|p| p.get("baseDir"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let config_path = request
+        .params
+        .as_ref()
+        .and_then(|p| p.get("configPath"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    // Phase 1: Prepare — read config from disk or use current
+    let new_config_value = if let Some(ref path) = config_path {
+        let p = std::path::Path::new(path);
+        match crate::config::read_config_file_snapshot(p) {
+            Ok(v) => v,
+            Err(e) => {
+                return OcResponseFrame::error(
+                    request.id.clone(),
+                    format!("Failed to read config: {}", e),
+                    Some(-32603),
+                );
+            }
+        }
+    } else {
+        let config = state.config.read().await;
+        serde_json::to_value(&*config).unwrap_or_default()
+    };
+
+    // Optionally resolve secrets
+    let final_config_value = if resolve_secrets {
+        let required_paths: Vec<&str> = request
+            .params
+            .as_ref()
+            .and_then(|p| p.get("requiredPaths"))
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+
+        let (resolved, result) = crate::infra::secrets::reload::reload_secrets(
+            &new_config_value,
+            base_dir,
+            &required_paths,
+            fail_on_missing,
+        )
+        .await;
+
+        if !result.ok {
+            return OcResponseFrame::error(
+                request.id.clone(),
+                format!(
+                    "Config reload failed: secrets resolution error — {} unresolved",
+                    result.failed_count
+                ),
+                Some(-32603),
+            );
+        }
+
+        resolved.unwrap_or(new_config_value)
+    } else {
+        new_config_value
+    };
+
+    // Phase 2: Activate — apply the new config
+    {
+        let mut config = state.config.write().await;
+        apply_config_patch(&mut config, &final_config_value);
+    }
+
+    // Phase 3: Apply — update hash
+    let new_hash = Uuid::new_v4().to_string();
+    *config_hash.write().await = new_hash.clone();
+
+    OcResponseFrame::success(
+        request.id.clone(),
+        serde_json::json!({
+            "ok": true,
+            "hash": new_hash,
+            "secretsResolved": resolve_secrets,
+        }),
+    )
 }
 
 // ============================================================================
@@ -2469,10 +2694,10 @@ fn handle_device_pair_action(
     request: &RequestFrame,
     new_status: &str,
 ) -> OcResponseFrame {
-    let device_id = request
-        .params
-        .as_ref()
-        .and_then(|p| p.get("deviceId"))
+    let params = request.params.as_ref();
+    let device_id = params.and_then(|p| p.get("deviceId")).and_then(|v| v.as_str());
+    let account_id = params
+        .and_then(|p| p.get("accountId"))
         .and_then(|v| v.as_str());
 
     match device_id {
@@ -2480,13 +2705,28 @@ fn handle_device_pair_action(
             let mut pairs = state.rpc.device_pairs.write();
             let mut found = false;
             for pair in pairs.iter_mut() {
-                if pair.get("deviceId").and_then(|v| v.as_str()) == Some(did) {
-                    if let Some(obj) = pair.as_object_mut() {
-                        obj.insert("status".to_string(), serde_json::json!(new_status));
-                    }
-                    found = true;
-                    break;
+                if pair.get("deviceId").and_then(|v| v.as_str()) != Some(did) {
+                    continue;
                 }
+                // Account-scoped: only modify pairs owned by this account
+                if let Some(acct) = account_id {
+                    let pair_acct = pair.get("accountId").and_then(|v| v.as_str());
+                    if pair_acct.is_some() && pair_acct != Some(acct) {
+                        continue;
+                    }
+                }
+                if let Some(obj) = pair.as_object_mut() {
+                    obj.insert("status".to_string(), serde_json::json!(new_status));
+                    // Stamp accountId if not already present
+                    if account_id.is_some() && !obj.contains_key("accountId") {
+                        obj.insert(
+                            "accountId".to_string(),
+                            serde_json::json!(account_id),
+                        );
+                    }
+                }
+                found = true;
+                break;
             }
             if found {
                 OcResponseFrame::success(request.id.clone(), serde_json::json!({ "ok": true }))
@@ -2507,17 +2747,29 @@ fn handle_device_pair_action(
 }
 
 fn handle_device_pair_remove(state: &GatewayState, request: &RequestFrame) -> OcResponseFrame {
-    let device_id = request
-        .params
-        .as_ref()
-        .and_then(|p| p.get("deviceId"))
+    let params = request.params.as_ref();
+    let device_id = params.and_then(|p| p.get("deviceId")).and_then(|v| v.as_str());
+    let account_id = params
+        .and_then(|p| p.get("accountId"))
         .and_then(|v| v.as_str());
 
     match device_id {
         Some(did) => {
             let mut pairs = state.rpc.device_pairs.write();
             let before = pairs.len();
-            pairs.retain(|p| p.get("deviceId").and_then(|v| v.as_str()) != Some(did));
+            pairs.retain(|p| {
+                if p.get("deviceId").and_then(|v| v.as_str()) != Some(did) {
+                    return true; // keep — different device
+                }
+                // Account-scoped: only remove pairs owned by this account
+                if let Some(acct) = account_id {
+                    let pair_acct = p.get("accountId").and_then(|v| v.as_str());
+                    if pair_acct.is_some() && pair_acct != Some(acct) {
+                        return true; // keep — different account
+                    }
+                }
+                false // remove
+            });
             let removed = pairs.len() < before;
             OcResponseFrame::success(
                 request.id.clone(),
@@ -2862,4 +3114,257 @@ fn handle_exec_approval_resolve(
             Some(-32600),
         )
     }
+}
+
+// ============================================================================
+// Secrets Management (v2026.2.26)
+// ============================================================================
+
+async fn handle_secrets_reload(
+    state: &GatewayState,
+    request: &RequestFrame,
+) -> OcResponseFrame {
+    let config = state.config.read().await;
+    let config_value = serde_json::to_value(&*config).unwrap_or_default();
+
+    let base_dir = request
+        .params
+        .as_ref()
+        .and_then(|p| p.get("baseDir"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let fail_on_missing = request
+        .params
+        .as_ref()
+        .and_then(|p| p.get("failOnMissing"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let required_paths: Vec<&str> = request
+        .params
+        .as_ref()
+        .and_then(|p| p.get("requiredPaths"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let (_resolved_config, result) = crate::infra::secrets::reload::reload_secrets(
+        &config_value,
+        base_dir,
+        &required_paths,
+        fail_on_missing,
+    )
+    .await;
+
+    OcResponseFrame::success(
+        request.id.clone(),
+        serde_json::to_value(&result).unwrap_or_default(),
+    )
+}
+
+// ============================================================================
+// ACP Agents (v2026.2.26)
+// ============================================================================
+
+async fn handle_acp_spawn(
+    state: &GatewayState,
+    request: &RequestFrame,
+) -> OcResponseFrame {
+    use crate::agents::acp::AcpSpawnParams;
+
+    let params: AcpSpawnParams = match request
+        .params
+        .as_ref()
+        .and_then(|p| serde_json::from_value(p.clone()).ok())
+    {
+        Some(p) => p,
+        None => {
+            return OcResponseFrame::error(
+                request.id.clone(),
+                "Invalid spawn params".to_string(),
+                Some(-32602),
+            );
+        }
+    };
+
+    let mgr = state.rpc.acp_manager.read().await;
+    let agent = mgr.spawn(params).await;
+    OcResponseFrame::success(
+        request.id.clone(),
+        serde_json::to_value(&agent).unwrap_or_default(),
+    )
+}
+
+async fn handle_acp_send(
+    state: &GatewayState,
+    request: &RequestFrame,
+) -> OcResponseFrame {
+    use crate::agents::acp::AcpSendParams;
+
+    let params: AcpSendParams = match request
+        .params
+        .as_ref()
+        .and_then(|p| serde_json::from_value(p.clone()).ok())
+    {
+        Some(p) => p,
+        None => {
+            return OcResponseFrame::error(
+                request.id.clone(),
+                "Invalid send params".to_string(),
+                Some(-32602),
+            );
+        }
+    };
+
+    let mgr = state.rpc.acp_manager.read().await;
+    let result = mgr.send(&params).await;
+    OcResponseFrame::success(
+        request.id.clone(),
+        serde_json::to_value(&result).unwrap_or_default(),
+    )
+}
+
+async fn handle_acp_stop(
+    state: &GatewayState,
+    request: &RequestFrame,
+) -> OcResponseFrame {
+    let agent_id = request
+        .params
+        .as_ref()
+        .and_then(|p| p.get("agentId"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let mgr = state.rpc.acp_manager.read().await;
+    let stopped = mgr.stop(agent_id).await;
+    OcResponseFrame::success(
+        request.id.clone(),
+        serde_json::json!({ "ok": stopped }),
+    )
+}
+
+async fn handle_acp_list(
+    state: &GatewayState,
+    request: &RequestFrame,
+) -> OcResponseFrame {
+    let mgr = state.rpc.acp_manager.read().await;
+    let agents = mgr.list().await;
+    OcResponseFrame::success(
+        request.id.clone(),
+        serde_json::json!({ "agents": serde_json::to_value(&agents).unwrap_or_default() }),
+    )
+}
+
+// ============================================================================
+// Agent Routing Bindings (v2026.2.26)
+// ============================================================================
+
+async fn handle_agents_bindings(
+    state: &GatewayState,
+    request: &RequestFrame,
+) -> OcResponseFrame {
+    let account_id = request
+        .params
+        .as_ref()
+        .and_then(|p| p.get("accountId"))
+        .and_then(|v| v.as_str());
+
+    let mgr = state.rpc.route_manager.read().await;
+    let routes = mgr.list(account_id).await;
+    OcResponseFrame::success(
+        request.id.clone(),
+        serde_json::json!({ "bindings": serde_json::to_value(&routes).unwrap_or_default() }),
+    )
+}
+
+async fn handle_agents_bind(
+    state: &GatewayState,
+    request: &RequestFrame,
+) -> OcResponseFrame {
+    use crate::config::AgentBindingMatch;
+    use crate::routing::RouteEntry;
+
+    let params = match request.params.as_ref() {
+        Some(p) => p,
+        None => {
+            return OcResponseFrame::error(
+                request.id.clone(),
+                "Missing params".to_string(),
+                Some(-32602),
+            );
+        }
+    };
+
+    let agent_id = params
+        .get("agentId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let account_id = params
+        .get("accountId")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let binding = AgentBindingMatch {
+        channel: params.get("channel").and_then(|v| v.as_str()).map(String::from),
+        account_id: account_id.clone(),
+        peer: params.get("peer").and_then(|v| v.as_str()).map(String::from),
+        guild_id: params.get("guildId").and_then(|v| v.as_str()).map(String::from),
+        team_id: params.get("teamId").and_then(|v| v.as_str()).map(String::from),
+    };
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+
+    let entry = RouteEntry {
+        agent_id,
+        binding,
+        account_id,
+        created_at: now_ms,
+    };
+
+    let mgr = state.rpc.route_manager.read().await;
+    mgr.bind(entry).await;
+    OcResponseFrame::success(
+        request.id.clone(),
+        serde_json::json!({ "ok": true }),
+    )
+}
+
+async fn handle_agents_unbind(
+    state: &GatewayState,
+    request: &RequestFrame,
+) -> OcResponseFrame {
+    let params = match request.params.as_ref() {
+        Some(p) => p,
+        None => {
+            return OcResponseFrame::error(
+                request.id.clone(),
+                "Missing params".to_string(),
+                Some(-32602),
+            );
+        }
+    };
+
+    let agent_id = params
+        .get("agentId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let account_id = params
+        .get("accountId")
+        .and_then(|v| v.as_str());
+
+    let mgr = state.rpc.route_manager.read().await;
+    let removed = mgr.unbind(agent_id, account_id).await;
+    OcResponseFrame::success(
+        request.id.clone(),
+        serde_json::json!({ "ok": true, "removed": removed }),
+    )
 }

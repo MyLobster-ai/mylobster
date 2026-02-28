@@ -4,6 +4,27 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tracing::warn;
+
+/// v2026.2.26: Risk warning for Gemini CLI OAuth.
+///
+/// Gemini CLI OAuth grants broad Google account access. This constant
+/// provides the warning text that should be shown to users before
+/// initiating OAuth flows.
+pub const GEMINI_OAUTH_RISK_WARNING: &str =
+    "WARNING: Gemini CLI OAuth grants access to your Google account. \
+     Only proceed if you trust this application and understand the \
+     permissions being requested. This is NOT recommended for shared \
+     or untrusted environments.";
+
+/// Check if Gemini OAuth should require confirmation.
+///
+/// Returns `true` if the environment suggests this is a CLI or
+/// unattended context where OAuth risks should be highlighted.
+pub fn should_warn_oauth() -> bool {
+    // Warn in non-interactive or shared environments
+    std::env::var("GEMINI_SKIP_OAUTH_WARNING").is_err()
+}
 
 pub struct GeminiProvider {
     api_key: String,

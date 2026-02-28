@@ -5,7 +5,28 @@ use super::plugin::{ChannelCapability, ChannelMeta, ChannelPlugin};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+// ============================================================================
+// v2026.2.26: NO_REPLY Suppression
+// ============================================================================
+
+/// Sentinel value indicating the agent chose not to reply.
+///
+/// When the agent returns this exact string as a response, the Slack channel
+/// suppresses the API call — no message is sent and no error is raised.
+/// This prevents empty or unwanted messages from being posted to Slack.
+pub const NO_REPLY_SENTINEL: &str = "NO_REPLY";
+
+/// Check if a message should be suppressed (not sent to Slack).
+pub fn should_suppress_message(message: &str) -> bool {
+    let trimmed = message.trim();
+    trimmed == NO_REPLY_SENTINEL || trimmed.is_empty()
+}
+
+// ============================================================================
+// Slack Channel Implementation
+// ============================================================================
 
 /// Slack channel implementation using slack-morphism.
 pub struct SlackChannel {
@@ -88,7 +109,13 @@ impl ChannelPlugin for SlackChannel {
         Ok(())
     }
 
-    async fn send_message(&self, to: &str, _message: &str) -> Result<()> {
+    async fn send_message(&self, to: &str, message: &str) -> Result<()> {
+        // v2026.2.26: Suppress NO_REPLY before making API call.
+        if should_suppress_message(message) {
+            debug!(channel = to, "Slack: suppressing NO_REPLY message");
+            return Ok(());
+        }
+
         let _bot_token = self
             .bot_token
             .as_deref()
@@ -96,7 +123,7 @@ impl ChannelPlugin for SlackChannel {
 
         info!(channel = to, "Slack: sending message");
 
-        // TODO: Use slack-morphism to call chat.postMessage with (to, _message).
+        // TODO: Use slack-morphism to call chat.postMessage with (to, message).
 
         Ok(())
     }
@@ -106,4 +133,30 @@ impl ChannelPlugin for SlackChannel {
 pub(crate) async fn send_message(config: &Config, to: &str, message: &str) -> Result<()> {
     let channel = SlackChannel::new(config);
     channel.send_message(to, message).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_reply_sentinel_suppressed() {
+        assert!(should_suppress_message("NO_REPLY"));
+        assert!(should_suppress_message("  NO_REPLY  "));
+        assert!(should_suppress_message("NO_REPLY\n"));
+    }
+
+    #[test]
+    fn empty_message_suppressed() {
+        assert!(should_suppress_message(""));
+        assert!(should_suppress_message("   "));
+        assert!(should_suppress_message("\n\t"));
+    }
+
+    #[test]
+    fn normal_message_not_suppressed() {
+        assert!(!should_suppress_message("Hello world"));
+        assert!(!should_suppress_message("NO_REPLY extra text"));
+        assert!(!should_suppress_message("no_reply")); // case-sensitive
+    }
 }

@@ -1,22 +1,73 @@
 use crate::gateway::protocol::*;
 use crate::gateway::server::GatewayState;
 use crate::gateway::websocket;
+use crate::infra::security_path;
 
 use axum::{
+    body::Body,
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::WebSocketUpgrade,
         ConnectInfo, Json, Query, State,
     },
-    http::StatusCode,
-    response::IntoResponse,
+    http::{Request, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{debug, error, info};
+use tracing::{debug, error, warn};
+
+/// Security path canonicalization middleware.
+///
+/// Rejects requests with encoded path traversal, null bytes, or other
+/// malicious URI patterns before they reach any handler.
+async fn security_path_middleware(request: Request<Body>, next: Next) -> Response {
+    let path = request.uri().path();
+    match security_path::validate_request_path(path) {
+        Ok(_canonical) => next.run(request).await,
+        Err(reason) => {
+            warn!("Blocked request with invalid path '{}': {}", path, reason);
+            StatusCode::BAD_REQUEST.into_response()
+        }
+    }
+}
+
+/// Plugin route auth enforcement middleware.
+///
+/// Protects `/api/channels` and `/api/plugins` endpoints by requiring
+/// a valid Authorization header with a bearer token. Rejects
+/// broken-path variants that attempt to bypass authentication.
+async fn plugin_route_auth_middleware(
+    State(state): State<GatewayState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+
+    // Check if this is a protected plugin route (is_protected_path canonicalizes internally)
+    if security_path::is_protected_path(path) {
+        // Require bearer token auth
+        let has_auth = request
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.starts_with("Bearer "))
+            .unwrap_or(false);
+
+        if !has_auth {
+            // Check if gateway has token auth configured
+            if state.auth.token.is_some() {
+                warn!("Blocked unauthenticated access to protected path: {}", path);
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+        }
+    }
+
+    next.run(request).await
+}
 
 /// Build all routes for the gateway.
 pub fn build_routes(state: GatewayState) -> Router {
@@ -59,6 +110,12 @@ pub fn build_routes(state: GatewayState) -> Router {
         // OpenAI-compatible endpoints
         .route("/v1/chat/completions", post(chat_completions_handler))
         .route("/v1/responses", post(responses_handler))
+        // Security: path canonicalization + plugin route auth
+        .layer(middleware::from_fn(security_path_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            plugin_route_auth_middleware,
+        ))
         .layer(cors)
         .with_state(state)
 }

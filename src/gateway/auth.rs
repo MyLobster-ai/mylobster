@@ -249,10 +249,12 @@ pub struct DeviceVerifyResult {
 
 /// Verify an Ed25519 device identity from the connect handshake.
 ///
-/// The bridge signs a v2 payload:
-///   `"v2|deviceId|clientId|clientMode|role|scopes|signedAtMs|token|nonce"`
+/// Supports both v2 and v3 payloads (v2026.2.26):
+///   v2: `"v2|deviceId|clientId|clientMode|role|scopes|signedAtMs|token|nonce"`
+///   v3: `"v3|deviceId|clientId|clientMode|role|scopes|signedAtMs|token|nonce|platform|deviceFamily"`
 ///
-/// We reconstruct this payload and verify the Ed25519 signature.
+/// The version is auto-detected from the presence of `platform`/`device_family`
+/// fields on the DeviceParams. v2 clients still work unchanged.
 pub fn verify_device_identity(
     device: &DeviceParams,
     client_id: &str,
@@ -350,29 +352,87 @@ pub fn verify_device_identity(
         }
     };
 
-    // 5. Reconstruct v2 payload exactly as bridge builds it:
-    //    "v2|deviceId|clientId|clientMode|role|scopes|signedAtMs|token|nonce"
+    // 5. Reconstruct payload — auto-detect v2 vs v3.
     let scopes_str = scopes.join(",");
     let token_str = token.unwrap_or("");
-    let payload = format!(
-        "v2|{}|{}|{}|{}|{}|{}|{}|{}",
-        device.id,
-        client_id,
-        client_mode,
-        role,
-        scopes_str,
-        device.signed_at,
-        token_str,
-        device.nonce,
-    );
+
+    let payload = if device.is_v3() {
+        // v3: "v3|deviceId|clientId|clientMode|role|scopes|signedAtMs|token|nonce|platform|deviceFamily"
+        let platform = device.normalized_platform().unwrap_or_default();
+        let device_family = device.normalized_device_family().unwrap_or_default();
+        format!(
+            "v3|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            device.id,
+            client_id,
+            client_mode,
+            role,
+            scopes_str,
+            device.signed_at,
+            token_str,
+            device.nonce,
+            platform,
+            device_family,
+        )
+    } else {
+        // v2: "v2|deviceId|clientId|clientMode|role|scopes|signedAtMs|token|nonce"
+        format!(
+            "v2|{}|{}|{}|{}|{}|{}|{}|{}",
+            device.id,
+            client_id,
+            client_mode,
+            role,
+            scopes_str,
+            device.signed_at,
+            token_str,
+            device.nonce,
+        )
+    };
 
     // 6. Verify Ed25519 signature over UTF-8 payload bytes
     match verifying_key.verify(payload.as_bytes(), &signature) {
-        Ok(()) => DeviceVerifyResult {
-            valid: true,
-            device_id: Some(device.id.clone()),
-            reason: None,
-        },
+        Ok(()) => {
+            if device.is_v3() {
+                debug!(
+                    "Device v3 identity verified: platform={:?}, family={:?}",
+                    device.normalized_platform(),
+                    device.normalized_device_family(),
+                );
+            }
+            DeviceVerifyResult {
+                valid: true,
+                device_id: Some(device.id.clone()),
+                reason: None,
+            }
+        }
+        Err(_) if device.is_v3() => {
+            // Fallback: try v2 payload for v3 params (bridge upgrade race).
+            let v2_payload = format!(
+                "v2|{}|{}|{}|{}|{}|{}|{}|{}",
+                device.id,
+                client_id,
+                client_mode,
+                role,
+                scopes_str,
+                device.signed_at,
+                token_str,
+                device.nonce,
+            );
+            match verifying_key.verify(v2_payload.as_bytes(), &signature) {
+                Ok(()) => {
+                    debug!("Device identity verified via v2 fallback for v3 params");
+                    DeviceVerifyResult {
+                        valid: true,
+                        device_id: Some(device.id.clone()),
+                        reason: None,
+                    }
+                }
+                Err(e) => DeviceVerifyResult {
+                    valid: false,
+                    device_id: None,
+                    reason: Some(format!("signature verification failed: {}", e)),
+                },
+            }
+        }
         Err(e) => DeviceVerifyResult {
             valid: false,
             device_id: None,
@@ -438,6 +498,8 @@ mod tests {
             signature: BASE64URL_NOPAD.encode(&signature.to_bytes()),
             signed_at: now_ms,
             nonce: nonce.to_string(),
+            platform: None,
+            device_family: None,
         };
 
         (params, signing_key)
@@ -810,6 +872,8 @@ mod tests {
             signature: BASE64URL_NOPAD.encode(&signature.to_bytes()),
             signed_at: stale_ms,
             nonce: nonce.to_string(),
+            platform: None,
+            device_family: None,
         };
 
         let result = verify_device_identity(
@@ -847,6 +911,8 @@ mod tests {
                 .unwrap()
                 .as_millis() as u64,
             nonce: "n".to_string(),
+            platform: None,
+            device_family: None,
         };
         let result = verify_device_identity(&device, "gc", "bridge", "op", &[], None, "n");
         assert!(!result.valid);
@@ -867,6 +933,8 @@ mod tests {
             signature: BASE64URL_NOPAD.encode(&[0u8; 64]),
             signed_at: now_ms,
             nonce: "n".to_string(),
+            platform: None,
+            device_family: None,
         };
         let result = verify_device_identity(&device, "gc", "bridge", "op", &[], None, "n");
         assert!(!result.valid);
@@ -901,6 +969,107 @@ mod tests {
             &device, "gc", "bridge", "operator", &[], None, nonce,
         );
         assert!(result.valid, "Expected valid, got: {:?}", result.reason);
+    }
+
+    // =====================================================================
+    // Ed25519 device identity verification — v3 (v2026.2.26)
+    // =====================================================================
+
+    fn make_device_params_v3(
+        device_id: &str,
+        client_id: &str,
+        client_mode: &str,
+        role: &str,
+        scopes: &[&str],
+        token: Option<&str>,
+        nonce: &str,
+        platform: &str,
+        device_family: &str,
+    ) -> (DeviceParams, SigningKey) {
+        let signing_key = {
+            let mut secret = [0u8; 32];
+            use rand::RngCore;
+            rand::thread_rng().fill_bytes(&mut secret);
+            SigningKey::from_bytes(&secret)
+        };
+        let public_key_bytes = signing_key.verifying_key().to_bytes();
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let scopes_str = scopes.join(",");
+        let token_str = token.unwrap_or("");
+        let platform_lower = platform.to_ascii_lowercase();
+        let family_lower = device_family.to_ascii_lowercase();
+        let payload = format!(
+            "v3|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            device_id, client_id, client_mode, role, scopes_str, now_ms,
+            token_str, nonce, platform_lower, family_lower
+        );
+
+        let signature = signing_key.sign(payload.as_bytes());
+
+        let params = DeviceParams {
+            id: device_id.to_string(),
+            public_key: BASE64URL_NOPAD.encode(&public_key_bytes),
+            signature: BASE64URL_NOPAD.encode(&signature.to_bytes()),
+            signed_at: now_ms,
+            nonce: nonce.to_string(),
+            platform: Some(platform.to_string()),
+            device_family: Some(device_family.to_string()),
+        };
+
+        (params, signing_key)
+    }
+
+    #[test]
+    fn valid_v3_device_identity() {
+        let nonce = "v3-nonce";
+        let (device, _) = make_device_params_v3(
+            "dev-v3", "gc", "bridge", "operator",
+            &["operator.admin"], Some("tok"), nonce,
+            "Darwin", "Desktop",
+        );
+
+        let result = verify_device_identity(
+            &device, "gc", "bridge", "operator",
+            &["operator.admin".to_string()], Some("tok"), nonce,
+        );
+        assert!(result.valid, "Expected valid v3, got: {:?}", result.reason);
+    }
+
+    #[test]
+    fn v3_normalizes_platform_case() {
+        let nonce = "case-nonce";
+        let (device, _) = make_device_params_v3(
+            "dev-case", "gc", "bridge", "operator",
+            &[], None, nonce,
+            "LINUX", "SERVER",
+        );
+
+        let result = verify_device_identity(
+            &device, "gc", "bridge", "operator", &[], None, nonce,
+        );
+        assert!(result.valid, "Expected valid with case normalization, got: {:?}", result.reason);
+    }
+
+    #[test]
+    fn v2_client_still_works_unchanged() {
+        // Ensure v2 params without platform/deviceFamily still verify.
+        let nonce = "v2-compat";
+        let (device, _) = make_device_params(
+            "dev-v2", "gc", "bridge", "operator", &["operator.write"],
+            Some("t"), nonce,
+        );
+        assert!(!device.is_v3());
+
+        let result = verify_device_identity(
+            &device, "gc", "bridge", "operator",
+            &["operator.write".to_string()], Some("t"), nonce,
+        );
+        assert!(result.valid, "v2 backward compat failed: {:?}", result.reason);
     }
 
     // =====================================================================

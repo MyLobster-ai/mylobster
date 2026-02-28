@@ -30,15 +30,34 @@ use tracing::{info, warn};
 /// Reference: OC `src/channels/typing-lifecycle.ts`.
 pub struct TypingKeepaliveLoop {
     interval_ms: u64,
+    /// Maximum duration before auto-stop (v2026.2.26 safety net).
+    max_duration_ms: u64,
     running: Arc<AtomicBool>,
+    /// Suppressed during tool execution (v2026.2.26).
+    suppressed: Arc<AtomicBool>,
 }
+
+/// Default maximum typing indicator duration: 120 seconds.
+const DEFAULT_MAX_TYPING_DURATION_MS: u64 = 120_000;
 
 impl TypingKeepaliveLoop {
     /// Create a new keepalive loop with the given interval.
     pub fn new(interval_ms: u64) -> Self {
         Self {
             interval_ms,
+            max_duration_ms: DEFAULT_MAX_TYPING_DURATION_MS,
             running: Arc::new(AtomicBool::new(false)),
+            suppressed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Create with a custom max duration (v2026.2.26).
+    pub fn with_max_duration(interval_ms: u64, max_duration_ms: u64) -> Self {
+        Self {
+            interval_ms,
+            max_duration_ms,
+            running: Arc::new(AtomicBool::new(false)),
+            suppressed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -47,23 +66,47 @@ impl TypingKeepaliveLoop {
         self.running.load(Ordering::Relaxed)
     }
 
+    /// Suppress typing indicators during tool execution (v2026.2.26).
+    pub fn suppress(&self) {
+        self.suppressed.store(true, Ordering::Relaxed);
+    }
+
+    /// Resume typing indicators after tool execution (v2026.2.26).
+    pub fn unsuppress(&self) {
+        self.suppressed.store(false, Ordering::Relaxed);
+    }
+
     /// Start the keepalive loop, invoking `on_tick` at each interval.
     /// Returns a handle that can be used to stop the loop.
+    ///
+    /// v2026.2.26: auto-stops after `max_duration_ms` to prevent stuck indicators.
     pub fn start<F>(&self, on_tick: F) -> tokio::task::JoinHandle<()>
     where
         F: Fn() + Send + Sync + 'static,
     {
         self.running.store(true, Ordering::Relaxed);
         let running = self.running.clone();
+        let suppressed = self.suppressed.clone();
         let interval = self.interval_ms;
+        let max_duration = self.max_duration_ms;
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_millis(interval));
+            let start = std::time::Instant::now();
             // Skip the first immediate tick.
             ticker.tick().await;
             while running.load(Ordering::Relaxed) {
                 ticker.tick().await;
                 if !running.load(Ordering::Relaxed) {
                     break;
+                }
+                // v2026.2.26: TTL safety net — auto-stop stuck indicators.
+                if start.elapsed().as_millis() as u64 > max_duration {
+                    running.store(false, Ordering::Relaxed);
+                    break;
+                }
+                // v2026.2.26: skip tick if suppressed (tool execution).
+                if suppressed.load(Ordering::Relaxed) {
+                    continue;
                 }
                 on_tick();
             }

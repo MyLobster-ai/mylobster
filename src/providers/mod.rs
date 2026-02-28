@@ -5,7 +5,8 @@ mod groq;
 mod mistral;
 mod ollama;
 mod openai;
-mod openai_compat;
+pub(crate) mod openai_codex;
+pub(crate) mod openai_compat;
 
 use crate::config::Config;
 use crate::gateway::TokenUsage;
