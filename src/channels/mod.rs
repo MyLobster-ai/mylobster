@@ -1,12 +1,27 @@
+mod bluebubbles;
 mod discord;
+mod feishu;
+mod googlechat;
 mod imessage;
+mod irc;
+mod line;
+mod matrix;
+mod mattermost;
+mod nextcloud;
 mod normalize;
+mod nostr;
 mod plugin;
 mod signal;
 mod slack;
 mod synology_chat;
+mod teams;
 mod telegram;
+mod tlon;
+mod twitch;
+mod webchat;
 mod whatsapp;
+mod zalo;
+mod zalouser;
 
 pub use plugin::{ChannelCapability, ChannelMeta, ChannelPlugin};
 
@@ -234,6 +249,65 @@ impl ChannelManager {
         plugins.insert(
             "synology_chat".to_string(),
             Arc::new(synology_chat::SynologyChatChannel::new(config)),
+        );
+
+        // New channel plugins (v2026.3.3).
+        plugins.insert(
+            "matrix".to_string(),
+            Arc::new(matrix::MatrixChannel::new()),
+        );
+        plugins.insert("irc".to_string(), Arc::new(irc::IrcChannel::new()));
+        plugins.insert(
+            "googlechat".to_string(),
+            Arc::new(googlechat::GoogleChatChannel::new()),
+        );
+        plugins.insert(
+            "teams".to_string(),
+            Arc::new(teams::TeamsChannel::new()),
+        );
+        plugins.insert(
+            "bluebubbles".to_string(),
+            Arc::new(bluebubbles::BlueBubblesChannel::new()),
+        );
+        plugins.insert(
+            "line".to_string(),
+            Arc::new(line::LineChannel::new()),
+        );
+        plugins.insert(
+            "mattermost".to_string(),
+            Arc::new(mattermost::MattermostChannel::new()),
+        );
+        plugins.insert(
+            "twitch".to_string(),
+            Arc::new(twitch::TwitchChannel::new()),
+        );
+        plugins.insert(
+            "nostr".to_string(),
+            Arc::new(nostr::NostrChannel::new()),
+        );
+        plugins.insert(
+            "feishu".to_string(),
+            Arc::new(feishu::FeishuChannel::new()),
+        );
+        plugins.insert(
+            "nextcloud".to_string(),
+            Arc::new(nextcloud::NextcloudChannel::new()),
+        );
+        plugins.insert(
+            "tlon".to_string(),
+            Arc::new(tlon::TlonChannel::new()),
+        );
+        plugins.insert(
+            "zalo".to_string(),
+            Arc::new(zalo::ZaloChannel::new()),
+        );
+        plugins.insert(
+            "zalouser".to_string(),
+            Arc::new(zalouser::ZaloUserChannel::new()),
+        );
+        plugins.insert(
+            "webchat".to_string(),
+            Arc::new(webchat::WebChatChannel::new()),
         );
 
         Self {

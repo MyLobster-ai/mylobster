@@ -1,3 +1,8 @@
+pub mod api;
+pub mod discovery;
+pub mod manifest;
+pub mod loader;
+
 use crate::config::Config;
 
 use anyhow::Result;
@@ -5,6 +10,11 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::info;
+
+pub use api::{PluginApi, PluginCoordinator, PluginRegistrations};
+pub use discovery::{DiscoveredPlugin, PluginKind, discover_plugins, default_search_paths};
+pub use loader::PluginLoader;
+pub use manifest::PluginManifest;
 
 // ============================================================================
 // Plugin Interactive Onboarding (v2026.2.26)

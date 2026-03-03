@@ -1,3 +1,4 @@
+mod agent_step;
 pub mod bash;
 mod browser_tool;
 mod canvas;
@@ -5,10 +6,15 @@ mod common;
 mod cron_tool;
 mod discord_actions;
 mod image_tool;
+mod media_tool;
 mod memory_tool;
 mod message_tool;
+mod node_tools;
+mod pdf_tool;
+mod sessions_a2a;
 mod sessions_tool;
 mod slack_actions;
+mod subagents;
 mod telegram_actions;
 mod tts_tool;
 pub mod web_fetch;
@@ -423,6 +429,39 @@ pub fn list_available_tools(config: &Config) -> Vec<ToolInfo> {
             "properties": {}
         }),
     });
+
+    // PDF tool
+    tools.push(pdf_tool::PdfTool.info());
+
+    // Expanded Discord actions
+    tools.push(discord_actions::DiscordActionsTool.info());
+
+    // Expanded Telegram actions
+    tools.push(telegram_actions::TelegramActionsTool.info());
+
+    // Expanded Slack actions
+    tools.push(slack_actions::SlackActionsTool.info());
+
+    // Expanded WhatsApp actions
+    tools.push(whatsapp_actions::WhatsAppActionsTool.info());
+
+    // Node/device tools
+    tools.push(node_tools::NodeTool.info());
+
+    // Expanded Canvas tool
+    tools.push(canvas::CanvasTool.info());
+
+    // Subagent management
+    tools.push(subagents::SubagentsTool.info());
+
+    // Agent step (nested reasoning)
+    tools.push(agent_step::AgentStepTool.info());
+
+    // Media processing
+    tools.push(media_tool::MediaTool.info());
+
+    // A2A messaging
+    tools.push(sessions_a2a::SessionsA2aTool.info());
 
     // Filter by tool policy
     let tools = filter_tools_by_policy(tools, config);

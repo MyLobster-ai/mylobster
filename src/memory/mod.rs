@@ -1,7 +1,10 @@
+pub mod batch_embedding;
 mod chunking;
 mod embeddings;
 mod hybrid;
+pub mod lancedb;
 mod manager;
+pub mod postgres;
 mod schema;
 mod search;
 
@@ -10,6 +13,34 @@ pub use search::MemorySearchResult;
 
 use crate::config::Config;
 use anyhow::Result;
+
+/// Memory backend selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryBackend {
+    /// SQLite with FTS5 + vector (default).
+    Sqlite,
+    /// PostgreSQL with pgvector + tsvector.
+    Postgres,
+    /// LanceDB for vector-only search.
+    LanceDb,
+}
+
+impl Default for MemoryBackend {
+    fn default() -> Self {
+        Self::Sqlite
+    }
+}
+
+impl MemoryBackend {
+    /// Parse backend from config string.
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "postgres" | "postgresql" | "pg" => Self::Postgres,
+            "lancedb" | "lance" => Self::LanceDb,
+            _ => Self::Sqlite,
+        }
+    }
+}
 
 /// Search memory for relevant content matching `query`.
 ///

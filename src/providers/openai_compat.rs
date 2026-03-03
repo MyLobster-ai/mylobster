@@ -109,7 +109,7 @@ pub(crate) fn build_request(request: ProviderRequest, stream: bool) -> OpenAiReq
 }
 
 /// Parse an OpenAI-compatible response into our ProviderResponse.
-fn parse_response(api_resp: OpenAiResponse) -> Result<ProviderResponse> {
+pub(crate) fn parse_openai_response(api_resp: OpenAiResponse) -> Result<ProviderResponse> {
     let choice = api_resp
         .choices
         .into_iter()
@@ -191,7 +191,7 @@ pub(crate) async fn openai_compat_chat(
     }
 
     let api_resp: OpenAiResponse = resp.json().await?;
-    parse_response(api_resp)
+    parse_openai_response(api_resp)
 }
 
 /// Make a streaming chat request to an OpenAI-compatible endpoint.

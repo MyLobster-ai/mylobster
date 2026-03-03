@@ -14,5 +14,7 @@ pub mod plugins;
 pub mod providers;
 pub mod routing;
 pub mod sessions;
+pub mod skills;
+pub mod tts;
 
 pub mod ffi;
