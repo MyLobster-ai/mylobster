@@ -36,6 +36,12 @@ pub struct ProviderMessage {
     pub tool_calls: Option<Vec<serde_json::Value>>,
 }
 
+/// Configuration for extended thinking.
+#[derive(Debug, Clone)]
+pub struct ThinkingConfig {
+    pub budget_tokens: u64,
+}
+
 /// A request to a model provider.
 #[derive(Debug, Clone)]
 pub struct ProviderRequest {
@@ -46,6 +52,7 @@ pub struct ProviderRequest {
     pub stream: bool,
     pub tools: Option<Vec<serde_json::Value>>,
     pub tool_choice: Option<serde_json::Value>,
+    pub thinking: Option<ThinkingConfig>,
 }
 
 /// A response from a model provider.
@@ -73,6 +80,7 @@ impl ProviderResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ContentBlock {
     Text(String),
+    Thinking(String),
     ToolUse {
         id: String,
         name: String,
@@ -87,6 +95,7 @@ pub enum ContentBlock {
 /// Events streamed from a provider.
 pub enum StreamEvent {
     Delta(String),
+    Thinking(String),
     ToolCall(serde_json::Value),
     Done(TokenUsage),
     Error(String),

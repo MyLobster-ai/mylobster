@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::gateway::protocol::*;
-use crate::providers::{ProviderMessage, ProviderRequest, StreamEvent};
+use crate::providers::{ProviderMessage, ProviderRequest, StreamEvent, ThinkingConfig};
 use crate::sessions::SessionStore;
 
 use anyhow::Result;
@@ -107,6 +107,13 @@ pub async fn process_chat(
             break;
         }
 
+        // Enable extended thinking for Claude models (makes reasoning visible)
+        let thinking = if model.contains("claude") {
+            Some(ThinkingConfig { budget_tokens: 10000 })
+        } else {
+            None
+        };
+
         // Create request with tools
         let request = ProviderRequest {
             model: model.clone(),
@@ -120,6 +127,7 @@ pub async fn process_chat(
                 Some(tools.clone())
             },
             tool_choice: None,
+            thinking,
         };
 
         // Stream response
@@ -160,6 +168,23 @@ pub async fn process_chat(
                                         "type": "text",
                                         "text": full_content
                                     }]
+                                })),
+                                error_message: None,
+                                usage: None,
+                                stop_reason: None,
+                            };
+                            seq += 1;
+                            let _ = event_tx.send(chat_event).await;
+                        }
+                        StreamEvent::Thinking(text) => {
+                            // Emit thinking delta so the user can see reasoning
+                            let chat_event = ChatEvent {
+                                run_id: run_id.clone(),
+                                session_key: session_key.clone(),
+                                seq,
+                                state: ChatEventState::Delta,
+                                message: Some(serde_json::json!({
+                                    "thinking": text
                                 })),
                                 error_message: None,
                                 usage: None,

@@ -101,6 +101,7 @@ impl AgentTool for AgentStepTool {
             stream: false,
             tools: None,
             tool_choice: None,
+            thinking: None,
         };
 
         let response = tokio::time::timeout(

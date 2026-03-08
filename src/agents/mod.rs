@@ -48,6 +48,7 @@ pub async fn run_single_message(
         stream: false,
         tools: None,
         tool_choice: None,
+        thinking: None,
     };
 
     let response = provider.chat(request).await?;
@@ -84,6 +85,7 @@ pub async fn handle_chat_completion(
         stream: false,
         tools: req.tools,
         tool_choice: req.tool_choice,
+        thinking: None,
     };
 
     let response = provider.chat(request).await?;
@@ -202,6 +204,7 @@ pub async fn handle_responses_api(
         stream: false,
         tools: None,
         tool_choice: None,
+        thinking: None,
     };
 
     let response = provider.chat(request).await?;

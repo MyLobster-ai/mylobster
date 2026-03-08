@@ -459,6 +459,7 @@ pub unsafe extern "C" fn mylobster_agent_message(
             stream: false,
             tools: None,
             tool_choice: None,
+            thinking: None,
         };
 
         let response = provider.chat(request).await?;
