@@ -2,6 +2,50 @@
 
 All notable changes to the MyLobster Rust agent are documented in this file.
 
+## [2026.3.2] - 2026-03-08
+
+### Synced with OpenClaw v2026.3.2
+
+This release completes full feature parity with OpenClaw v2026.3.2, wiring up all tool stubs, memory search, hook lifecycle events, and the complete tool execution pipeline.
+
+### Added
+
+- **Memory search end-to-end** (`src/memory/search.rs`, `src/memory/manager.rs`, `src/memory/mod.rs`) — Fully implemented FTS5 full-text search, brute-force vector similarity search with cosine similarity, and hybrid BM25+vector retrieval via reciprocal rank fusion. The `memory::search()` entry point now initialises `MemoryIndexManager` and delegates to the configured search mode (FTS, Vector, or Hybrid). Embedding computation is performed before acquiring the database lock to maintain Send safety.
+
+- **Memory store tool** (`src/agents/tools/memory_tool.rs`) — `MemoryStoreTool` persists content to daily memory log files (`memory/YYYY-MM-DD.md`) with timestamps and optional tags, matching OpenClaw's daily log pattern.
+
+- **Memory search tool** (`src/agents/tools/memory_tool.rs`) — `MemorySearchTool` wraps the memory subsystem's hybrid search with configurable `maxResults` and `minScore` parameters.
+
+- **Message send tool** (`src/agents/tools/message_tool.rs`) — `MessageSendTool` dispatches messages to any configured channel (telegram, discord, slack, whatsapp, signal, imessage, synology_chat) via the channel manager.
+
+- **Cron schedule tool** (`src/agents/tools/cron_tool.rs`) — `CronScheduleTool` validates cron expressions, applies stagger delays for top-of-hour jobs, and persists job definitions to the state directory. `CronListTool` lists all scheduled jobs.
+
+- **Image generation tool** (`src/agents/tools/image_tool.rs`) — `ImageGenerateTool` generates images via the OpenAI DALL-E API with configurable model, size, and quality parameters.
+
+- **TTS tool** (`src/agents/tools/tts_tool.rs`) — `TtsSpeakTool` converts text to speech using ElevenLabs API or system TTS (macOS `say` / Linux `espeak`), saving audio to the state directory.
+
+- **Full tool execution pipeline** (`src/gateway/chat.rs`) — `execute_tool()` now routes all 25+ tools by name: web_fetch, web_search, system_run, memory_store, memory_search, message_send, cron_schedule, cron_list, image_generate, tts_speak, pdf_extract, media_process, discord_actions, telegram_actions, slack_actions, whatsapp_actions, node_invoke, canvas_render, subagents, agent_step, sessions_a2a.
+
+- **Hook lifecycle integration** (`src/gateway/chat.rs`) — `process_chat_with_hooks()` fires 8 hook events at key points in the agent loop:
+  - `BeforeAgentStart` — before session creation
+  - `MessageReceived` — on incoming user message
+  - `BeforeModelResolve` — modifying hook that can override model selection
+  - `LlmInput` — before provider call with full message context
+  - `BeforeToolCall` — modifying hook that can cancel tool execution
+  - `AfterToolCall` — after tool returns results
+  - `LlmOutput` — after provider response
+  - `AgentEnd` — after final response with token usage
+
+- **Ollama embedding provider** (`src/memory/embeddings.rs`) — Added Ollama embedding support for local self-hosted memory search, resolving base URL from config.
+
+### Changed
+
+- **Tool modules visibility** — All tool modules (`agents/tools/*`) changed from `mod` to `pub mod` to enable cross-module tool resolution in the gateway chat handler.
+
+- **Config validation module** — Made `config::validation` public to fix binary compilation.
+
+- **Memory manager Send safety** — Restructured `MemoryIndexManager::search()` to compute embeddings before acquiring the `parking_lot::Mutex` database lock, ensuring the future is `Send`-safe for use in async contexts.
+
 ## [2026.2.25] - 2026-02-26
 
 ### Synced with OpenClaw v2026.2.25

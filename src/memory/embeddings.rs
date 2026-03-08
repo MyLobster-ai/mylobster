@@ -76,6 +76,15 @@ pub fn create_provider(config: &Config) -> Option<EmbeddingProviderBox> {
                 .and_then(|p| p.api_key.clone())?;
             Some(Box::new(VoyageEmbeddingProvider::new(api_key, None)))
         }
+        EmbeddingProviderKind::Ollama => {
+            let base_url = config
+                .models
+                .providers
+                .get("ollama")
+                .map(|p| p.base_url.clone())
+                .unwrap_or_else(|| "http://localhost:11434".to_string());
+            Some(Box::new(OllamaEmbeddingProvider::new(base_url, None)))
+        }
         EmbeddingProviderKind::Local => Some(Box::new(LocalEmbeddingProvider::new(None))),
     }
 }
@@ -381,6 +390,77 @@ impl EmbeddingProvider for VoyageEmbeddingProvider {
 
     fn dimensions(&self) -> usize {
         1024
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ollama
+// ---------------------------------------------------------------------------
+
+/// Calls the Ollama `/api/embed` endpoint for local model embeddings.
+pub struct OllamaEmbeddingProvider {
+    base_url: String,
+    model: String,
+    client: reqwest::Client,
+}
+
+impl OllamaEmbeddingProvider {
+    pub fn new(base_url: String, model: Option<String>) -> Self {
+        Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            model: model.unwrap_or_else(|| "nomic-embed-text".to_string()),
+            client: reqwest::Client::new(),
+        }
+    }
+
+    fn embed_url(&self) -> String {
+        let base = self.base_url.strip_suffix("/v1").unwrap_or(&self.base_url);
+        format!("{}/api/embed", base)
+    }
+}
+
+#[derive(Serialize)]
+struct OllamaEmbedRequest {
+    model: String,
+    input: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct OllamaEmbedResponse {
+    embeddings: Vec<Vec<f64>>,
+}
+
+#[async_trait]
+impl EmbeddingProvider for OllamaEmbeddingProvider {
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f64>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let body = OllamaEmbedRequest {
+            model: self.model.clone(),
+            input: texts.to_vec(),
+        };
+
+        let resp = self
+            .client
+            .post(&self.embed_url())
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<OllamaEmbedResponse>()
+            .await?;
+
+        Ok(resp.embeddings)
+    }
+
+    fn model_name(&self) -> String {
+        self.model.clone()
+    }
+
+    fn dimensions(&self) -> usize {
+        768
     }
 }
 

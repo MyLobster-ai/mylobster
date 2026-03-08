@@ -1,7 +1,7 @@
 mod defaults;
 mod io;
 mod types;
-mod validation;
+pub mod validation;
 
 pub use defaults::*;
 pub use io::*;

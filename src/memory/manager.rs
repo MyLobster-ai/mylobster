@@ -119,9 +119,71 @@ impl MemoryIndexManager {
     /// Execute a hybrid search (BM25 full-text + vector similarity) and return
     /// results sorted by descending score.
     pub async fn search(&self, query: &str, opts: MemorySearchOptions) -> Vec<MemorySearchResult> {
-        let _ = (query, opts);
-        debug!(agent_id = %self.agent_id, "memory search (stub)");
-        Vec::new()
+        use super::hybrid;
+        use super::search as sq;
+
+        let limit = opts.max_results;
+
+        // Compute embedding first (before holding lock) for vector/hybrid modes
+        let query_embedding = match opts.mode {
+            sq::SearchMode::Fts => None,
+            sq::SearchMode::Vector | sq::SearchMode::Hybrid => {
+                match self._embedding_provider.embed(&[query.to_string()]).await {
+                    Ok(vecs) if !vecs.is_empty() => Some(vecs.into_iter().next().unwrap()),
+                    _ => {
+                        debug!(agent_id = %self.agent_id, "embedding failed, will fallback to FTS");
+                        None
+                    }
+                }
+            }
+        };
+
+        // Now acquire lock for DB operations (no await while holding lock)
+        let results = {
+            let db = self.db.lock();
+
+            match opts.mode {
+                sq::SearchMode::Fts => {
+                    let fts = sq::fts_search(&db, query, limit);
+                    sq::load_results(&db, &fts)
+                }
+                sq::SearchMode::Vector => {
+                    if let Some(ref emb) = query_embedding {
+                        let vec_results = sq::vector_search(&db, emb, limit);
+                        sq::load_results(&db, &vec_results)
+                    } else {
+                        let fts = sq::fts_search(&db, query, limit);
+                        sq::load_results(&db, &fts)
+                    }
+                }
+                sq::SearchMode::Hybrid => {
+                    let fts = sq::fts_search(&db, query, limit * 2);
+                    let vec_results = if let Some(ref emb) = query_embedding {
+                        sq::vector_search(&db, emb, limit * 2)
+                    } else {
+                        Vec::new()
+                    };
+                    let merged = hybrid::merge_results(&fts, &vec_results, limit);
+                    sq::load_results(&db, &merged)
+                }
+            }
+        }; // lock released here
+
+        // Filter by min_score
+        let results: Vec<MemorySearchResult> = results
+            .into_iter()
+            .filter(|r| r.score >= opts.min_score)
+            .collect();
+
+        debug!(
+            agent_id = %self.agent_id,
+            query,
+            mode = ?opts.mode,
+            results = results.len(),
+            "memory search complete"
+        );
+
+        results
     }
 
     /// Synchronise the index with the file system.

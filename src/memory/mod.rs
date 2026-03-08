@@ -58,12 +58,28 @@ impl MemoryBackend {
 /// * `min_score`   - Minimum relevance score (0.0 .. 1.0) to include a result.
 /// * `session_key` - Optional session key used to scope results.
 pub async fn search(
-    _config: &Config,
-    _query: &str,
-    _max_results: u32,
-    _min_score: f64,
-    _session_key: Option<&str>,
+    config: &Config,
+    query: &str,
+    max_results: u32,
+    min_score: f64,
+    session_key: Option<&str>,
 ) -> Result<Vec<MemorySearchResult>> {
-    // TODO: initialise MemoryIndexManager and delegate to its search method.
-    Ok(Vec::new())
+    let agent_id = "default";
+
+    let manager = match MemoryIndexManager::get(config, agent_id).await {
+        Some(m) => m,
+        None => {
+            tracing::debug!("memory search unavailable (no embedding provider)");
+            return Ok(Vec::new());
+        }
+    };
+
+    let opts = search::MemorySearchOptions {
+        max_results,
+        min_score,
+        session_key: session_key.map(|s| s.to_string()),
+        mode: search::SearchMode::Hybrid,
+    };
+
+    Ok(manager.search(query, opts).await)
 }
