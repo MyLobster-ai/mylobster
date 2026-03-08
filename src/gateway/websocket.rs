@@ -1265,6 +1265,10 @@ async fn handle_request(
             let response = handle_secrets_reload(state, &request).await;
             send_oc_response(tx, response).await;
         }
+        "secrets.resolve" => {
+            let response = handle_secrets_resolve(state, &request).await;
+            send_oc_response(tx, response).await;
+        }
 
         // ================================================================
         // ACP agents (v2026.2.26)
@@ -1331,6 +1335,28 @@ async fn handle_request(
                         "arch": std::env::consts::ARCH,
                         "version": state.version,
                         "runtime": "rust",
+                    }),
+                ),
+            )
+            .await;
+        }
+
+        // ================================================================
+        // Canvas capabilities (v2026.3.2)
+        // ================================================================
+        "node.canvas.capability.refresh" => {
+            send_oc_response(
+                tx,
+                OcResponseFrame::success(
+                    request_id,
+                    serde_json::json!({
+                        "ok": true,
+                        "capabilities": {
+                            "render": true,
+                            "interactive": false,
+                            "maxWidth": 1920,
+                            "maxHeight": 1080,
+                        }
                     }),
                 ),
             )
@@ -3164,6 +3190,54 @@ async fn handle_secrets_reload(
     OcResponseFrame::success(
         request.id.clone(),
         serde_json::to_value(&result).unwrap_or_default(),
+    )
+}
+
+async fn handle_secrets_resolve(
+    state: &GatewayState,
+    request: &RequestFrame,
+) -> OcResponseFrame {
+    let key = match request
+        .params
+        .as_ref()
+        .and_then(|p| p.get("key"))
+        .and_then(|v| v.as_str())
+    {
+        Some(k) => k,
+        None => {
+            return OcResponseFrame::error(
+                request.id.clone(),
+                "Missing 'key' param".to_string(),
+                Some(-32602),
+            );
+        }
+    };
+
+    // Resolve the secret using environment variables as the primary source.
+    // This matches OpenClaw's `secrets.resolve` which interpolates ${SECRET_NAME}
+    // patterns in configuration values.
+    let resolved = std::env::var(key).ok();
+
+    let config = state.config.read().await;
+    let config_value = serde_json::to_value(&*config).unwrap_or_default();
+
+    // Also check if the key exists as a dotted path in the config
+    let config_resolved = key.split('.').fold(Some(&config_value), |acc, part| {
+        acc.and_then(|v| v.get(part))
+    });
+
+    let value = resolved
+        .map(serde_json::Value::String)
+        .or_else(|| config_resolved.cloned())
+        .unwrap_or(serde_json::Value::Null);
+
+    OcResponseFrame::success(
+        request.id.clone(),
+        serde_json::json!({
+            "key": key,
+            "value": value,
+            "resolved": !value.is_null(),
+        }),
     )
 }
 

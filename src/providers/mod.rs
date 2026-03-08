@@ -156,6 +156,11 @@ const OPENAI_COMPAT_PROVIDERS: &[OaiCompatDef] = &[
         env_key: "VENICE_API_KEY",
     },
     OaiCompatDef {
+        name: "minimax",
+        default_base_url: "https://api.minimaxi.chat/v1",
+        env_key: "MINIMAX_API_KEY",
+    },
+    OaiCompatDef {
         name: "nvidia",
         default_base_url: "https://integrate.api.nvidia.com/v1",
         env_key: "NVIDIA_API_KEY",

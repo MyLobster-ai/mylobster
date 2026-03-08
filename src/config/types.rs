@@ -742,6 +742,7 @@ pub enum ModelApi {
     GithubCopilot,
     BedrockConverseStream,
     Ollama,
+    MiniMax,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1916,6 +1917,7 @@ pub enum EmbeddingProvider {
     Mistral,
     Local,
     Voyage,
+    Ollama,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

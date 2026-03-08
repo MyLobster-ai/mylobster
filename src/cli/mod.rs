@@ -49,6 +49,9 @@ pub struct SendOpts {
 pub struct ConfigOpts {
     #[arg(short, long)]
     pub config: Option<String>,
+    /// Output validation results as JSON
+    #[arg(long)]
+    pub json: bool,
     #[command(subcommand)]
     pub action: ConfigAction,
 }

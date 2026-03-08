@@ -42,7 +42,24 @@ async fn main() -> anyhow::Result<()> {
                     println!("{}", serde_json::to_string_pretty(&config)?);
                 }
                 mylobster::cli::ConfigAction::Validate => {
-                    info!("Configuration is valid");
+                    let errors = mylobster::config::validation::validate_config(&config);
+                    if opts.json {
+                        let result = serde_json::json!({
+                            "valid": errors.is_empty(),
+                            "errors": errors.iter().map(|e| serde_json::json!({
+                                "path": e.path,
+                                "message": e.message,
+                            })).collect::<Vec<_>>(),
+                        });
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    } else if errors.is_empty() {
+                        info!("Configuration is valid");
+                    } else {
+                        for err in &errors {
+                            eprintln!("  {} — {}", err.path, err.message);
+                        }
+                        std::process::exit(1);
+                    }
                 }
                 mylobster::cli::ConfigAction::Init => {
                     Config::write_default(opts.config.as_deref().unwrap_or("mylobster.json"))?;
