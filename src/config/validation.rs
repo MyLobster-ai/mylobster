@@ -175,4 +175,94 @@ mod tests {
     fn no_network_allowed() {
         assert_eq!(get_blocked_network_mode_reason(None, false), None);
     }
+
+    // ====================================================================
+    // validate_config (v2026.3.11 parity)
+    // ====================================================================
+
+    #[test]
+    fn valid_default_config_has_no_errors() {
+        let config = Config::default();
+        let errors = validate_config(&config);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn zero_port_is_invalid() {
+        let mut config = Config::default();
+        config.gateway.port = 0;
+        let errors = validate_config(&config);
+        assert!(errors.iter().any(|e| e.path == "gateway.port"));
+    }
+
+    #[test]
+    fn password_auth_without_password_is_invalid() {
+        let mut config = Config::default();
+        config.gateway.auth.mode = GatewayAuthMode::Password;
+        config.gateway.auth.password = None;
+        let errors = validate_config(&config);
+        assert!(errors.iter().any(|e| e.path == "gateway.auth.password"));
+    }
+
+    #[test]
+    fn password_auth_with_password_is_valid() {
+        let mut config = Config::default();
+        config.gateway.auth.mode = GatewayAuthMode::Password;
+        config.gateway.auth.password = Some("my-pass".to_string());
+        let errors = validate_config(&config);
+        assert!(!errors.iter().any(|e| e.path == "gateway.auth.password"));
+    }
+
+    #[test]
+    fn empty_provider_base_url_is_invalid() {
+        let mut config = Config::default();
+        config.models.providers.insert(
+            "test".to_string(),
+            crate::config::types::ModelProviderConfig {
+                base_url: "".to_string(),
+                api_key: Some("key".to_string()),
+                auth: None,
+                api: None,
+                headers: None,
+                auth_header: None,
+                models: vec![],
+            },
+        );
+        let errors = validate_config(&config);
+        assert!(errors
+            .iter()
+            .any(|e| e.path == "models.providers.test.baseUrl"));
+    }
+
+    #[test]
+    fn multiple_errors_accumulate() {
+        let mut config = Config::default();
+        config.gateway.port = 0;
+        config.gateway.auth.mode = GatewayAuthMode::Password;
+        config.gateway.auth.password = None;
+        let errors = validate_config(&config);
+        assert!(errors.len() >= 2);
+    }
+
+    #[test]
+    fn config_validation_error_display() {
+        let err = ConfigValidationError {
+            path: "gateway.port".to_string(),
+            message: "Port must be greater than 0".to_string(),
+        };
+        assert_eq!(err.to_string(), "gateway.port: Port must be greater than 0");
+    }
+
+    #[test]
+    fn validate_config_object_ok() {
+        let config = Config::default();
+        assert!(validate_config_object(&config).is_ok());
+    }
+
+    #[test]
+    fn validate_config_object_err() {
+        let mut config = Config::default();
+        config.gateway.port = 0;
+        assert!(validate_config_object(&config).is_err());
+    }
 }

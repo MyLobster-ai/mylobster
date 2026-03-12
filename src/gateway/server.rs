@@ -267,6 +267,91 @@ fn resolve_bind_address(config: &Config, bind_override: Option<&str>, port: u16)
     format!("{host}:{port}").parse().unwrap()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ====================================================================
+    // RpcState initialization (v2026.3.11)
+    // ====================================================================
+
+    #[test]
+    fn rpc_state_new_initializes_all_fields() {
+        let state = RpcState::new();
+        assert!(state.cron_jobs.read().is_empty());
+        assert!(state.cron_runs.read().is_empty());
+        assert!(state.cron_last_errors.read().is_empty());
+        assert_eq!(*state.cron_error_count.read(), 0);
+        assert!(state.agents.read().is_empty());
+        assert!(state.node_pending_work.read().is_empty());
+        assert!(!state.model_fallback.read().is_on_cooldown("any-model"));
+    }
+
+    #[test]
+    fn rpc_state_node_pending_work_operations() {
+        let state = RpcState::new();
+        {
+            let mut pending = state.node_pending_work.write();
+            let queue = pending.entry("node-1".to_string()).or_insert_with(Vec::new);
+            queue.push(serde_json::json!({"task": "test"}));
+        }
+        assert_eq!(state.node_pending_work.read().get("node-1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rpc_state_cron_error_tracking() {
+        let state = RpcState::new();
+        {
+            let mut errors = state.cron_last_errors.write();
+            errors.insert("job-1".to_string(), "timeout".to_string());
+            *state.cron_error_count.write() += 1;
+        }
+        assert_eq!(
+            state.cron_last_errors.read().get("job-1").map(|s| s.as_str()),
+            Some("timeout")
+        );
+        assert_eq!(*state.cron_error_count.read(), 1);
+    }
+
+    #[test]
+    fn rpc_state_model_fallback_integration() {
+        let state = RpcState::new();
+        {
+            let mut fb = state.model_fallback.write();
+            fb.record_failure("claude-sonnet-4-6");
+        }
+        assert!(state.model_fallback.read().is_on_cooldown("claude-sonnet-4-6"));
+        assert!(!state.model_fallback.read().is_on_cooldown("gpt-4o"));
+    }
+
+    #[test]
+    fn rpc_state_default_is_new() {
+        let state = RpcState::default();
+        assert!(state.node_pending_work.read().is_empty());
+        assert_eq!(*state.cron_error_count.read(), 0);
+    }
+
+    // ====================================================================
+    // resolve_bind_address
+    // ====================================================================
+
+    #[test]
+    fn bind_loopback_resolves_to_127() {
+        let config = Config::default();
+        let addr = resolve_bind_address(&config, None, 18789);
+        assert_eq!(addr.ip().to_string(), "127.0.0.1");
+        assert_eq!(addr.port(), 18789);
+    }
+
+    #[test]
+    fn bind_override_string() {
+        let config = Config::default();
+        let addr = resolve_bind_address(&config, Some("lan"), 9000);
+        assert_eq!(addr.ip().to_string(), "0.0.0.0");
+        assert_eq!(addr.port(), 9000);
+    }
+}
+
 /// Print startup banner with server info.
 fn print_startup_banner(state: &GatewayState, addr: &SocketAddr) {
     let auth_mode = match state.auth.mode {

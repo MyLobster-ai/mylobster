@@ -815,3 +815,188 @@ async fn sessions_list_returns_empty() {
 
     let _ = shutdown.send(());
 }
+
+// =========================================================================
+// v2026.3.11 — HTTP endpoint tests
+// =========================================================================
+
+#[tokio::test]
+async fn http_status_endpoint_includes_runtime_version() {
+    let (url, shutdown) = start_no_auth_gateway().await;
+    let http_url = url.replace("ws://", "http://").replace("/ws", "/api/status");
+
+    let client = reqwest::Client::new();
+    let resp = client.get(&http_url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "ok");
+    assert!(body["version"].is_string());
+    assert!(body["runtimeVersion"].is_string());
+    assert_eq!(body["protocolVersion"], 4);
+    assert!(body["uptime"].is_number());
+    assert!(body["sessions"].is_number());
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn http_config_validate_endpoint() {
+    let (url, shutdown) = start_no_auth_gateway().await;
+    let http_url = url
+        .replace("ws://", "http://")
+        .replace("/ws", "/api/config/validate");
+
+    let client = reqwest::Client::new();
+    let resp = client.post(&http_url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["valid"].is_boolean());
+    assert!(body["issues"].is_array());
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn http_config_schema_endpoint() {
+    let (url, shutdown) = start_no_auth_gateway().await;
+    let http_url = url
+        .replace("ws://", "http://")
+        .replace("/ws", "/api/config/schema");
+
+    let client = reqwest::Client::new();
+    let resp = client.get(&http_url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["schema"].is_object());
+    assert!(body["schema"]["properties"]["agents"].is_object());
+    assert!(body["schema"]["properties"]["models"].is_object());
+    assert!(body["schema"]["properties"]["gateway"].is_object());
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn http_cron_jobs_endpoint() {
+    let (url, shutdown) = start_no_auth_gateway().await;
+    let http_url = url
+        .replace("ws://", "http://")
+        .replace("/ws", "/api/cron/jobs");
+
+    let client = reqwest::Client::new();
+    let resp = client.get(&http_url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["jobs"].is_array());
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn http_cron_job_detail_not_found() {
+    let (url, shutdown) = start_no_auth_gateway().await;
+    let http_url = url
+        .replace("ws://", "http://")
+        .replace("/ws", "/api/cron/jobs/nonexistent-id");
+
+    let client = reqwest::Client::new();
+    let resp = client.get(&http_url).send().await.unwrap();
+    assert_eq!(resp.status(), 404);
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn http_cron_status_endpoint() {
+    let (url, shutdown) = start_no_auth_gateway().await;
+    let http_url = url
+        .replace("ws://", "http://")
+        .replace("/ws", "/api/cron/status");
+
+    let client = reqwest::Client::new();
+    let resp = client.get(&http_url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["running"].as_bool().unwrap());
+    assert_eq!(body["jobCount"], 0);
+    assert_eq!(body["errorCount"], 0);
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn http_usage_endpoint() {
+    let (url, shutdown) = start_no_auth_gateway().await;
+    let http_url = url
+        .replace("ws://", "http://")
+        .replace("/ws", "/api/usage");
+
+    let client = reqwest::Client::new();
+    let resp = client.get(&http_url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["totalInputTokens"], 0);
+    assert_eq!(body["totalOutputTokens"], 0);
+    assert_eq!(body["totalRequests"], 0);
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn http_agents_list_endpoint() {
+    let (url, shutdown) = start_no_auth_gateway().await;
+    let http_url = url
+        .replace("ws://", "http://")
+        .replace("/ws", "/api/agents");
+
+    let client = reqwest::Client::new();
+    let resp = client.get(&http_url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let agents = body["agents"].as_array().unwrap();
+    // Should contain at least the default agent
+    assert!(agents.iter().any(|a| a["id"] == "default"));
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn http_models_list_endpoint() {
+    let (url, shutdown) = start_no_auth_gateway().await;
+    let http_url = url
+        .replace("ws://", "http://")
+        .replace("/ws", "/api/models");
+
+    let client = reqwest::Client::new();
+    let resp = client.get(&http_url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["models"].is_array());
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn http_sessions_list_endpoint() {
+    let (url, shutdown) = start_no_auth_gateway().await;
+    let http_url = url
+        .replace("ws://", "http://")
+        .replace("/ws", "/api/sessions");
+
+    let client = reqwest::Client::new();
+    let resp = client.get(&http_url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    // HTTP endpoint returns a plain array (not wrapped in {sessions: []})
+    assert!(body.is_array());
+
+    let _ = shutdown.send(());
+}

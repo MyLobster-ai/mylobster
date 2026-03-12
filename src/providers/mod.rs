@@ -660,3 +660,202 @@ impl AgentModelConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    // ====================================================================
+    // detect_provider (v2026.3.11 — MiniMax + alternative providers)
+    // ====================================================================
+
+    #[test]
+    fn detect_anthropic_claude_models() {
+        let config = Config::default();
+        assert_eq!(detect_provider(&config, "claude-sonnet-4-6"), "anthropic");
+        assert_eq!(detect_provider(&config, "claude-3-opus"), "anthropic");
+    }
+
+    #[test]
+    fn detect_openai_gpt_models() {
+        let config = Config::default();
+        assert_eq!(detect_provider(&config, "gpt-4o"), "openai");
+        assert_eq!(detect_provider(&config, "gpt-4-turbo"), "openai");
+        assert_eq!(detect_provider(&config, "o1-preview"), "openai");
+        assert_eq!(detect_provider(&config, "o3-mini"), "openai");
+    }
+
+    #[test]
+    fn detect_gemini_models() {
+        let config = Config::default();
+        assert_eq!(detect_provider(&config, "gemini-2.0-flash"), "google");
+        assert_eq!(detect_provider(&config, "gemini-pro"), "google");
+    }
+
+    #[test]
+    fn detect_mistral_models() {
+        let config = Config::default();
+        assert_eq!(detect_provider(&config, "mistral-large"), "mistral");
+        assert_eq!(detect_provider(&config, "codestral-latest"), "mistral");
+        assert_eq!(detect_provider(&config, "pixtral-12b"), "mistral");
+    }
+
+    #[test]
+    fn detect_xai_grok_models() {
+        let config = Config::default();
+        assert_eq!(detect_provider(&config, "grok-2"), "xai");
+    }
+
+    #[test]
+    fn detect_ollama_models_with_tag() {
+        let config = Config::default();
+        assert_eq!(detect_provider(&config, "llama3.3:latest"), "ollama");
+        assert_eq!(detect_provider(&config, "phi4:14b"), "ollama");
+    }
+
+    // v2026.3.11: MiniMax provider prefix
+    #[test]
+    fn detect_minimax_prefix() {
+        let config = Config::default();
+        assert_eq!(detect_provider(&config, "minimax/abab6.5-chat"), "minimax");
+    }
+
+    // v2026.3.11: Alternative provider prefixes
+    #[test]
+    fn detect_together_prefix() {
+        let config = Config::default();
+        assert_eq!(detect_provider(&config, "together/llama-3-70b"), "together");
+    }
+
+    #[test]
+    fn detect_venice_prefix() {
+        let config = Config::default();
+        assert_eq!(detect_provider(&config, "venice/llama-3.1-405b"), "venice");
+    }
+
+    #[test]
+    fn detect_openrouter_prefix() {
+        let config = Config::default();
+        assert_eq!(detect_provider(&config, "openrouter/gpt-4-turbo"), "openrouter");
+    }
+
+    #[test]
+    fn detect_nvidia_prefix() {
+        let config = Config::default();
+        assert_eq!(detect_provider(&config, "nvidia/nemotron-4-340b"), "nvidia");
+        assert_eq!(detect_provider(&config, "nim/llama-3"), "nvidia");
+    }
+
+    #[test]
+    fn detect_qianfan_baidu_prefix() {
+        let config = Config::default();
+        assert_eq!(detect_provider(&config, "qianfan/ernie-4.0"), "qianfan");
+        assert_eq!(detect_provider(&config, "baidu/ernie-bot"), "qianfan");
+    }
+
+    #[test]
+    fn detect_doubao_volcengine_prefix() {
+        let config = Config::default();
+        assert_eq!(detect_provider(&config, "doubao/doubao-pro"), "doubao");
+        assert_eq!(detect_provider(&config, "volcengine/doubao-lite"), "doubao");
+    }
+
+    #[test]
+    fn detect_mimo_xiaomi_prefix() {
+        let config = Config::default();
+        assert_eq!(detect_provider(&config, "mimo/mimo-llm"), "mimo");
+        assert_eq!(detect_provider(&config, "xiaomi/mimo-vl"), "mimo");
+    }
+
+    #[test]
+    fn detect_kimi_prefix() {
+        let config = Config::default();
+        assert_eq!(detect_provider(&config, "kimi/moonshot-v1-8k"), "kimi");
+    }
+
+    #[test]
+    fn detect_cloudflare_prefix() {
+        let config = Config::default();
+        assert_eq!(detect_provider(&config, "cloudflare/llama-3"), "cloudflare");
+        assert_eq!(detect_provider(&config, "cf/phi-2"), "cloudflare");
+    }
+
+    #[test]
+    fn detect_copilot_github_prefix() {
+        let config = Config::default();
+        assert_eq!(detect_provider(&config, "copilot/gpt-4"), "copilot");
+        assert_eq!(detect_provider(&config, "github/gpt-4o"), "copilot");
+    }
+
+    #[test]
+    fn detect_bedrock_aws_prefix() {
+        let config = Config::default();
+        assert_eq!(detect_provider(&config, "bedrock/claude-3"), "bedrock");
+        assert_eq!(detect_provider(&config, "aws/claude-3"), "bedrock");
+    }
+
+    #[test]
+    fn detect_unknown_prefix_falls_through() {
+        let config = Config::default();
+        // Unknown prefix with slash — falls through to model name matching
+        assert_eq!(detect_provider(&config, "unknown/claude-model"), "anthropic");
+    }
+
+    #[test]
+    fn detect_unknown_model_defaults_to_anthropic() {
+        let config = Config::default();
+        assert_eq!(detect_provider(&config, "some-random-model"), "anthropic");
+    }
+
+    // ====================================================================
+    // OPENAI_COMPAT_PROVIDERS includes MiniMax (v2026.3.11)
+    // ====================================================================
+
+    #[test]
+    fn openai_compat_includes_minimax() {
+        assert!(OPENAI_COMPAT_PROVIDERS.iter().any(|p| p.name == "minimax"));
+    }
+
+    #[test]
+    fn openai_compat_minimax_base_url() {
+        let minimax = OPENAI_COMPAT_PROVIDERS
+            .iter()
+            .find(|p| p.name == "minimax")
+            .unwrap();
+        assert_eq!(minimax.default_base_url, "https://api.minimaxi.chat/v1");
+    }
+
+    // ====================================================================
+    // ANTHROPIC_COMPAT_PROVIDERS includes MiniMax (v2026.3.11)
+    // ====================================================================
+
+    #[test]
+    fn anthropic_compat_includes_minimax() {
+        assert!(ANTHROPIC_COMPAT_PROVIDERS.iter().any(|p| p.name == "minimax"));
+    }
+
+    // ====================================================================
+    // v2026.3.11 alternative provider entries
+    // ====================================================================
+
+    #[test]
+    fn openai_compat_includes_all_v2026_3_11_providers() {
+        let names: Vec<&str> = OPENAI_COMPAT_PROVIDERS.iter().map(|p| p.name).collect();
+        assert!(names.contains(&"venice"));
+        assert!(names.contains(&"minimax"));
+        assert!(names.contains(&"nvidia"));
+        assert!(names.contains(&"kilocode"));
+        assert!(names.contains(&"qianfan"));
+        assert!(names.contains(&"doubao"));
+        assert!(names.contains(&"byteplus"));
+        assert!(names.contains(&"vllm"));
+    }
+
+    #[test]
+    fn anthropic_compat_includes_mimo_kimi() {
+        let names: Vec<&str> = ANTHROPIC_COMPAT_PROVIDERS.iter().map(|p| p.name).collect();
+        assert!(names.contains(&"mimo"));
+        assert!(names.contains(&"kimi"));
+    }
+}
