@@ -2638,11 +2638,13 @@ pub fn get_provider_models(provider: &str) -> Vec<serde_json::Value> {
 
 fn handle_cron_status(state: &GatewayState, request: &RequestFrame) -> OcResponseFrame {
     let job_count = state.rpc.cron_jobs.read().len();
+    let error_count = *state.rpc.cron_error_count.read();
     OcResponseFrame::success(
         request.id.clone(),
         serde_json::json!({
             "running": true,
             "jobCount": job_count,
+            "errorCount": error_count,
         }),
     )
 }
