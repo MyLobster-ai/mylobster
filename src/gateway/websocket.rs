@@ -3148,6 +3148,8 @@ async fn handle_status(state: &GatewayState, request: &RequestFrame) -> OcRespon
         request.id.clone(),
         serde_json::json!({
             "version": state.version,
+            "runtimeVersion": env!("CARGO_PKG_VERSION"),
+            "protocolVersion": crate::gateway::protocol::PROTOCOL_VERSION,
             "uptime": uptime,
             "sessions": session_count,
             "channels": channel_status,

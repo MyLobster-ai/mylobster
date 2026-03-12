@@ -309,3 +309,123 @@ pub fn has_orchestration_privilege(session_key: &str) -> bool {
     // Sessions with "subagent:" prefix are leaf sessions — no orchestration
     !session_key.starts_with("subagent:")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ====================================================================
+    // Session alias canonicalization (v2026.3.11)
+    // ====================================================================
+
+    #[test]
+    fn canonicalize_main_to_default() {
+        assert_eq!(canonicalize_session_alias("main"), Some("default".to_string()));
+    }
+
+    #[test]
+    fn canonicalize_main_case_variants() {
+        assert_eq!(canonicalize_session_alias("Main"), Some("default".to_string()));
+        assert_eq!(canonicalize_session_alias("MAIN"), Some("default".to_string()));
+    }
+
+    #[test]
+    fn canonicalize_non_alias_returns_none() {
+        assert_eq!(canonicalize_session_alias("default"), None);
+        assert_eq!(canonicalize_session_alias("my-session"), None);
+        assert_eq!(canonicalize_session_alias(""), None);
+        assert_eq!(canonicalize_session_alias("mainX"), None);
+    }
+
+    // ====================================================================
+    // Session visibility enforcement (v2026.3.11)
+    // ====================================================================
+
+    #[test]
+    fn visibility_same_session_allowed() {
+        let store = SessionStore::new(&Config::default());
+        assert!(store.check_session_visibility("session:a", "session:a"));
+    }
+
+    #[test]
+    fn visibility_parent_can_access_child() {
+        let store = SessionStore::new(&Config::default());
+        assert!(store.check_session_visibility("session", "session:child"));
+        assert!(store.check_session_visibility("session:a", "session:a:b"));
+    }
+
+    #[test]
+    fn visibility_child_cannot_access_parent() {
+        let store = SessionStore::new(&Config::default());
+        assert!(!store.check_session_visibility("session:child", "session"));
+    }
+
+    #[test]
+    fn visibility_siblings_cannot_access_each_other() {
+        let store = SessionStore::new(&Config::default());
+        assert!(!store.check_session_visibility("session:a", "session:b"));
+    }
+
+    #[test]
+    fn visibility_unrelated_sessions_rejected() {
+        let store = SessionStore::new(&Config::default());
+        assert!(!store.check_session_visibility("alpha", "beta"));
+    }
+
+    // ====================================================================
+    // Orchestration privilege (v2026.3.11)
+    // ====================================================================
+
+    #[test]
+    fn orchestration_default_session_has_privilege() {
+        assert!(has_orchestration_privilege("default"));
+    }
+
+    #[test]
+    fn orchestration_root_session_no_colon_has_privilege() {
+        assert!(has_orchestration_privilege("my-session"));
+        assert!(has_orchestration_privilege("session123"));
+    }
+
+    #[test]
+    fn orchestration_subagent_prefix_no_privilege() {
+        assert!(!has_orchestration_privilege("subagent:task-1"));
+        assert!(!has_orchestration_privilege("subagent:deep:nested"));
+    }
+
+    #[test]
+    fn orchestration_non_subagent_colon_has_privilege() {
+        assert!(has_orchestration_privilege("session:child"));
+        assert!(has_orchestration_privilege("agent:worker"));
+    }
+
+    // ====================================================================
+    // SessionStore resolve_session with alias (v2026.3.11)
+    // ====================================================================
+
+    #[test]
+    fn resolve_session_main_alias_to_default() {
+        let store = SessionStore::new(&Config::default());
+        let config = Config::default();
+        // Create a "default" session
+        store.get_or_create_session("default", &config);
+        // "main" should resolve to "default"
+        let resolved = store.resolve_session("main");
+        assert_eq!(resolved, Some("default".to_string()));
+    }
+
+    #[test]
+    fn resolve_session_main_alias_no_match_when_no_default() {
+        let store = SessionStore::new(&Config::default());
+        let resolved = store.resolve_session("main");
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn resolve_session_exact_key() {
+        let store = SessionStore::new(&Config::default());
+        let config = Config::default();
+        store.get_or_create_session("my-key", &config);
+        assert_eq!(store.resolve_session("my-key"), Some("my-key".to_string()));
+    }
+}

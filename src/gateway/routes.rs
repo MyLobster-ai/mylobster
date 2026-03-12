@@ -555,3 +555,62 @@ async fn responses_handler(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ====================================================================
+    // is_origin_allowed (v2026.3.11 — GHSA-5wcw-8jjv-m286)
+    // ====================================================================
+
+    #[test]
+    fn origin_allowed_exact_match() {
+        let allowed = vec!["https://mylobster.ai".to_string()];
+        assert!(is_origin_allowed("https://mylobster.ai", &allowed));
+    }
+
+    #[test]
+    fn origin_rejected_not_in_list() {
+        let allowed = vec!["https://mylobster.ai".to_string()];
+        assert!(!is_origin_allowed("https://evil.com", &allowed));
+    }
+
+    #[test]
+    fn origin_allowed_wildcard() {
+        let allowed = vec!["*".to_string()];
+        assert!(is_origin_allowed("https://anything.example.com", &allowed));
+    }
+
+    #[test]
+    fn origin_allowed_multiple_entries() {
+        let allowed = vec![
+            "https://mylobster.ai".to_string(),
+            "https://app.mylobster.ai".to_string(),
+            "http://localhost:3000".to_string(),
+        ];
+        assert!(is_origin_allowed("https://app.mylobster.ai", &allowed));
+        assert!(is_origin_allowed("http://localhost:3000", &allowed));
+        assert!(!is_origin_allowed("https://other.com", &allowed));
+    }
+
+    #[test]
+    fn origin_rejected_empty_list() {
+        let allowed: Vec<String> = vec![];
+        // Empty list means nothing matches (caller should skip check for empty)
+        assert!(!is_origin_allowed("https://anything.com", &allowed));
+    }
+
+    #[test]
+    fn origin_case_sensitive() {
+        let allowed = vec!["https://MyLobster.ai".to_string()];
+        // Origin matching is case-sensitive per spec
+        assert!(!is_origin_allowed("https://mylobster.ai", &allowed));
+    }
+
+    #[test]
+    fn origin_no_partial_match() {
+        let allowed = vec!["https://mylobster.ai".to_string()];
+        assert!(!is_origin_allowed("https://mylobster.ai.evil.com", &allowed));
+    }
+}

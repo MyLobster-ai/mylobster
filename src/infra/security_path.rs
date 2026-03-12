@@ -574,4 +574,106 @@ mod tests {
         // Wrong inode — should detect rebind
         assert!(detect_symlink_rebind(&file, 0, 99999999).is_err());
     }
+
+    // ====================================================================
+    // validate_archive_entry_path (v2026.3.11)
+    // ====================================================================
+
+    #[test]
+    fn archive_normal_path_accepted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let result = validate_archive_entry_path(dir.path(), std::path::Path::new("data/file.txt"));
+        assert!(result.is_ok());
+        let resolved = result.unwrap();
+        assert!(resolved.starts_with(dir.path()));
+    }
+
+    #[test]
+    fn archive_absolute_path_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let result = validate_archive_entry_path(dir.path(), std::path::Path::new("/etc/passwd"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("absolute path"));
+    }
+
+    #[test]
+    fn archive_parent_traversal_escaping_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let result = validate_archive_entry_path(
+            dir.path(),
+            std::path::Path::new("../../etc/passwd"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn archive_dot_segment_accepted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let result = validate_archive_entry_path(dir.path(), std::path::Path::new("./data/file.txt"));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn archive_parent_within_target_accepted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // sub/../file.txt should resolve to target/file.txt — still within target
+        let result = validate_archive_entry_path(dir.path(), std::path::Path::new("sub/../file.txt"));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn archive_deeply_nested_accepted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let result = validate_archive_entry_path(dir.path(), std::path::Path::new("a/b/c/d/file.txt"));
+        assert!(result.is_ok());
+    }
+
+    // ====================================================================
+    // secure_read_secret_file (v2026.3.11, Unix only)
+    // ====================================================================
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_read_normal_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("secret.key");
+        std::fs::write(&file, "super-secret-value").unwrap();
+
+        let content = secure_read_secret_file(&file).unwrap();
+        assert_eq!(content, b"super-secret-value");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_read_rejects_symlink() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("real.key");
+        std::fs::write(&target, "secret").unwrap();
+
+        let link = dir.path().join("symlink.key");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let result = secure_read_secret_file(&link);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_read_nonexistent_file_errors() {
+        let result = secure_read_secret_file(std::path::Path::new("/tmp/nonexistent_secret_file_xyz"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Cannot lstat"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_read_empty_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("empty.key");
+        std::fs::write(&file, "").unwrap();
+
+        let content = secure_read_secret_file(&file).unwrap();
+        assert!(content.is_empty());
+    }
 }

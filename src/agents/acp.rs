@@ -446,4 +446,37 @@ mod tests {
             "\"stopped\""
         );
     }
+
+    // ====================================================================
+    // resume_session_id (v2026.3.11 — ACPX session resume)
+    // ====================================================================
+
+    #[tokio::test]
+    async fn spawn_with_resume_session_id() {
+        let mgr = AcpAgentManager::new();
+        let agent = mgr
+            .spawn(AcpSpawnParams {
+                name: "resumable".into(),
+                config: None,
+                session_key: Some("session:resume-1".into()),
+                account_id: None,
+                resume_session_id: Some("prev-session-abc".into()),
+            })
+            .await;
+
+        assert_eq!(agent.name, "resumable");
+        assert_eq!(agent.state, AcpAgentState::Running);
+    }
+
+    #[tokio::test]
+    async fn spawn_params_resume_session_id_none_by_default() {
+        let params = AcpSpawnParams {
+            name: "agent".into(),
+            config: None,
+            session_key: None,
+            account_id: None,
+            resume_session_id: None,
+        };
+        assert!(params.resume_session_id.is_none());
+    }
 }

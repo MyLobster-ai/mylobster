@@ -168,4 +168,136 @@ mod tests {
         assert_eq!(restored.expr, "0 9 * * 1-5");
         assert_eq!(restored.stagger_ms, Some(5000));
     }
+
+    // ====================================================================
+    // CronJob v2026.3.11 fields
+    // ====================================================================
+
+    fn make_job(id: &str) -> CronJob {
+        CronJob {
+            id: id.to_string(),
+            name: format!("job-{id}"),
+            schedule: make_schedule("cron", "0 * * * *", None),
+            message: "hello".to_string(),
+            session_key: None,
+            enabled: true,
+            created_at: 1000,
+            isolated_delivery: false,
+            last_error_reason: None,
+            retry_silent: false,
+        }
+    }
+
+    #[test]
+    fn cron_job_serde_round_trip_with_v2026_3_11_fields() {
+        let mut job = make_job("j1");
+        job.isolated_delivery = true;
+        job.last_error_reason = Some("timeout".to_string());
+        job.retry_silent = true;
+
+        let json = serde_json::to_string(&job).unwrap();
+        let restored: CronJob = serde_json::from_str(&json).unwrap();
+        assert!(restored.isolated_delivery);
+        assert_eq!(restored.last_error_reason.as_deref(), Some("timeout"));
+        assert!(restored.retry_silent);
+    }
+
+    #[test]
+    fn cron_job_defaults_v2026_3_11_fields() {
+        let raw = serde_json::json!({
+            "id": "j2",
+            "name": "test",
+            "schedule": { "kind": "cron", "expr": "0 * * * *" },
+            "message": "hi",
+            "enabled": true,
+            "createdAt": 1000
+        });
+        let job: CronJob = serde_json::from_value(raw).unwrap();
+        assert!(!job.isolated_delivery);
+        assert!(job.last_error_reason.is_none());
+        assert!(!job.retry_silent);
+    }
+
+    // ====================================================================
+    // CronErrorTracker (v2026.3.11)
+    // ====================================================================
+
+    #[test]
+    fn error_tracker_starts_empty() {
+        let tracker = CronErrorTracker::default();
+        assert_eq!(tracker.total_error_count, 0);
+        assert!(tracker.errors.is_empty());
+    }
+
+    #[test]
+    fn error_tracker_record_and_query() {
+        let mut tracker = CronErrorTracker::default();
+        tracker.record_error("job-1", "timeout after 30s");
+        assert_eq!(tracker.last_error("job-1"), Some("timeout after 30s"));
+        assert_eq!(tracker.total_error_count, 1);
+    }
+
+    #[test]
+    fn error_tracker_record_overwrites_previous() {
+        let mut tracker = CronErrorTracker::default();
+        tracker.record_error("job-1", "first error");
+        tracker.record_error("job-1", "second error");
+        assert_eq!(tracker.last_error("job-1"), Some("second error"));
+        assert_eq!(tracker.total_error_count, 2);
+    }
+
+    #[test]
+    fn error_tracker_clear_error() {
+        let mut tracker = CronErrorTracker::default();
+        tracker.record_error("job-1", "err");
+        tracker.clear_error("job-1");
+        assert!(tracker.last_error("job-1").is_none());
+        // total_error_count is not decremented on clear
+        assert_eq!(tracker.total_error_count, 1);
+    }
+
+    #[test]
+    fn error_tracker_multiple_jobs() {
+        let mut tracker = CronErrorTracker::default();
+        tracker.record_error("job-1", "rate limit");
+        tracker.record_error("job-2", "auth failure");
+        assert_eq!(tracker.last_error("job-1"), Some("rate limit"));
+        assert_eq!(tracker.last_error("job-2"), Some("auth failure"));
+        assert!(tracker.last_error("job-3").is_none());
+        assert_eq!(tracker.total_error_count, 2);
+    }
+
+    // ====================================================================
+    // migrate_legacy_storage (v2026.3.11)
+    // ====================================================================
+
+    #[test]
+    fn migrate_legacy_enables_isolated_delivery() {
+        let mut jobs = vec![make_job("j1"), make_job("j2")];
+        assert!(!jobs[0].isolated_delivery);
+        assert!(!jobs[1].isolated_delivery);
+
+        migrate_legacy_storage(&mut jobs);
+
+        assert!(jobs[0].isolated_delivery);
+        assert!(jobs[1].isolated_delivery);
+    }
+
+    #[test]
+    fn migrate_legacy_preserves_already_isolated() {
+        let mut job = make_job("j1");
+        job.isolated_delivery = true;
+        let mut jobs = vec![job];
+
+        migrate_legacy_storage(&mut jobs);
+
+        assert!(jobs[0].isolated_delivery);
+    }
+
+    #[test]
+    fn migrate_legacy_empty_list() {
+        let mut jobs: Vec<CronJob> = vec![];
+        migrate_legacy_storage(&mut jobs);
+        assert!(jobs.is_empty());
+    }
 }

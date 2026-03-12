@@ -244,4 +244,167 @@ mod tests {
         let next = resolve_next_fallback(&chain, "model-a", &state);
         assert_eq!(next, None);
     }
+
+    // ====================================================================
+    // classify_http_error (v2026.3.11)
+    // ====================================================================
+
+    #[test]
+    fn classify_429_as_rate_limit() {
+        assert_eq!(classify_http_error(429, None), FailoverReason::RateLimit);
+    }
+
+    #[test]
+    fn classify_401_as_auth_error() {
+        assert_eq!(classify_http_error(401, None), FailoverReason::AuthError);
+    }
+
+    #[test]
+    fn classify_403_as_auth_error() {
+        assert_eq!(classify_http_error(403, None), FailoverReason::AuthError);
+    }
+
+    #[test]
+    fn classify_402_as_insufficient_balance() {
+        assert_eq!(classify_http_error(402, None), FailoverReason::InsufficientBalance);
+    }
+
+    #[test]
+    fn classify_402_venice_insufficient_balance() {
+        let body = r#"{"error": "Insufficient balance to process request"}"#;
+        assert_eq!(
+            classify_http_error(402, Some(body)),
+            FailoverReason::InsufficientBalance
+        );
+    }
+
+    #[test]
+    fn classify_402_poe_insufficient_points() {
+        let body = r#"{"detail": "insufficient points for this model"}"#;
+        assert_eq!(
+            classify_http_error(402, Some(body)),
+            FailoverReason::InsufficientBalance
+        );
+    }
+
+    #[test]
+    fn classify_408_as_timeout() {
+        assert_eq!(classify_http_error(408, None), FailoverReason::Timeout);
+    }
+
+    #[test]
+    fn classify_504_as_timeout() {
+        assert_eq!(classify_http_error(504, None), FailoverReason::Timeout);
+    }
+
+    #[test]
+    fn classify_499_as_client_closed() {
+        assert_eq!(classify_http_error(499, None), FailoverReason::ClientClosed);
+    }
+
+    #[test]
+    fn classify_500_as_unknown() {
+        assert_eq!(classify_http_error(500, None), FailoverReason::Unknown);
+    }
+
+    // ====================================================================
+    // is_retryable (v2026.3.11)
+    // ====================================================================
+
+    #[test]
+    fn timeout_is_retryable() {
+        assert!(is_retryable(FailoverReason::Timeout));
+    }
+
+    #[test]
+    fn rate_limit_is_retryable() {
+        assert!(is_retryable(FailoverReason::RateLimit));
+    }
+
+    #[test]
+    fn malformed_response_is_retryable() {
+        assert!(is_retryable(FailoverReason::MalformedResponse));
+    }
+
+    #[test]
+    fn client_closed_is_retryable() {
+        assert!(is_retryable(FailoverReason::ClientClosed));
+    }
+
+    #[test]
+    fn auth_error_is_not_retryable() {
+        assert!(!is_retryable(FailoverReason::AuthError));
+    }
+
+    #[test]
+    fn insufficient_balance_is_not_retryable() {
+        assert!(!is_retryable(FailoverReason::InsufficientBalance));
+    }
+
+    #[test]
+    fn context_overflow_is_not_retryable() {
+        assert!(!is_retryable(FailoverReason::ContextOverflow));
+    }
+
+    #[test]
+    fn unknown_is_not_retryable() {
+        assert!(!is_retryable(FailoverReason::Unknown));
+    }
+
+    // ====================================================================
+    // FallbackDecisionEvent (v2026.3.11)
+    // ====================================================================
+
+    #[test]
+    fn fallback_decision_event_construction() {
+        let event = FallbackDecisionEvent {
+            run_id: "run-123".to_string(),
+            failed_model: "claude-sonnet-4-6".to_string(),
+            fallback_model: Some("gpt-4o".to_string()),
+            reason: FailoverReason::RateLimit,
+            status_code: Some(429),
+            probe_count: 1,
+            probe_capped: false,
+        };
+        assert_eq!(event.run_id, "run-123");
+        assert_eq!(event.fallback_model.as_deref(), Some("gpt-4o"));
+        assert_eq!(event.reason, FailoverReason::RateLimit);
+        assert!(!event.probe_capped);
+    }
+
+    #[test]
+    fn fallback_decision_event_no_fallback_available() {
+        let event = FallbackDecisionEvent {
+            run_id: "run-456".to_string(),
+            failed_model: "model-a".to_string(),
+            fallback_model: None,
+            reason: FailoverReason::AuthError,
+            status_code: Some(401),
+            probe_count: 3,
+            probe_capped: true,
+        };
+        assert!(event.fallback_model.is_none());
+        assert!(event.probe_capped);
+    }
+
+    // ====================================================================
+    // record_failure_with_cooldown (v2026.3.11)
+    // ====================================================================
+
+    #[test]
+    fn record_failure_with_custom_cooldown() {
+        let mut state = ModelFallbackState::new(Duration::from_secs(60));
+        state.record_failure_with_cooldown("model-a", Duration::from_secs(300));
+        assert!(state.is_on_cooldown("model-a"));
+    }
+
+    #[test]
+    fn clear_expired_removes_old_cooldowns() {
+        let mut state = ModelFallbackState::new(Duration::from_secs(0));
+        // Use zero-duration cooldown so it expires immediately
+        state.record_failure_with_cooldown("model-a", Duration::from_secs(0));
+        std::thread::sleep(Duration::from_millis(10));
+        state.clear_expired();
+        assert!(!state.is_on_cooldown("model-a"));
+    }
 }

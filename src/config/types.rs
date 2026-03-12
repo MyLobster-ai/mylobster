@@ -3026,4 +3026,167 @@ mod tests {
         assert_eq!(config.api_key.as_deref(), Some("sk-xxx"));
         assert!(config.providers.is_none());
     }
+
+    // ====================================================================
+    // GatewayRateLimitConfig (v2026.3.11)
+    // ====================================================================
+
+    #[test]
+    fn rate_limit_config_full() {
+        let raw = json!({
+            "maxRequests": 100,
+            "windowSeconds": 60,
+            "maxConnections": 50
+        });
+        let config: GatewayRateLimitConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(config.max_requests, Some(100));
+        assert_eq!(config.window_seconds, Some(60));
+        assert_eq!(config.max_connections, Some(50));
+    }
+
+    #[test]
+    fn rate_limit_config_partial() {
+        let raw = json!({ "maxRequests": 200 });
+        let config: GatewayRateLimitConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(config.max_requests, Some(200));
+        assert!(config.window_seconds.is_none());
+        assert!(config.max_connections.is_none());
+    }
+
+    #[test]
+    fn rate_limit_config_roundtrip() {
+        let config = GatewayRateLimitConfig {
+            max_requests: Some(50),
+            window_seconds: Some(30),
+            max_connections: Some(10),
+        };
+        let v = serde_json::to_value(&config).unwrap();
+        assert_eq!(v["maxRequests"], 50);
+        assert_eq!(v["windowSeconds"], 30);
+        assert_eq!(v["maxConnections"], 10);
+    }
+
+    // ====================================================================
+    // GatewayConfig allowed_origins (v2026.3.11)
+    // ====================================================================
+
+    #[test]
+    fn gateway_config_allowed_origins_default_empty() {
+        let config = GatewayConfig::default();
+        assert!(config.allowed_origins.is_empty());
+    }
+
+    #[test]
+    fn gateway_config_allowed_origins_from_json() {
+        let raw = json!({
+            "port": 18789,
+            "allowedOrigins": ["https://example.com", "https://app.mylobster.ai"]
+        });
+        let config: GatewayConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(config.allowed_origins.len(), 2);
+        assert_eq!(config.allowed_origins[0], "https://example.com");
+    }
+
+    #[test]
+    fn gateway_config_rate_limit_present() {
+        let raw = json!({
+            "port": 18789,
+            "rateLimit": { "maxRequests": 100, "windowSeconds": 60 }
+        });
+        let config: GatewayConfig = serde_json::from_value(raw).unwrap();
+        let rl = config.rate_limit.unwrap();
+        assert_eq!(rl.max_requests, Some(100));
+    }
+
+    #[test]
+    fn gateway_config_rate_limit_absent() {
+        let config = GatewayConfig::default();
+        assert!(config.rate_limit.is_none());
+    }
+
+    // ====================================================================
+    // MemoryMultimodalConfig (v2026.3.11)
+    // ====================================================================
+
+    #[test]
+    fn multimodal_config_full() {
+        let raw = json!({
+            "indexImages": true,
+            "indexAudio": false,
+            "embeddingModel": "gemini-embedding-2-preview",
+            "embeddingDimensions": 768
+        });
+        let config: MemoryMultimodalConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(config.index_images, Some(true));
+        assert_eq!(config.index_audio, Some(false));
+        assert_eq!(config.embedding_model.as_deref(), Some("gemini-embedding-2-preview"));
+        assert_eq!(config.embedding_dimensions, Some(768));
+    }
+
+    #[test]
+    fn multimodal_config_default_all_none() {
+        let config = MemoryMultimodalConfig::default();
+        assert!(config.index_images.is_none());
+        assert!(config.index_audio.is_none());
+        assert!(config.embedding_model.is_none());
+        assert!(config.embedding_dimensions.is_none());
+    }
+
+    #[test]
+    fn multimodal_config_roundtrip() {
+        let config = MemoryMultimodalConfig {
+            index_images: Some(true),
+            index_audio: Some(true),
+            embedding_model: Some("text-embedding-3-large".to_string()),
+            embedding_dimensions: Some(3072),
+        };
+        let v = serde_json::to_value(&config).unwrap();
+        let restored: MemoryMultimodalConfig = serde_json::from_value(v).unwrap();
+        assert_eq!(restored.index_images, Some(true));
+        assert_eq!(restored.embedding_dimensions, Some(3072));
+    }
+
+    // ====================================================================
+    // ModelsConfig alternative_providers & cooldown_probe_cap (v2026.3.11)
+    // ====================================================================
+
+    #[test]
+    fn models_config_alternative_providers() {
+        let raw = json!({
+            "providers": {},
+            "alternativeProviders": {
+                "venice": {
+                    "baseUrl": "https://api.venice.ai/v1",
+                    "models": []
+                },
+                "together": {
+                    "baseUrl": "https://api.together.xyz/v1",
+                    "models": []
+                }
+            }
+        });
+        let config: ModelsConfig = serde_json::from_value(raw).unwrap();
+        let alt = config.alternative_providers.unwrap();
+        assert_eq!(alt.len(), 2);
+        assert!(alt.contains_key("venice"));
+        assert!(alt.contains_key("together"));
+    }
+
+    #[test]
+    fn models_config_cooldown_probe_cap() {
+        let raw = json!({
+            "providers": {},
+            "cooldownProbeCap": 1
+        });
+        let config: ModelsConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(config.cooldown_probe_cap, Some(1));
+    }
+
+    #[test]
+    fn models_config_defaults_no_alternatives() {
+        let raw = json!({ "providers": {} });
+        let config: ModelsConfig = serde_json::from_value(raw).unwrap();
+        assert!(config.alternative_providers.is_none());
+        assert!(config.cooldown_probe_cap.is_none());
+    }
 }

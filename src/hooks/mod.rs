@@ -564,4 +564,91 @@ mod tests {
         registry.emit(HookEvent::GatewayStart);
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+
+    // ====================================================================
+    // HookPluginContext (v2026.3.11)
+    // ====================================================================
+
+    #[test]
+    fn plugin_context_default_all_none() {
+        let ctx = HookPluginContext::default();
+        assert!(ctx.trigger.is_none());
+        assert!(ctx.channel_id.is_none());
+        assert!(ctx.account_id.is_none());
+        assert!(ctx.thread_id.is_none());
+    }
+
+    #[test]
+    fn plugin_context_with_fields() {
+        let ctx = HookPluginContext {
+            trigger: Some("message".to_string()),
+            channel_id: Some("telegram:123".to_string()),
+            account_id: Some("user-456".to_string()),
+            thread_id: Some("thread-789".to_string()),
+        };
+        assert_eq!(ctx.trigger.as_deref(), Some("message"));
+        assert_eq!(ctx.channel_id.as_deref(), Some("telegram:123"));
+        assert_eq!(ctx.account_id.as_deref(), Some("user-456"));
+        assert_eq!(ctx.thread_id.as_deref(), Some("thread-789"));
+    }
+
+    #[test]
+    fn plugin_context_clone() {
+        let ctx = HookPluginContext {
+            trigger: Some("cron".to_string()),
+            channel_id: None,
+            account_id: None,
+            thread_id: None,
+        };
+        let cloned = ctx.clone();
+        assert_eq!(cloned.trigger, ctx.trigger);
+    }
+
+    // ====================================================================
+    // SharedHookRegistry plugin context lifecycle (v2026.3.11)
+    // ====================================================================
+
+    #[tokio::test]
+    async fn shared_registry_plugin_context_lifecycle() {
+        let registry = SharedHookRegistry::new();
+
+        // Initially no context
+        assert!(registry.get_plugin_context().await.is_none());
+
+        // Set context
+        let ctx = HookPluginContext {
+            trigger: Some("api".to_string()),
+            channel_id: Some("slack:C01".to_string()),
+            account_id: None,
+            thread_id: None,
+        };
+        registry.set_plugin_context(ctx).await;
+
+        // Retrieve context
+        let retrieved = registry.get_plugin_context().await.unwrap();
+        assert_eq!(retrieved.trigger.as_deref(), Some("api"));
+        assert_eq!(retrieved.channel_id.as_deref(), Some("slack:C01"));
+
+        // Clear context
+        registry.clear_plugin_context().await;
+        assert!(registry.get_plugin_context().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn shared_registry_plugin_context_overwrite() {
+        let registry = SharedHookRegistry::new();
+
+        registry.set_plugin_context(HookPluginContext {
+            trigger: Some("message".to_string()),
+            ..Default::default()
+        }).await;
+
+        registry.set_plugin_context(HookPluginContext {
+            trigger: Some("cron".to_string()),
+            ..Default::default()
+        }).await;
+
+        let ctx = registry.get_plugin_context().await.unwrap();
+        assert_eq!(ctx.trigger.as_deref(), Some("cron"));
+    }
 }

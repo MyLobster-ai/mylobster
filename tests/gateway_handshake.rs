@@ -488,3 +488,330 @@ async fn health_endpoint_accessible() {
 
     let _ = shutdown.send(());
 }
+
+// =========================================================================
+// v2026.3.11 — config.validate RPC
+// =========================================================================
+
+#[tokio::test]
+async fn config_validate_returns_valid() {
+    let (url, shutdown) = start_no_auth_gateway().await;
+
+    let (ws, _) = connect_async(&url).await.expect("WS connect failed");
+    let (mut tx, mut rx) = ws.split();
+
+    // Complete handshake
+    let _challenge = recv_text(&mut rx).await;
+    let connect_req = json!({
+        "type": "req",
+        "id": "c1",
+        "method": "connect",
+        "params": { "auth": {} }
+    });
+    tx.send(Message::Text(connect_req.to_string().into()))
+        .await
+        .unwrap();
+    let resp = recv_text(&mut rx).await;
+    assert_eq!(resp["ok"], true);
+
+    // Call config.validate
+    let validate_req = json!({
+        "type": "req",
+        "id": "cv-1",
+        "method": "config.validate"
+    });
+    tx.send(Message::Text(validate_req.to_string().into()))
+        .await
+        .unwrap();
+
+    let validate_resp = recv_text(&mut rx).await;
+    assert_eq!(validate_resp["type"], "res");
+    assert_eq!(validate_resp["id"], "cv-1");
+    assert_eq!(validate_resp["ok"], true);
+    assert!(validate_resp["payload"]["valid"].is_boolean());
+    assert!(validate_resp["payload"]["issues"].is_array());
+    assert!(validate_resp["payload"]["truncated"].is_boolean());
+
+    let _ = shutdown.send(());
+}
+
+// =========================================================================
+// v2026.3.11 — node.pending.enqueue / drain RPC
+// =========================================================================
+
+#[tokio::test]
+async fn node_pending_enqueue_and_drain() {
+    let (url, shutdown) = start_no_auth_gateway().await;
+
+    let (ws, _) = connect_async(&url).await.expect("WS connect failed");
+    let (mut tx, mut rx) = ws.split();
+
+    // Complete handshake
+    let _challenge = recv_text(&mut rx).await;
+    let connect_req = json!({
+        "type": "req",
+        "id": "c1",
+        "method": "connect",
+        "params": { "auth": {} }
+    });
+    tx.send(Message::Text(connect_req.to_string().into()))
+        .await
+        .unwrap();
+    let resp = recv_text(&mut rx).await;
+    assert_eq!(resp["ok"], true);
+
+    // Enqueue work item 1
+    let enqueue1 = json!({
+        "type": "req",
+        "id": "npe-1",
+        "method": "node.pending.enqueue",
+        "params": {
+            "nodeId": "node-A",
+            "workId": "work-1",
+            "payload": { "task": "summarize" }
+        }
+    });
+    tx.send(Message::Text(enqueue1.to_string().into()))
+        .await
+        .unwrap();
+    let resp1 = recv_text(&mut rx).await;
+    assert_eq!(resp1["ok"], true);
+    assert_eq!(resp1["payload"]["workId"], "work-1");
+    assert_eq!(resp1["payload"]["depth"], 1);
+
+    // Enqueue work item 2
+    let enqueue2 = json!({
+        "type": "req",
+        "id": "npe-2",
+        "method": "node.pending.enqueue",
+        "params": {
+            "nodeId": "node-A",
+            "workId": "work-2",
+            "payload": { "task": "translate" }
+        }
+    });
+    tx.send(Message::Text(enqueue2.to_string().into()))
+        .await
+        .unwrap();
+    let resp2 = recv_text(&mut rx).await;
+    assert_eq!(resp2["ok"], true);
+    assert_eq!(resp2["payload"]["depth"], 2);
+
+    // Drain with limit 1
+    let drain = json!({
+        "type": "req",
+        "id": "npd-1",
+        "method": "node.pending.drain",
+        "params": {
+            "nodeId": "node-A",
+            "limit": 1
+        }
+    });
+    tx.send(Message::Text(drain.to_string().into()))
+        .await
+        .unwrap();
+    let drain_resp = recv_text(&mut rx).await;
+    assert_eq!(drain_resp["ok"], true);
+    assert_eq!(drain_resp["payload"]["count"], 1);
+    let items = drain_resp["payload"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["workId"], "work-1");
+
+    // Drain remaining
+    let drain2 = json!({
+        "type": "req",
+        "id": "npd-2",
+        "method": "node.pending.drain",
+        "params": {
+            "nodeId": "node-A",
+            "limit": 10
+        }
+    });
+    tx.send(Message::Text(drain2.to_string().into()))
+        .await
+        .unwrap();
+    let drain_resp2 = recv_text(&mut rx).await;
+    assert_eq!(drain_resp2["ok"], true);
+    assert_eq!(drain_resp2["payload"]["count"], 1);
+    let items2 = drain_resp2["payload"]["items"].as_array().unwrap();
+    assert_eq!(items2[0]["workId"], "work-2");
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn node_pending_drain_empty_queue() {
+    let (url, shutdown) = start_no_auth_gateway().await;
+
+    let (ws, _) = connect_async(&url).await.expect("WS connect failed");
+    let (mut tx, mut rx) = ws.split();
+
+    // Complete handshake
+    let _challenge = recv_text(&mut rx).await;
+    let connect_req = json!({
+        "type": "req",
+        "id": "c1",
+        "method": "connect",
+        "params": { "auth": {} }
+    });
+    tx.send(Message::Text(connect_req.to_string().into()))
+        .await
+        .unwrap();
+    let resp = recv_text(&mut rx).await;
+    assert_eq!(resp["ok"], true);
+
+    // Drain from non-existent node
+    let drain = json!({
+        "type": "req",
+        "id": "npd-1",
+        "method": "node.pending.drain",
+        "params": {
+            "nodeId": "nonexistent-node",
+            "limit": 10
+        }
+    });
+    tx.send(Message::Text(drain.to_string().into()))
+        .await
+        .unwrap();
+    let drain_resp = recv_text(&mut rx).await;
+    assert_eq!(drain_resp["ok"], true);
+    assert_eq!(drain_resp["payload"]["count"], 0);
+    assert_eq!(drain_resp["payload"]["items"].as_array().unwrap().len(), 0);
+
+    let _ = shutdown.send(());
+}
+
+// =========================================================================
+// v2026.3.11 — node.pending.enqueue generates workId if absent
+// =========================================================================
+
+#[tokio::test]
+async fn node_pending_enqueue_auto_generates_work_id() {
+    let (url, shutdown) = start_no_auth_gateway().await;
+
+    let (ws, _) = connect_async(&url).await.expect("WS connect failed");
+    let (mut tx, mut rx) = ws.split();
+
+    // Complete handshake
+    let _challenge = recv_text(&mut rx).await;
+    let connect_req = json!({
+        "type": "req",
+        "id": "c1",
+        "method": "connect",
+        "params": { "auth": {} }
+    });
+    tx.send(Message::Text(connect_req.to_string().into()))
+        .await
+        .unwrap();
+    let resp = recv_text(&mut rx).await;
+    assert_eq!(resp["ok"], true);
+
+    // Enqueue without explicit workId
+    let enqueue = json!({
+        "type": "req",
+        "id": "npe-auto",
+        "method": "node.pending.enqueue",
+        "params": {
+            "nodeId": "node-B",
+            "payload": { "task": "auto" }
+        }
+    });
+    tx.send(Message::Text(enqueue.to_string().into()))
+        .await
+        .unwrap();
+    let enqueue_resp = recv_text(&mut rx).await;
+    assert_eq!(enqueue_resp["ok"], true);
+    // Should have an auto-generated workId (UUID format)
+    let work_id = enqueue_resp["payload"]["workId"].as_str().unwrap();
+    assert!(!work_id.is_empty());
+    assert!(work_id.len() >= 32); // UUID with hyphens is 36 chars
+
+    let _ = shutdown.send(());
+}
+
+// =========================================================================
+// v2026.3.11 — status endpoint includes runtimeVersion and protocolVersion
+// =========================================================================
+
+#[tokio::test]
+async fn status_rpc_includes_version_fields() {
+    let (url, shutdown) = start_no_auth_gateway().await;
+
+    let (ws, _) = connect_async(&url).await.expect("WS connect failed");
+    let (mut tx, mut rx) = ws.split();
+
+    // Complete handshake
+    let _challenge = recv_text(&mut rx).await;
+    let connect_req = json!({
+        "type": "req",
+        "id": "c1",
+        "method": "connect",
+        "params": { "auth": {} }
+    });
+    tx.send(Message::Text(connect_req.to_string().into()))
+        .await
+        .unwrap();
+    let resp = recv_text(&mut rx).await;
+    assert_eq!(resp["ok"], true);
+
+    // Call status
+    let status_req = json!({
+        "type": "req",
+        "id": "st-1",
+        "method": "status"
+    });
+    tx.send(Message::Text(status_req.to_string().into()))
+        .await
+        .unwrap();
+
+    let status_resp = recv_text(&mut rx).await;
+    assert_eq!(status_resp["type"], "res");
+    assert_eq!(status_resp["ok"], true);
+    assert!(status_resp["payload"]["runtimeVersion"].is_string());
+    assert_eq!(status_resp["payload"]["protocolVersion"], 4);
+
+    let _ = shutdown.send(());
+}
+
+// =========================================================================
+// v2026.3.11 — sessions.list RPC
+// =========================================================================
+
+#[tokio::test]
+async fn sessions_list_returns_empty() {
+    let (url, shutdown) = start_no_auth_gateway().await;
+
+    let (ws, _) = connect_async(&url).await.expect("WS connect failed");
+    let (mut tx, mut rx) = ws.split();
+
+    // Complete handshake
+    let _challenge = recv_text(&mut rx).await;
+    let connect_req = json!({
+        "type": "req",
+        "id": "c1",
+        "method": "connect",
+        "params": { "auth": {} }
+    });
+    tx.send(Message::Text(connect_req.to_string().into()))
+        .await
+        .unwrap();
+    let resp = recv_text(&mut rx).await;
+    assert_eq!(resp["ok"], true);
+
+    let list_req = json!({
+        "type": "req",
+        "id": "sl-1",
+        "method": "sessions.list"
+    });
+    tx.send(Message::Text(list_req.to_string().into()))
+        .await
+        .unwrap();
+
+    let list_resp = recv_text(&mut rx).await;
+    assert_eq!(list_resp["type"], "res");
+    assert_eq!(list_resp["ok"], true);
+    // payload is the sessions array directly
+    assert!(list_resp["payload"].is_array());
+
+    let _ = shutdown.send(());
+}
