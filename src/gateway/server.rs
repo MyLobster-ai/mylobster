@@ -28,6 +28,10 @@ pub struct RpcState {
     // Cron
     pub cron_jobs: parking_lot::RwLock<HashMap<String, serde_json::Value>>,
     pub cron_runs: parking_lot::RwLock<Vec<serde_json::Value>>,
+    /// Per-job last error reason (v2026.3.11).
+    pub cron_last_errors: parking_lot::RwLock<HashMap<String, String>>,
+    /// Error count for status endpoint (v2026.3.11).
+    pub cron_error_count: parking_lot::RwLock<u64>,
     // Agents
     pub agents: parking_lot::RwLock<HashMap<String, serde_json::Value>>,
     pub agent_files: parking_lot::RwLock<HashMap<String, HashMap<String, String>>>,
@@ -37,6 +41,8 @@ pub struct RpcState {
     pub nodes: parking_lot::RwLock<HashMap<String, serde_json::Value>>,
     pub node_pairs: parking_lot::RwLock<Vec<serde_json::Value>>,
     pub node_invoke_results: parking_lot::RwLock<HashMap<String, serde_json::Value>>,
+    /// Node pending-work queue (v2026.3.11).
+    pub node_pending_work: parking_lot::RwLock<HashMap<String, Vec<serde_json::Value>>>,
     // Exec approvals
     pub exec_policies: parking_lot::RwLock<Vec<serde_json::Value>>,
     pub exec_node_policies: parking_lot::RwLock<Vec<serde_json::Value>>,
@@ -60,6 +66,8 @@ pub struct RpcState {
     pub acp_manager: RwLock<AcpAgentManager>,
     // Route manager (v2026.2.26)
     pub route_manager: RwLock<RouteManager>,
+    /// Model fallback state (v2026.3.11).
+    pub model_fallback: parking_lot::RwLock<crate::agents::model_fallback::ModelFallbackState>,
 }
 
 impl RpcState {
@@ -67,12 +75,15 @@ impl RpcState {
         Self {
             cron_jobs: parking_lot::RwLock::new(HashMap::new()),
             cron_runs: parking_lot::RwLock::new(Vec::new()),
+            cron_last_errors: parking_lot::RwLock::new(HashMap::new()),
+            cron_error_count: parking_lot::RwLock::new(0),
             agents: parking_lot::RwLock::new(HashMap::new()),
             agent_files: parking_lot::RwLock::new(HashMap::new()),
             device_pairs: parking_lot::RwLock::new(Vec::new()),
             nodes: parking_lot::RwLock::new(HashMap::new()),
             node_pairs: parking_lot::RwLock::new(Vec::new()),
             node_invoke_results: parking_lot::RwLock::new(HashMap::new()),
+            node_pending_work: parking_lot::RwLock::new(HashMap::new()),
             exec_policies: parking_lot::RwLock::new(Vec::new()),
             exec_node_policies: parking_lot::RwLock::new(Vec::new()),
             exec_requests: parking_lot::RwLock::new(HashMap::new()),
@@ -88,6 +99,9 @@ impl RpcState {
             heartbeat_mode: parking_lot::RwLock::new("auto".to_string()),
             acp_manager: RwLock::new(AcpAgentManager::new()),
             route_manager: RwLock::new(RouteManager::new()),
+            model_fallback: parking_lot::RwLock::new(
+                crate::agents::model_fallback::ModelFallbackState::default(),
+            ),
         }
     }
 }

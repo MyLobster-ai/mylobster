@@ -9,7 +9,7 @@ use axum::{
         ws::WebSocketUpgrade,
         ConnectInfo, Json, Query, State,
     },
-    http::{Request, StatusCode},
+    http::{header, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -18,7 +18,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 /// Security path canonicalization middleware.
 ///
@@ -35,11 +35,14 @@ async fn security_path_middleware(request: Request<Body>, next: Next) -> Respons
     }
 }
 
-/// Plugin route auth enforcement middleware.
+/// Plugin route auth enforcement middleware (v2026.3.11 hardened).
 ///
 /// Protects `/api/channels` and `/api/plugins` endpoints by requiring
 /// a valid Authorization header with a bearer token. Rejects
 /// broken-path variants that attempt to bypass authentication.
+///
+/// v2026.3.11: Unauthenticated routes no longer inherit synthetic admin
+/// scopes — only explicitly authenticated requests receive elevated scopes.
 async fn plugin_route_auth_middleware(
     State(state): State<GatewayState>,
     request: Request<Body>,
@@ -58,7 +61,8 @@ async fn plugin_route_auth_middleware(
             .unwrap_or(false);
 
         if !has_auth {
-            // Check if gateway has token auth configured
+            // v2026.3.11: Always reject unauthenticated access to protected paths
+            // when gateway has token auth configured. No synthetic admin scope inheritance.
             if state.auth.token.is_some() {
                 warn!("Blocked unauthenticated access to protected path: {}", path);
                 return StatusCode::UNAUTHORIZED.into_response();
@@ -67,6 +71,47 @@ async fn plugin_route_auth_middleware(
     }
 
     next.run(request).await
+}
+
+/// Browser origin validation middleware (v2026.3.11 — GHSA-5wcw-8jjv-m286).
+///
+/// Prevents cross-site WebSocket hijacking by validating the Origin header
+/// on WebSocket upgrade requests. Enforced regardless of proxy headers.
+async fn browser_origin_validation_middleware(
+    State(state): State<GatewayState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    // Only validate WebSocket upgrade requests
+    let is_ws_upgrade = request
+        .headers()
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+
+    if is_ws_upgrade {
+        if let Some(origin) = request.headers().get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+            let config = state.config.read().await;
+            let allowed = &config.gateway.allowed_origins;
+            if !allowed.is_empty() && !is_origin_allowed(origin, allowed) {
+                warn!(
+                    "Blocked WebSocket upgrade from disallowed origin: {}",
+                    origin
+                );
+                return StatusCode::FORBIDDEN.into_response();
+            }
+        }
+    }
+
+    next.run(request).await
+}
+
+/// Check if a given origin is in the allowed origins list.
+///
+/// Supports exact match and wildcard ("*").
+fn is_origin_allowed(origin: &str, allowed: &[String]) -> bool {
+    allowed.iter().any(|a| a == "*" || a == origin)
 }
 
 /// Build all routes for the gateway.
@@ -95,26 +140,33 @@ pub fn build_routes(state: GatewayState) -> Router {
         .route("/api/gateway/info", get(gateway_info_handler))
         // Models
         .route("/api/models", get(models_list_handler))
-        // Config
+        // Config (v2026.3.11: added validate + reload)
         .route("/api/config/schema", get(config_schema_handler))
+        .route("/api/config/validate", post(config_validate_handler))
+        .route("/api/config/reload", post(config_reload_handler))
         // Agents
         .route("/api/agents", get(agents_list_handler))
         .route("/api/agents/{id}", get(agent_get_handler))
-        // Cron
+        // Cron (v2026.3.11: added jobs detail)
         .route("/api/cron/jobs", get(cron_jobs_handler))
+        .route("/api/cron/jobs/{id}", get(cron_job_detail_handler))
         .route("/api/cron/status", get(cron_status_handler))
         // Usage
         .route("/api/usage", get(usage_handler))
-        // Status
+        // Status (v2026.3.11: includes runtime version)
         .route("/api/status", get(status_handler))
         // OpenAI-compatible endpoints
         .route("/v1/chat/completions", post(chat_completions_handler))
         .route("/v1/responses", post(responses_handler))
-        // Security: path canonicalization + plugin route auth
+        // Security: path canonicalization + plugin route auth + browser origin validation
         .layer(middleware::from_fn(security_path_middleware))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             plugin_route_auth_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            browser_origin_validation_middleware,
         ))
         .layer(cors)
         .with_state(state)
@@ -302,6 +354,45 @@ async fn config_schema_handler() -> Json<serde_json::Value> {
 }
 
 // ============================================================================
+// Config Validate + Reload (v2026.3.11)
+// ============================================================================
+
+async fn config_validate_handler(
+    State(state): State<GatewayState>,
+) -> Json<serde_json::Value> {
+    let config = state.config.read().await;
+    let issues = crate::config::validate_config(&config);
+    // Surface up to 3 issues per v2026.3.11 spec
+    let capped: Vec<String> = issues.iter().map(|e| e.to_string()).take(3).collect();
+    Json(serde_json::json!({
+        "valid": issues.is_empty(),
+        "issues": capped,
+    }))
+}
+
+async fn config_reload_handler(
+    State(state): State<GatewayState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Attempt to reload config from disk
+    let new_config = match crate::config::Config::load(None) {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Config reload failed: {}", e);
+            return Ok(Json(serde_json::json!({
+                "ok": false,
+                "error": format!("{}", e),
+            })));
+        }
+    };
+    let mut config = state.config.write().await;
+    *config = new_config;
+    info!("Configuration reloaded successfully");
+    Ok(Json(serde_json::json!({
+        "ok": true,
+    })))
+}
+
+// ============================================================================
 // Agents
 // ============================================================================
 
@@ -345,11 +436,24 @@ async fn cron_jobs_handler(State(state): State<GatewayState>) -> Json<serde_json
     Json(serde_json::json!({ "jobs": jobs }))
 }
 
+async fn cron_job_detail_handler(
+    State(state): State<GatewayState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let jobs = state.rpc.cron_jobs.read();
+    jobs.get(&id)
+        .cloned()
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
 async fn cron_status_handler(State(state): State<GatewayState>) -> Json<serde_json::Value> {
     let job_count = state.rpc.cron_jobs.read().len();
+    let error_count = state.rpc.cron_error_count.read().clone();
     Json(serde_json::json!({
         "running": true,
         "jobCount": job_count,
+        "errorCount": error_count,
     }))
 }
 
@@ -377,6 +481,8 @@ async fn status_handler(State(state): State<GatewayState>) -> Json<serde_json::V
     let session_count = state.sessions.active_count();
     Json(serde_json::json!({
         "version": state.version,
+        "runtimeVersion": env!("CARGO_PKG_VERSION"),
+        "protocolVersion": PROTOCOL_VERSION,
         "uptime": uptime,
         "sessions": session_count,
         "status": "ok",

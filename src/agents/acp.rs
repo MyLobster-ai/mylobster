@@ -72,6 +72,9 @@ pub struct AcpSpawnParams {
     /// Account ID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
+    /// Resume an existing session instead of creating a new one (v2026.3.11 ACPX).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_session_id: Option<String>,
 }
 
 /// Parameters for sending a message to an ACP agent.
@@ -282,6 +285,7 @@ mod tests {
                 config: None,
                 session_key: Some("session:1".into()),
                 account_id: None,
+                resume_session_id: None,
             })
             .await;
 
@@ -302,6 +306,7 @@ mod tests {
                 config: None,
                 session_key: None,
                 account_id: None,
+                resume_session_id: None,
             })
             .await;
 
@@ -325,6 +330,7 @@ mod tests {
                 config: None,
                 session_key: None,
                 account_id: None,
+                resume_session_id: None,
             })
             .await;
 
@@ -366,6 +372,7 @@ mod tests {
                 config: None,
                 session_key: None,
                 account_id: None,
+                resume_session_id: None,
             })
             .await;
 
@@ -390,6 +397,7 @@ mod tests {
                 config: None,
                 session_key: None,
                 account_id: None,
+                resume_session_id: None,
             })
             .await;
         }

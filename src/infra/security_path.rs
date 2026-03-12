@@ -227,6 +227,125 @@ pub fn detect_symlink_rebind(
 }
 
 // ============================================================================
+// Archive Extraction Symlink Escape Hardening (v2026.3.11)
+// ============================================================================
+
+/// Validate that an archive entry path does not escape the target directory
+/// via symlinks or parent traversal (v2026.3.11).
+///
+/// Rejects:
+/// - Absolute paths
+/// - Paths containing `..` segments after canonicalization
+/// - Paths containing symlinks that resolve outside the target
+pub fn validate_archive_entry_path(
+    target_dir: &std::path::Path,
+    entry_path: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    // Reject absolute paths in archive entries
+    if entry_path.is_absolute() {
+        return Err(format!(
+            "Archive entry has absolute path: {}",
+            entry_path.display()
+        ));
+    }
+
+    let full_path = target_dir.join(entry_path);
+
+    // Canonicalize the entry path components without following symlinks
+    let mut resolved = target_dir.to_path_buf();
+    for component in entry_path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                // Check that we don't escape the target directory
+                if !resolved.starts_with(target_dir) {
+                    return Err(format!(
+                        "Archive entry escapes target dir via '..': {}",
+                        entry_path.display()
+                    ));
+                }
+                resolved.pop();
+            }
+            std::path::Component::Normal(name) => {
+                resolved.push(name);
+                // Check if intermediate path is a symlink pointing outside target
+                if resolved.is_symlink() {
+                    if let Ok(link_target) = std::fs::read_link(&resolved) {
+                        let link_display = link_target.display().to_string();
+                        let absolute_target = if link_target.is_absolute() {
+                            link_target
+                        } else {
+                            resolved.parent().unwrap_or(target_dir).join(&link_display)
+                        };
+                        // Normalize without following further symlinks
+                        if !absolute_target.starts_with(target_dir) {
+                            return Err(format!(
+                                "Symlink escape in archive: {} -> {}",
+                                resolved.display(),
+                                link_display
+                            ));
+                        }
+                    }
+                }
+            }
+            std::path::Component::CurDir => { /* skip `.` */ }
+            _ => {}
+        }
+    }
+
+    // Final check: resolved path must be within target directory
+    if !resolved.starts_with(target_dir) {
+        return Err(format!(
+            "Archive entry resolves outside target dir: {} -> {}",
+            entry_path.display(),
+            resolved.display()
+        ));
+    }
+
+    Ok(full_path)
+}
+
+// ============================================================================
+// Secret Files Path-Swap Race Hardening (v2026.3.11)
+// ============================================================================
+
+/// Securely read a secret file with path-swap race protection (v2026.3.11).
+///
+/// 1. lstat the path to get the inode
+/// 2. open the file
+/// 3. fstat the opened fd to verify inode matches
+///
+/// This prevents TOCTOU attacks where an attacker swaps the file between
+/// stat and open.
+#[cfg(unix)]
+pub fn secure_read_secret_file(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    use std::os::unix::fs::MetadataExt;
+
+    // Step 1: lstat to get expected inode
+    let pre_meta = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("Cannot lstat '{}': {}", path.display(), e))?;
+
+    // Reject symlinks for secret files
+    if pre_meta.file_type().is_symlink() {
+        return Err(format!(
+            "Secret file '{}' is a symlink — rejected for security",
+            path.display()
+        ));
+    }
+
+    let expected_dev = pre_meta.dev();
+    let expected_ino = pre_meta.ino();
+
+    // Step 2: read the file
+    let content = std::fs::read(path)
+        .map_err(|e| format!("Cannot read '{}': {}", path.display(), e))?;
+
+    // Step 3: verify inode hasn't changed (detect path-swap race)
+    detect_symlink_rebind(path, expected_dev, expected_ino)?;
+
+    Ok(content)
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

@@ -93,8 +93,65 @@ pub enum FailoverReason {
     AuthError,
     /// Rate limit (429) from the provider.
     RateLimit,
+    /// Insufficient balance (402) — Venice, Poe (v2026.3.11).
+    InsufficientBalance,
+    /// Malformed response from provider — retryable (v2026.3.11 Gemini).
+    MalformedResponse,
+    /// Client closed connection (HTTP 499) — transient (v2026.3.11).
+    ClientClosed,
     /// Unclassified error.
     Unknown,
+}
+
+/// Structured lifecycle event for model fallback decisions (v2026.3.11).
+#[derive(Debug, Clone)]
+pub struct FallbackDecisionEvent {
+    /// Unique identifier for this run.
+    pub run_id: String,
+    /// Model that failed.
+    pub failed_model: String,
+    /// Selected fallback model (if any).
+    pub fallback_model: Option<String>,
+    /// Reason for the failover.
+    pub reason: FailoverReason,
+    /// HTTP status code from the failed request.
+    pub status_code: Option<u16>,
+    /// Number of probe attempts this run.
+    pub probe_count: u32,
+    /// Whether probe cap was hit (v2026.3.11).
+    pub probe_capped: bool,
+}
+
+/// Classify an HTTP status code into a FailoverReason (v2026.3.11).
+pub fn classify_http_error(status: u16, body: Option<&str>) -> FailoverReason {
+    match status {
+        429 => FailoverReason::RateLimit,
+        401 | 403 => FailoverReason::AuthError,
+        402 => {
+            // v2026.3.11: Detect Venice "Insufficient balance" and Poe "insufficient points"
+            if let Some(b) = body {
+                let lower = b.to_ascii_lowercase();
+                if lower.contains("insufficient balance") || lower.contains("insufficient points") {
+                    return FailoverReason::InsufficientBalance;
+                }
+            }
+            FailoverReason::InsufficientBalance
+        }
+        408 | 504 => FailoverReason::Timeout,
+        499 => FailoverReason::ClientClosed,
+        _ => FailoverReason::Unknown,
+    }
+}
+
+/// Check if a FailoverReason is retryable (v2026.3.11).
+pub fn is_retryable(reason: FailoverReason) -> bool {
+    matches!(
+        reason,
+        FailoverReason::Timeout
+            | FailoverReason::RateLimit
+            | FailoverReason::MalformedResponse
+            | FailoverReason::ClientClosed
+    )
 }
 
 /// Resolve the next available model from the fallback chain.

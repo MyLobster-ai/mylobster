@@ -149,7 +149,7 @@ async fn handshake_succeeds_local_no_auth() {
     assert_eq!(resp["type"], "res");
     assert_eq!(resp["id"], "conn-1");
     assert_eq!(resp["ok"], true);
-    assert_eq!(resp["payload"]["protocol"], 3);
+    assert_eq!(resp["payload"]["protocol"], 4);
     assert_eq!(resp["payload"]["server"], "mylobster");
     assert!(resp["payload"]["sessionId"].is_string());
     assert!(resp["payload"]["version"].is_string());
@@ -185,7 +185,7 @@ async fn handshake_succeeds_with_token_auth() {
     let resp = recv_text(&mut rx).await;
     assert_eq!(resp["type"], "res");
     assert_eq!(resp["ok"], true);
-    assert_eq!(resp["payload"]["protocol"], 3);
+    assert_eq!(resp["payload"]["protocol"], 4);
 
     let _ = shutdown.send(());
 }
@@ -356,7 +356,7 @@ async fn gateway_info_returns_oc_response_format() {
     assert_eq!(info_resp["id"], "info-1");
     assert_eq!(info_resp["ok"], true);
     assert!(info_resp["payload"]["version"].is_string());
-    assert_eq!(info_resp["payload"]["protocol"], 3);
+    assert_eq!(info_resp["payload"]["protocol"], 4);
 
     let _ = shutdown.send(());
 }

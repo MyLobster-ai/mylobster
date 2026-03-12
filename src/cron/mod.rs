@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// A cron schedule with optional stagger delay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8,6 +9,51 @@ pub struct CronSchedule {
     pub expr: String,
     pub tz: Option<String>,
     pub stagger_ms: Option<u64>,
+}
+
+/// Cron job with v2026.3.11 isolated delivery and error tracking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CronJob {
+    pub id: String,
+    pub name: String,
+    pub schedule: CronSchedule,
+    pub message: String,
+    pub session_key: Option<String>,
+    pub enabled: bool,
+    pub created_at: u64,
+    /// Whether this job uses isolated delivery (v2026.3.11).
+    /// When true, no ad hoc sends or fallback main-session summaries.
+    #[serde(default)]
+    pub isolated_delivery: bool,
+    /// Last error reason recorded for this job (v2026.3.11).
+    pub last_error_reason: Option<String>,
+    /// Whether to retry deliberately silent jobs (v2026.3.11).
+    /// Default false: subagent follow-up won't retry silent jobs.
+    #[serde(default)]
+    pub retry_silent: bool,
+}
+
+/// Per-job error state for status reporting (v2026.3.11).
+#[derive(Debug, Clone, Default)]
+pub struct CronErrorTracker {
+    pub errors: HashMap<String, String>,
+    pub total_error_count: u64,
+}
+
+impl CronErrorTracker {
+    pub fn record_error(&mut self, job_id: &str, reason: &str) {
+        self.errors.insert(job_id.to_string(), reason.to_string());
+        self.total_error_count += 1;
+    }
+
+    pub fn clear_error(&mut self, job_id: &str) {
+        self.errors.remove(job_id);
+    }
+
+    pub fn last_error(&self, job_id: &str) -> Option<&str> {
+        self.errors.get(job_id).map(|s| s.as_str())
+    }
 }
 
 /// Default stagger for top-of-hour cron expressions (5 minutes).
@@ -40,6 +86,17 @@ fn is_top_of_hour(expr: &str) -> bool {
 
 pub fn list_jobs() -> Vec<serde_json::Value> {
     vec![]
+}
+
+/// Migrate legacy cron storage to v2026.3.11 format.
+/// Called by `mylobster doctor --fix`.
+pub fn migrate_legacy_storage(jobs: &mut Vec<CronJob>) {
+    for job in jobs.iter_mut() {
+        // Ensure v2026.3.11 fields have defaults
+        if !job.isolated_delivery {
+            job.isolated_delivery = true; // New default: isolated delivery enabled
+        }
+    }
 }
 
 #[cfg(test)]

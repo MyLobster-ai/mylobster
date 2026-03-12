@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-/// Handle a WebSocket connection using the OC v2026.2.22 protocol.
+/// Handle a WebSocket connection using the OC v2026.3.11 protocol.
 ///
 /// Flow:
 /// 1. Send `connect.challenge` event with a random nonce
@@ -493,6 +493,26 @@ async fn handle_request(
             .await;
         }
 
+        // v2026.3.11: config.validate RPC
+        "config.validate" => {
+            let config = state.config.read().await;
+            let issues = crate::config::validation::validate_config(&config);
+            let capped: Vec<String> = issues.iter().map(|e| e.to_string()).take(3).collect();
+            drop(config);
+            send_oc_response(
+                tx,
+                OcResponseFrame::success(
+                    request_id,
+                    serde_json::json!({
+                        "valid": capped.is_empty(),
+                        "issues": capped,
+                        "truncated": issues.len() > 3,
+                    }),
+                ),
+            )
+            .await;
+        }
+
         // ================================================================
         // Session extensions
         // ================================================================
@@ -772,6 +792,85 @@ async fn handle_request(
             send_oc_response(
                 tx,
                 OcResponseFrame::success(request_id, serde_json::json!({ "ok": true })),
+            )
+            .await;
+        }
+
+        // ================================================================
+        // Node pending-work queue (v2026.3.11)
+        // ================================================================
+        "node.pending.enqueue" => {
+            let node_id = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("nodeId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let work_id = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("workId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
+            let payload = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("payload"))
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
+
+            let depth = {
+                let mut pending = state.rpc.node_pending_work.write();
+                let queue = pending.entry(node_id.clone()).or_insert_with(Vec::new);
+                queue.push(serde_json::json!({
+                    "workId": work_id,
+                    "payload": payload,
+                }));
+                queue.len()
+            };
+
+            send_oc_response(
+                tx,
+                OcResponseFrame::success(
+                    request_id,
+                    serde_json::json!({ "ok": true, "workId": work_id, "depth": depth }),
+                ),
+            )
+            .await;
+        }
+        "node.pending.drain" => {
+            let node_id = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("nodeId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let limit = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("limit"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(10) as usize;
+
+            let items: Vec<serde_json::Value> = {
+                let mut pending = state.rpc.node_pending_work.write();
+                if let Some(queue) = pending.get_mut(&node_id) {
+                    let drain_count = limit.min(queue.len());
+                    queue.drain(..drain_count).collect()
+                } else {
+                    vec![]
+                }
+            };
+
+            send_oc_response(
+                tx,
+                OcResponseFrame::success(
+                    request_id,
+                    serde_json::json!({ "items": items, "count": items.len() }),
+                ),
             )
             .await;
         }

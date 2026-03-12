@@ -306,6 +306,24 @@ pub struct GatewayConfig {
     pub http: GatewayHttpConfig,
     pub nodes: Option<GatewayNodesConfig>,
     pub trusted_proxies: Option<Vec<String>>,
+    /// Allowed browser origins for WebSocket connections (v2026.3.11, GHSA-5wcw-8jjv-m286).
+    /// Empty list means all origins are allowed. Use `["*"]` to explicitly allow all.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+    /// Rate limiting configuration (v2026.3.11).
+    pub rate_limit: Option<GatewayRateLimitConfig>,
+}
+
+/// Rate limiting for gateway connections (v2026.3.11).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayRateLimitConfig {
+    /// Maximum requests per window.
+    pub max_requests: Option<u32>,
+    /// Window duration in seconds.
+    pub window_seconds: Option<u32>,
+    /// Maximum concurrent WebSocket connections.
+    pub max_connections: Option<u32>,
 }
 
 impl Default for GatewayConfig {
@@ -324,6 +342,8 @@ impl Default for GatewayConfig {
             http: GatewayHttpConfig::default(),
             nodes: None,
             trusted_proxies: None,
+            allowed_origins: Vec::new(),
+            rate_limit: None,
         }
     }
 }
@@ -818,6 +838,14 @@ pub struct ModelsConfig {
     #[serde(default)]
     pub providers: HashMap<String, ModelProviderConfig>,
     pub bedrock_discovery: Option<BedrockDiscoveryConfig>,
+    /// Alternative providers discovered at runtime (v2026.3.11).
+    /// Keys: alibaba, baidu, bytedance, huggingface, kimi, kilocode,
+    /// moonshot, nvidia, openrouter, perplexity, qwen_portal,
+    /// together, venice, vercel, xiaomi, vllm, cloudflare.
+    pub alternative_providers: Option<HashMap<String, ModelProviderConfig>>,
+    /// Cooldown probing configuration (v2026.3.11).
+    /// Caps fallback probing to one per provider per run.
+    pub cooldown_probe_cap: Option<u32>,
 }
 
 impl ModelsConfig {
@@ -1850,6 +1878,23 @@ pub struct MemoryConfig {
     pub backend: MemoryBackend,
     pub citations: Option<String>,
     pub qmd: Option<MemoryQmdConfig>,
+    /// Multimodal indexing configuration (v2026.3.11).
+    /// Enables image and audio content indexing in memory.
+    pub multimodal: Option<MemoryMultimodalConfig>,
+}
+
+/// Multimodal memory indexing (v2026.3.11).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryMultimodalConfig {
+    /// Enable image memory indexing.
+    pub index_images: Option<bool>,
+    /// Enable audio memory indexing.
+    pub index_audio: Option<bool>,
+    /// Embedding model for multimodal content (e.g. "gemini-embedding-2-preview").
+    pub embedding_model: Option<String>,
+    /// Configurable embedding dimensions.
+    pub embedding_dimensions: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

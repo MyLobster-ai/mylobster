@@ -67,11 +67,43 @@ pub async fn resolve_all_secrets(
     (resolved_config, statuses)
 }
 
+/// Validate that an EXEC secret ref key does not contain path traversal (v2026.3.11).
+///
+/// Rejects keys containing `..`, absolute paths, or shell metacharacters
+/// that could escape the intended execution context.
+fn validate_exec_ref_key(key: &str) -> Result<(), String> {
+    if key.contains("..") {
+        return Err(format!("EXEC ref key contains path traversal: '{}'", key));
+    }
+    if key.starts_with('/') || key.starts_with('\\') {
+        return Err(format!("EXEC ref key contains absolute path: '{}'", key));
+    }
+    // Reject shell metacharacters that could enable command injection
+    let dangerous_chars = ['|', ';', '&', '`', '$', '(', ')', '{', '}', '<', '>'];
+    for ch in &dangerous_chars {
+        if key.contains(*ch) {
+            return Err(format!(
+                "EXEC ref key contains dangerous character '{}': '{}'",
+                ch, key
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Resolve a single secret reference through its provider.
 async fn resolve_single_ref(
     secret_ref: &SecretRef,
     providers: &HashMap<SecretRefKind, &dyn SecretProvider>,
 ) -> SecretResolution {
+    // v2026.3.11: Validate EXEC refs for path traversal
+    if secret_ref.kind == SecretRefKind::Exec {
+        if let Err(msg) = validate_exec_ref_key(&secret_ref.key) {
+            error!("SecretRef exec traversal rejected: {}", msg);
+            return SecretResolution::Failed(msg);
+        }
+    }
+
     let provider = match providers.get(&secret_ref.kind) {
         Some(p) => *p,
         None => {
@@ -277,6 +309,23 @@ mod tests {
         }];
         let unresolved = check_unresolved_required(&statuses, &["models"]);
         assert_eq!(unresolved.len(), 1);
+    }
+
+    // v2026.3.11: exec traversal rejection
+    #[test]
+    fn exec_ref_traversal_rejected() {
+        assert!(validate_exec_ref_key("../../../etc/passwd").is_err());
+        assert!(validate_exec_ref_key("/usr/bin/dangerous").is_err());
+        assert!(validate_exec_ref_key("cmd; rm -rf /").is_err());
+        assert!(validate_exec_ref_key("cmd | cat /etc/passwd").is_err());
+        assert!(validate_exec_ref_key("$(whoami)").is_err());
+    }
+
+    #[test]
+    fn exec_ref_safe_keys_accepted() {
+        assert!(validate_exec_ref_key("my-script").is_ok());
+        assert!(validate_exec_ref_key("get_secret").is_ok());
+        assert!(validate_exec_ref_key("vault-read-key").is_ok());
     }
 
     #[test]

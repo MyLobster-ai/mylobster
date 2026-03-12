@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Protocol version for WebSocket communication.
-/// Version 3 matches OpenClaw v2026.2.24.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// Version 4 matches OpenClaw v2026.3.11.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Maximum WebSocket payload size (25 MB).
 pub const MAX_WS_PAYLOAD: usize = 25 * 1024 * 1024;
@@ -348,6 +348,51 @@ pub struct ChatSendParams {
     /// When true, delivery failures are silently ignored (v2026.2.24).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub best_effort_deliver: Option<bool>,
+    /// Resume an existing session instead of creating new (v2026.3.11 ACPX).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_session_id: Option<String>,
+}
+
+// ============================================================================
+// Node Pending-Work Queue (v2026.3.11)
+// ============================================================================
+
+/// Enqueue a pending work item for a node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodePendingEnqueueParams {
+    pub node_id: String,
+    pub work_id: String,
+    pub payload: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u32>,
+}
+
+/// Drain pending work items from a node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodePendingDrainParams {
+    pub node_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+// ============================================================================
+// Enriched Tool Call Events (v2026.3.11)
+// ============================================================================
+
+/// Enriched tool_call event with text content and file hints.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnrichedToolCallEvent {
+    pub tool_name: String,
+    pub tool_call_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_hints: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 /// Chat event streamed back to client.
@@ -961,8 +1006,8 @@ mod tests {
     // ====================================================================
 
     #[test]
-    fn protocol_version_matches_openclaw_v2026_2_24() {
-        assert_eq!(PROTOCOL_VERSION, 3);
+    fn protocol_version_matches_openclaw_v2026_3_11() {
+        assert_eq!(PROTOCOL_VERSION, 4);
     }
 
     // ====================================================================
@@ -1034,7 +1079,7 @@ mod tests {
 
         assert_eq!(v["type"], "res");
         assert_eq!(v["ok"], true);
-        assert_eq!(v["payload"]["protocol"], 3);
+        assert_eq!(v["payload"]["protocol"], 4);
         assert_eq!(v["payload"]["server"], "mylobster");
         assert!(v["payload"]["sessionId"].is_string());
     }
@@ -1092,6 +1137,7 @@ mod tests {
             timeout_ms: None,
             idempotency_key: None,
             best_effort_deliver: Some(true),
+            resume_session_id: None,
         };
         let v = serde_json::to_value(&params).unwrap();
         assert_eq!(v["bestEffortDeliver"], true);
@@ -1111,8 +1157,98 @@ mod tests {
             timeout_ms: None,
             idempotency_key: None,
             best_effort_deliver: None,
+            resume_session_id: None,
         };
         let v = serde_json::to_value(&params).unwrap();
         assert!(v.get("bestEffortDeliver").is_none());
+    }
+
+    // ====================================================================
+    // v2026.3.11 — ChatSendParams.resumeSessionId (ACPX)
+    // ====================================================================
+
+    #[test]
+    fn chat_send_params_resume_session_id() {
+        let raw = json!({
+            "sessionKey": "s1",
+            "message": "hello",
+            "resumeSessionId": "sess-abc-123"
+        });
+        let params: ChatSendParams = serde_json::from_value(raw).unwrap();
+        assert_eq!(params.resume_session_id.as_deref(), Some("sess-abc-123"));
+    }
+
+    #[test]
+    fn chat_send_params_resume_session_id_absent() {
+        let raw = json!({
+            "sessionKey": "s1",
+            "message": "hello"
+        });
+        let params: ChatSendParams = serde_json::from_value(raw).unwrap();
+        assert!(params.resume_session_id.is_none());
+    }
+
+    // ====================================================================
+    // v2026.3.11 — NodePendingEnqueueParams
+    // ====================================================================
+
+    #[test]
+    fn node_pending_enqueue_params_parse() {
+        let raw = json!({
+            "nodeId": "node-1",
+            "workId": "work-abc",
+            "payload": {"task": "run_test"},
+            "priority": 10
+        });
+        let params: NodePendingEnqueueParams = serde_json::from_value(raw).unwrap();
+        assert_eq!(params.node_id, "node-1");
+        assert_eq!(params.work_id, "work-abc");
+        assert_eq!(params.priority, Some(10));
+    }
+
+    #[test]
+    fn node_pending_drain_params_parse() {
+        let raw = json!({
+            "nodeId": "node-1",
+            "limit": 5
+        });
+        let params: NodePendingDrainParams = serde_json::from_value(raw).unwrap();
+        assert_eq!(params.node_id, "node-1");
+        assert_eq!(params.limit, Some(5));
+    }
+
+    // ====================================================================
+    // v2026.3.11 — EnrichedToolCallEvent
+    // ====================================================================
+
+    #[test]
+    fn enriched_tool_call_event_serialization() {
+        let event = EnrichedToolCallEvent {
+            tool_name: "web_fetch".into(),
+            tool_call_id: "tc-1".into(),
+            text_content: Some("Fetching URL...".into()),
+            file_hints: Some(vec!["output.json".into()]),
+            status: Some("running".into()),
+        };
+        let v = serde_json::to_value(&event).unwrap();
+        assert_eq!(v["toolName"], "web_fetch");
+        assert_eq!(v["textContent"], "Fetching URL...");
+        assert_eq!(v["fileHints"][0], "output.json");
+        assert_eq!(v["status"], "running");
+    }
+
+    #[test]
+    fn enriched_tool_call_event_minimal() {
+        let event = EnrichedToolCallEvent {
+            tool_name: "bash".into(),
+            tool_call_id: "tc-2".into(),
+            text_content: None,
+            file_hints: None,
+            status: None,
+        };
+        let v = serde_json::to_value(&event).unwrap();
+        assert_eq!(v["toolName"], "bash");
+        assert!(v.get("textContent").is_none());
+        assert!(v.get("fileHints").is_none());
     }
 }

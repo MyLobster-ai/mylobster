@@ -197,8 +197,14 @@ impl SessionStore {
     }
 
     /// Resolve a session reference to a session key.
-    /// Accepts session key, session ID, or partial match.
+    /// Accepts session key, session ID, alias "main", or partial match.
+    ///
+    /// v2026.3.11: Canonicalize "main" alias before lookup.
     pub fn resolve_session(&self, reference: &str) -> Option<String> {
+        // v2026.3.11: Canonicalize "main" alias
+        let canonical = canonicalize_session_alias(reference);
+        let reference = canonical.as_deref().unwrap_or(reference);
+
         // Exact session key match
         if self.sessions.contains_key(reference) {
             return Some(reference.to_string());
@@ -217,6 +223,23 @@ impl SessionStore {
             }
         }
         None
+    }
+
+    /// Enforce session-tree visibility before mutations (v2026.3.11).
+    ///
+    /// Returns true if the requesting session is allowed to mutate the target.
+    /// Prevents leaf sessions from accessing parent session state.
+    pub fn check_session_visibility(&self, requester_key: &str, target_key: &str) -> bool {
+        // Same session always allowed
+        if requester_key == target_key {
+            return true;
+        }
+        // Parent can always access child
+        if target_key.starts_with(requester_key) {
+            return true;
+        }
+        // Siblings not allowed to access each other
+        false
     }
 
     /// Compact a session — no-op for in-memory store, but returns success.
@@ -252,4 +275,37 @@ impl SessionStore {
         self.sessions.insert(key.to_string(), handle.clone());
         handle
     }
+}
+
+// ============================================================================
+// Session Alias Canonicalization (v2026.3.11)
+// ============================================================================
+
+/// Canonicalize session aliases before lookup (v2026.3.11).
+///
+/// The "main" alias is canonicalized to the default session key format.
+/// Returns None if no canonicalization was needed.
+fn canonicalize_session_alias(reference: &str) -> Option<String> {
+    match reference {
+        "main" | "Main" | "MAIN" => Some("default".to_string()),
+        _ => None,
+    }
+}
+
+// ============================================================================
+// Subagent Authority (v2026.3.11)
+// ============================================================================
+
+/// Check if a session has orchestration privileges (v2026.3.11).
+///
+/// Leaf sessions (spawned by subagents) cannot regain orchestration
+/// privileges. Only the root session or explicitly promoted sessions
+/// can orchestrate other agents.
+pub fn has_orchestration_privilege(session_key: &str) -> bool {
+    // Root/default sessions always have orchestration
+    if session_key == "default" || !session_key.contains(':') {
+        return true;
+    }
+    // Sessions with "subagent:" prefix are leaf sessions — no orchestration
+    !session_key.starts_with("subagent:")
 }

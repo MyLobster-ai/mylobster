@@ -105,6 +105,22 @@ pub enum HookEvent {
     GatewayStop,
 }
 
+/// Plugin context carried through all hook phases (v2026.3.11).
+///
+/// Ensures `trigger` and `channelId` are available to every hook handler,
+/// not just the initial message-received handler.
+#[derive(Debug, Clone, Default)]
+pub struct HookPluginContext {
+    /// What triggered this hook chain (e.g., "message", "cron", "api").
+    pub trigger: Option<String>,
+    /// The channel ID where the triggering event originated.
+    pub channel_id: Option<String>,
+    /// Account ID associated with the trigger.
+    pub account_id: Option<String>,
+    /// Thread ID for threaded channels.
+    pub thread_id: Option<String>,
+}
+
 impl HookEvent {
     /// Get the event type name for routing.
     pub fn event_type(&self) -> &'static str {
@@ -300,14 +316,18 @@ impl HookRegistry {
 // ============================================================================
 
 /// Thread-safe hook registry that can be shared across async tasks.
+/// Thread-safe singleton hook registry (v2026.3.11: hardened state).
 pub struct SharedHookRegistry {
     inner: RwLock<HookRegistry>,
+    /// Plugin context carried through all hook phases (v2026.3.11).
+    plugin_context: RwLock<Option<HookPluginContext>>,
 }
 
 impl SharedHookRegistry {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(HookRegistry::new()),
+            plugin_context: RwLock::new(None),
         }
     }
 
@@ -325,6 +345,21 @@ impl SharedHookRegistry {
 
     pub async fn emit_modifying(&self, event: HookEvent) -> HookResult {
         self.inner.read().await.emit_modifying(event)
+    }
+
+    /// Set plugin context for the current hook chain (v2026.3.11).
+    pub async fn set_plugin_context(&self, ctx: HookPluginContext) {
+        *self.plugin_context.write().await = Some(ctx);
+    }
+
+    /// Get the current plugin context (v2026.3.11).
+    pub async fn get_plugin_context(&self) -> Option<HookPluginContext> {
+        self.plugin_context.read().await.clone()
+    }
+
+    /// Clear plugin context after hook chain completes (v2026.3.11).
+    pub async fn clear_plugin_context(&self) {
+        *self.plugin_context.write().await = None;
     }
 }
 
