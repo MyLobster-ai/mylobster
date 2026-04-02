@@ -9,6 +9,13 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 // ============================================================================
+// v2026.4.1: Media Download Idle-Timeout
+// ============================================================================
+
+/// Maximum time to wait for a media download before aborting (v2026.4.1).
+const MEDIA_DOWNLOAD_TIMEOUT_SECS: u64 = 30;
+
+// ============================================================================
 // v2026.2.26: Slash Command Validation
 // ============================================================================
 
@@ -240,6 +247,8 @@ impl ChannelPlugin for DiscordChannel {
         );
 
         // TODO: Initialise a serenity::Client with a gateway handler.
+        // v2026.4.1: Pass attachment and sticker downloads through shared idle-timeout
+        // and worker-abort path to prevent hangs (MEDIA_DOWNLOAD_TIMEOUT_SECS).
 
         Ok(())
     }

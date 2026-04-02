@@ -642,6 +642,47 @@ pub struct ChatCompletionDelta {
 }
 
 // ============================================================================
+// Task Board Protocol (v2026.4.1)
+// ============================================================================
+
+/// Task status in the task board (v2026.4.1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskStatus {
+    Pending,
+    Running,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+/// A task in the background task board (v2026.4.1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskInfo {
+    pub id: String,
+    pub status: TaskStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+}
+
+/// Voice wake configuration (v2026.4.1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceWakeConfig {
+    pub mode: String,
+    pub trigger_chime: bool,
+}
+
+// ============================================================================
 // Tests — OpenClaw v2026.2.24 Protocol Parity
 // ============================================================================
 

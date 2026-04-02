@@ -180,6 +180,7 @@ pub(crate) async fn openai_compat_chat(
         .post(format!("{}/chat/completions", base_url))
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
+        .header("User-Agent", "MyLobster/2026.4.1")
         .json(&body)
         .send()
         .await?;
@@ -216,6 +217,7 @@ pub(crate) async fn openai_compat_stream_chat(
             .post(format!("{}/chat/completions", base_url))
             .header("Authorization", format!("Bearer {}", api_key))
             .header("Content-Type", "application/json")
+            .header("User-Agent", "MyLobster/2026.4.1")
             .json(&body)
             .send()
             .await

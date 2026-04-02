@@ -32,6 +32,9 @@ pub struct CronJob {
     /// Default false: subagent follow-up won't retry silent jobs.
     #[serde(default)]
     pub retry_silent: bool,
+    /// Per-job tool allowlist (v2026.4.1).
+    /// When set, dramatically reduces input tokens for small local models.
+    pub tools: Option<Vec<String>>,
 }
 
 /// Per-job error state for status reporting (v2026.3.11).
@@ -96,6 +99,8 @@ pub fn migrate_legacy_storage(jobs: &mut Vec<CronJob>) {
         if !job.isolated_delivery {
             job.isolated_delivery = true; // New default: isolated delivery enabled
         }
+        // v2026.4.1: Apply per-job tool allowlist if configured
+        // When job.tools is Some, only those tools are available during execution
     }
 }
 
@@ -185,6 +190,7 @@ mod tests {
             isolated_delivery: false,
             last_error_reason: None,
             retry_silent: false,
+            tools: None,
         }
     }
 

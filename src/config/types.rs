@@ -145,6 +145,9 @@ pub struct GatewayReloadConfig {
     pub mode: GatewayReloadMode,
     #[serde(default = "default_debounce_ms")]
     pub debounce_ms: u64,
+    /// Graceful shutdown timeout before forcing reload (v2026.4.1).
+    /// Defaults to 300_000 ms (5 minutes).
+    pub deferral_timeout_ms: Option<u64>,
 }
 
 impl Default for GatewayReloadConfig {
@@ -152,6 +155,7 @@ impl Default for GatewayReloadConfig {
         Self {
             mode: GatewayReloadMode::default(),
             debounce_ms: 300,
+            deferral_timeout_ms: None,
         }
     }
 }
@@ -312,6 +316,16 @@ pub struct GatewayConfig {
     pub allowed_origins: Vec<String>,
     /// Rate limiting configuration (v2026.3.11).
     pub rate_limit: Option<GatewayRateLimitConfig>,
+    /// Webchat-specific configuration (v2026.4.1).
+    pub webchat: Option<GatewayWebchatConfig>,
+    /// Channel health check interval in minutes (v2026.4.1).
+    pub channel_health_check_minutes: Option<u32>,
+    /// Minutes before a channel socket is considered stale (v2026.4.1).
+    pub channel_stale_event_threshold_minutes: Option<u32>,
+    /// Maximum channel restarts per hour (v2026.4.1).
+    pub channel_max_restarts_per_hour: Option<u32>,
+    /// Push notification configuration (v2026.4.1).
+    pub push: Option<GatewayPushConfig>,
 }
 
 /// Rate limiting for gateway connections (v2026.3.11).
@@ -324,6 +338,33 @@ pub struct GatewayRateLimitConfig {
     pub window_seconds: Option<u32>,
     /// Maximum concurrent WebSocket connections.
     pub max_connections: Option<u32>,
+}
+
+/// Webchat-specific gateway configuration (v2026.4.1).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayWebchatConfig {
+    /// Maximum characters in chat history text truncation.
+    pub chat_history_max_chars: Option<u64>,
+}
+
+/// Push notification configuration (v2026.4.1).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayPushConfig {
+    /// APNs relay configuration for iOS push notifications.
+    pub apns: Option<GatewayApnsConfig>,
+}
+
+/// APNs relay configuration (v2026.4.1).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayApnsConfig {
+    pub relay_url: Option<String>,
+    pub key_id: Option<String>,
+    pub team_id: Option<String>,
+    pub bundle_id: Option<String>,
+    pub key_path: Option<String>,
 }
 
 impl Default for GatewayConfig {
@@ -344,6 +385,11 @@ impl Default for GatewayConfig {
             trusted_proxies: None,
             allowed_origins: Vec::new(),
             rate_limit: None,
+            webchat: None,
+            channel_health_check_minutes: None,
+            channel_stale_event_threshold_minutes: None,
+            channel_max_restarts_per_hour: None,
+            push: None,
         }
     }
 }
@@ -445,6 +491,8 @@ pub struct AgentCompactionConfig {
     pub reserve_tokens_floor: Option<u64>,
     pub max_history_share: Option<f64>,
     pub memory_flush: Option<AgentCompactionMemoryFlushConfig>,
+    /// Whether to notify user when compaction occurs (v2026.4.1).
+    pub notify_user: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -610,6 +658,8 @@ pub struct SubagentsConfig {
     pub max_children_per_agent: Option<u8>,
     /// Maximum time in seconds a subagent run is allowed to execute (v2026.2.24).
     pub run_timeout_seconds: Option<u64>,
+    /// Require explicit agentId in sessions_spawn calls (v2026.4.1).
+    pub require_agent_id: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -635,6 +685,12 @@ pub struct AgentDefaultsConfig {
     pub compaction: AgentCompactionConfig,
     pub memory_search: Option<bool>,
     pub thinking_default: Option<ThinkingLevel>,
+    /// Per-agent reasoning default (v2026.4.1).
+    pub reasoning_default: Option<ThinkingLevel>,
+    /// Per-agent fast mode default (v2026.4.1).
+    pub fast_mode_default: Option<bool>,
+    /// Global default provider parameters (v2026.4.1).
+    pub params: Option<HashMap<String, serde_json::Value>>,
     pub verbose_default: Option<VerboseLevel>,
     pub elevated_default: Option<ElevatedLevel>,
     pub block_streaming_default: Option<BlockStreamingLevel>,
@@ -716,6 +772,12 @@ pub struct AgentEntry {
     pub subagents: Option<SubagentsConfig>,
     pub sandbox: Option<AgentSandboxConfig>,
     pub tools: Option<AgentToolsConfig>,
+    /// Per-agent thinking default (v2026.4.1).
+    pub thinking_default: Option<ThinkingLevel>,
+    /// Per-agent reasoning default (v2026.4.1).
+    pub reasoning_default: Option<ThinkingLevel>,
+    /// Per-agent fast mode default (v2026.4.1).
+    pub fast_mode_default: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -828,6 +890,19 @@ pub struct BedrockDiscoveryConfig {
     pub refresh_interval: Option<String>,
     pub default_context_window: Option<u64>,
     pub default_max_tokens: Option<u64>,
+    /// Bedrock Guardrails configuration (v2026.4.1).
+    pub guardrails: Option<BedrockGuardrailsConfig>,
+}
+
+/// Bedrock Guardrails configuration (v2026.4.1).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BedrockGuardrailsConfig {
+    pub enabled: Option<bool>,
+    pub guardrail_id: Option<String>,
+    pub guardrail_version: Option<String>,
+    /// Trace configuration: "enabled" or "disabled".
+    pub trace: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1096,6 +1171,16 @@ pub struct TelegramAccountConfig {
     pub heartbeat: Option<HeartbeatConfig>,
     pub link_preview: Option<bool>,
     pub response_prefix: Option<String>,
+    /// Error reporting policy: "always", "once", "silent" (v2026.4.1).
+    pub error_policy: Option<String>,
+    /// Cooldown in ms between error reports (v2026.4.1).
+    pub error_cooldown_ms: Option<u64>,
+    /// Custom Telegram Bot API endpoint root (v2026.4.1).
+    pub api_root: Option<String>,
+    /// LLM-based auto-topic naming (v2026.4.1).
+    pub auto_topic_label: Option<bool>,
+    /// Suppress error reply messages (v2026.4.1).
+    pub silent_error_replies: Option<bool>,
 }
 
 impl Default for TelegramAccountConfig {
@@ -1139,6 +1224,11 @@ impl Default for TelegramAccountConfig {
             heartbeat: None,
             link_preview: Some(true),
             response_prefix: None,
+            error_policy: None,
+            error_cooldown_ms: None,
+            api_root: None,
+            auto_topic_label: None,
+            silent_error_replies: None,
         }
     }
 }
@@ -1277,6 +1367,15 @@ pub struct DiscordAccountConfig {
     pub intents: Option<DiscordIntentsConfig>,
     pub pluralkit: Option<bool>,
     pub response_prefix: Option<String>,
+    /// Per-account health monitor override (v2026.4.1).
+    pub health_monitor: Option<ChannelHealthMonitorConfig>,
+}
+
+/// Per-channel/account health monitor configuration (v2026.4.1).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelHealthMonitorConfig {
+    pub enabled: Option<bool>,
 }
 
 impl Default for DiscordAccountConfig {
@@ -1311,6 +1410,7 @@ impl Default for DiscordAccountConfig {
             intents: None,
             pluralkit: None,
             response_prefix: None,
+            health_monitor: None,
         }
     }
 }
@@ -1492,6 +1592,17 @@ impl SlackConfig {
 // WhatsApp Configuration
 // ============================================================================
 
+/// WhatsApp reaction level guidance (v2026.4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WhatsAppReactionLevel {
+    Off,
+    Ack,
+    #[default]
+    Minimal,
+    Extensive,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct WhatsAppActionConfig {
@@ -1539,6 +1650,8 @@ pub struct WhatsAppAccountConfig {
     pub debounce_ms: Option<u64>,
     pub heartbeat: Option<HeartbeatConfig>,
     pub actions: Option<WhatsAppActionConfig>,
+    /// Reaction level guidance for agent reactions (v2026.4.1).
+    pub reaction_level: Option<WhatsAppReactionLevel>,
 }
 
 impl Default for WhatsAppAccountConfig {
@@ -1571,6 +1684,7 @@ impl Default for WhatsAppAccountConfig {
             debounce_ms: None,
             heartbeat: None,
             actions: None,
+            reaction_level: None,
         }
     }
 }
@@ -1709,6 +1823,7 @@ pub struct SafeBinProfile {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecToolConfig {
+    /// Execution host: "sandbox", "auto" (default changed from sandbox, v2026.4.1), "node", etc.
     pub host: Option<String>,
     pub security: Option<String>,
     pub ask: Option<String>,
@@ -1724,6 +1839,8 @@ pub struct ExecToolConfig {
     pub cleanup_ms: Option<u64>,
     pub notify_on_exit: Option<bool>,
     pub apply_patch: Option<bool>,
+    /// Require explicit approval for interpreter inline-eval forms (v2026.4.1).
+    pub strict_inline_eval: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1736,6 +1853,12 @@ pub struct WebSearchConfig {
     pub cache_ttl_minutes: Option<u64>,
     pub perplexity: Option<PerplexitySearchConfig>,
     pub grok: Option<GrokSearchConfig>,
+    /// SearXNG bundled web search provider (v2026.4.1).
+    pub searxng: Option<SearxngSearchConfig>,
+    /// X (Twitter) search tool via xAI Grok (v2026.4.1).
+    pub x_search: Option<XSearchConfig>,
+    /// Native Codex web search for eligible models (v2026.4.1).
+    pub openai_codex: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1754,6 +1877,27 @@ pub struct GrokSearchConfig {
     pub inline_citations: Option<bool>,
 }
 
+/// SearXNG bundled web search provider configuration (v2026.4.1).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SearxngSearchConfig {
+    /// SearXNG instance host URL.
+    pub host: Option<String>,
+    pub max_results: Option<u32>,
+    pub engines: Option<Vec<String>>,
+    pub language: Option<String>,
+    pub timeout_seconds: Option<u64>,
+}
+
+/// X (Twitter) search configuration via xAI Grok (v2026.4.1).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct XSearchConfig {
+    pub api_key: Option<String>,
+    pub model: Option<String>,
+    pub max_results: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct WebFetchConfig {
@@ -1766,6 +1910,8 @@ pub struct WebFetchConfig {
     pub user_agent: Option<String>,
     pub readability: Option<bool>,
     pub firecrawl: Option<FirecrawlConfig>,
+    /// Maximum response bytes for truncation (v2026.4.1).
+    pub max_response_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1909,6 +2055,8 @@ pub struct MemoryQmdConfig {
     pub update: Option<MemoryQmdUpdateConfig>,
     pub limits: Option<MemoryQmdLimitsConfig>,
     pub scope: Option<String>,
+    /// Extra QMD collections to include in search (v2026.4.1).
+    pub extra_collections: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2009,6 +2157,17 @@ pub struct MemorySearchStoreConfig {
     pub path: Option<String>,
     pub vector: Option<serde_json::Value>,
     pub cache: Option<serde_json::Value>,
+    /// FTS5 tokenizer configuration for CJK text support (v2026.4.1).
+    /// Values: "unicode61" (default), "trigram" (for CJK).
+    pub fts: Option<MemoryFtsConfig>,
+}
+
+/// FTS5 tokenizer configuration (v2026.4.1).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryFtsConfig {
+    /// FTS5 tokenizer: "unicode61" or "trigram".
+    pub tokenizer: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2023,6 +2182,8 @@ pub struct MemorySearchChunkingConfig {
 pub struct MemorySearchSyncConfig {
     pub on_boot: Option<bool>,
     pub interval: Option<String>,
+    /// Force session reindex after compaction (v2026.4.1).
+    pub post_compaction_force: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2430,6 +2591,8 @@ pub struct DiagnosticsConfig {
 pub struct SandboxDockerSettings {
     pub image: Option<String>,
     pub container_prefix: Option<String>,
+    /// Additional tool allowlist entries for sandbox (v2026.4.1).
+    pub also_allow: Option<Vec<String>>,
     pub workdir: Option<String>,
     pub read_only_root: Option<bool>,
     pub tmpfs: Option<Vec<String>>,
@@ -2673,6 +2836,9 @@ pub struct CronConfig {
     pub max_concurrent_runs: Option<u32>,
     pub session_retention: Option<String>,
     pub default_stagger_ms: Option<u64>,
+    /// Default tool allowlist for cron jobs (v2026.4.1).
+    /// Dramatically reduces input tokens for small local models.
+    pub default_tools: Option<Vec<String>>,
 }
 
 // ============================================================================
@@ -2708,6 +2874,41 @@ pub struct IdentityConfig {
     pub theme: Option<String>,
     pub emoji: Option<String>,
     pub avatar: Option<String>,
+}
+
+// ============================================================================
+// Auth Configuration (v2026.4.1)
+// ============================================================================
+
+/// Auth cooldown configuration for provider rotation (v2026.4.1).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthCooldownConfig {
+    /// Max same-provider auth-profile retries before cross-provider fallback.
+    pub rate_limited_profile_rotations: Option<u32>,
+    /// Max retries for overloaded errors before cross-provider fallback.
+    pub overloaded_profile_rotations: Option<u32>,
+    /// Fixed delay in ms before retrying after overloaded error.
+    pub overloaded_backoff_ms: Option<u64>,
+}
+
+/// Auth profile configuration (v2026.4.1).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthProfileConfig {
+    pub provider: Option<String>,
+    pub api_key: Option<String>,
+    pub base_url: Option<String>,
+    /// Human-readable display name for this auth profile (v2026.4.1).
+    pub display_name: Option<String>,
+}
+
+/// Top-level auth configuration (v2026.4.1).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthConfig {
+    pub cooldowns: Option<AuthCooldownConfig>,
+    pub profiles: Option<HashMap<String, AuthProfileConfig>>,
 }
 
 // ============================================================================
@@ -3188,5 +3389,357 @@ mod tests {
         let config: ModelsConfig = serde_json::from_value(raw).unwrap();
         assert!(config.alternative_providers.is_none());
         assert!(config.cooldown_probe_cap.is_none());
+    }
+
+    // ====================================================================
+    // v2026.4.1 Config Type Parity Tests
+    // ====================================================================
+
+    // -- GatewayWebchatConfig --
+
+    #[test]
+    fn gateway_webchat_config_full() {
+        let raw = json!({ "chatHistoryMaxChars": 50000 });
+        let config: GatewayWebchatConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(config.chat_history_max_chars, Some(50000));
+    }
+
+    #[test]
+    fn gateway_webchat_config_default() {
+        let config = GatewayWebchatConfig::default();
+        assert!(config.chat_history_max_chars.is_none());
+    }
+
+    // -- GatewayPushConfig / GatewayApnsConfig --
+
+    #[test]
+    fn gateway_push_apns_config() {
+        let raw = json!({
+            "apns": {
+                "relayUrl": "https://apns.example.com",
+                "keyId": "ABC123",
+                "teamId": "TEAM456",
+                "bundleId": "ai.mylobster.app",
+                "keyPath": "/etc/apns/key.p8"
+            }
+        });
+        let config: GatewayPushConfig = serde_json::from_value(raw).unwrap();
+        let apns = config.apns.unwrap();
+        assert_eq!(apns.relay_url.as_deref(), Some("https://apns.example.com"));
+        assert_eq!(apns.key_id.as_deref(), Some("ABC123"));
+        assert_eq!(apns.team_id.as_deref(), Some("TEAM456"));
+        assert_eq!(apns.bundle_id.as_deref(), Some("ai.mylobster.app"));
+    }
+
+    // -- Gateway health monitor --
+
+    #[test]
+    fn gateway_config_health_monitor_fields() {
+        let raw = json!({
+            "port": 18789,
+            "channelHealthCheckMinutes": 5,
+            "channelStaleEventThresholdMinutes": 15,
+            "channelMaxRestartsPerHour": 3
+        });
+        let config: GatewayConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(config.channel_health_check_minutes, Some(5));
+        assert_eq!(config.channel_stale_event_threshold_minutes, Some(15));
+        assert_eq!(config.channel_max_restarts_per_hour, Some(3));
+    }
+
+    // -- Gateway reload deferral --
+
+    #[test]
+    fn gateway_reload_deferral_timeout() {
+        let raw = json!({
+            "mode": "hybrid",
+            "debounceMs": 300,
+            "deferralTimeoutMs": 300000
+        });
+        let config: GatewayReloadConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(config.deferral_timeout_ms, Some(300000));
+    }
+
+    // -- Agent defaults params --
+
+    #[test]
+    fn agent_defaults_params() {
+        let raw = json!({
+            "model": "claude-sonnet-4-6",
+            "params": { "temperature": 0.7, "topP": 0.9 }
+        });
+        let config: AgentDefaultsConfig = serde_json::from_value(raw).unwrap();
+        let params = config.params.unwrap();
+        assert_eq!(params["temperature"], 0.7);
+        assert_eq!(params["topP"], 0.9);
+    }
+
+    // -- Agent thinking/reasoning/fast mode defaults --
+
+    #[test]
+    fn agent_entry_thinking_defaults() {
+        let raw = json!({
+            "id": "test-agent",
+            "thinkingDefault": "high",
+            "reasoningDefault": "medium",
+            "fastModeDefault": true
+        });
+        let entry: AgentEntry = serde_json::from_value(raw).unwrap();
+        assert_eq!(entry.thinking_default, Some(ThinkingLevel::High));
+        assert_eq!(entry.reasoning_default, Some(ThinkingLevel::Medium));
+        assert_eq!(entry.fast_mode_default, Some(true));
+    }
+
+    // -- Subagents requireAgentId --
+
+    #[test]
+    fn subagents_require_agent_id() {
+        let raw = json!({
+            "maxConcurrent": 4,
+            "requireAgentId": true
+        });
+        let config: SubagentsConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(config.require_agent_id, Some(true));
+    }
+
+    // -- Compaction notifyUser --
+
+    #[test]
+    fn compaction_notify_user() {
+        let raw = json!({
+            "mode": "default",
+            "notifyUser": true
+        });
+        let config: AgentCompactionConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(config.notify_user, Some(true));
+    }
+
+    // -- Telegram error controls --
+
+    #[test]
+    fn telegram_error_policy_config() {
+        let raw = json!({
+            "errorPolicy": "silent",
+            "errorCooldownMs": 30000,
+            "apiRoot": "https://custom-bot-api.example.com",
+            "autoTopicLabel": true,
+            "silentErrorReplies": true
+        });
+        let config: TelegramAccountConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(config.error_policy.as_deref(), Some("silent"));
+        assert_eq!(config.error_cooldown_ms, Some(30000));
+        assert_eq!(config.api_root.as_deref(), Some("https://custom-bot-api.example.com"));
+        assert_eq!(config.auto_topic_label, Some(true));
+        assert_eq!(config.silent_error_replies, Some(true));
+    }
+
+    // -- WhatsApp reaction level --
+
+    #[test]
+    fn whatsapp_reaction_level_roundtrip() {
+        let v = serde_json::to_value(WhatsAppReactionLevel::Minimal).unwrap();
+        assert_eq!(v, json!("minimal"));
+        let parsed: WhatsAppReactionLevel = serde_json::from_value(json!("extensive")).unwrap();
+        assert_eq!(parsed, WhatsAppReactionLevel::Extensive);
+    }
+
+    #[test]
+    fn whatsapp_reaction_level_default_is_minimal() {
+        assert_eq!(WhatsAppReactionLevel::default(), WhatsAppReactionLevel::Minimal);
+    }
+
+    #[test]
+    fn whatsapp_account_reaction_level() {
+        let raw = json!({ "reactionLevel": "off" });
+        let config: WhatsAppAccountConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(config.reaction_level, Some(WhatsAppReactionLevel::Off));
+    }
+
+    // -- Exec strictInlineEval --
+
+    #[test]
+    fn exec_strict_inline_eval() {
+        let raw = json!({
+            "host": "auto",
+            "strictInlineEval": true
+        });
+        let config: ExecToolConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(config.host.as_deref(), Some("auto"));
+        assert_eq!(config.strict_inline_eval, Some(true));
+    }
+
+    // -- Sandbox alsoAllow --
+
+    #[test]
+    fn sandbox_docker_also_allow() {
+        let raw = json!({
+            "image": "node:22",
+            "alsoAllow": ["curl", "wget"]
+        });
+        let config: SandboxDockerSettings = serde_json::from_value(raw).unwrap();
+        let also = config.also_allow.unwrap();
+        assert_eq!(also, vec!["curl", "wget"]);
+    }
+
+    // -- SearXNG search config --
+
+    #[test]
+    fn searxng_search_config() {
+        let raw = json!({
+            "host": "http://searxng.local:8888",
+            "maxResults": 20,
+            "engines": ["google", "bing"],
+            "language": "en"
+        });
+        let config: SearxngSearchConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(config.host.as_deref(), Some("http://searxng.local:8888"));
+        assert_eq!(config.max_results, Some(20));
+        assert_eq!(config.engines.as_ref().unwrap().len(), 2);
+    }
+
+    // -- X search config --
+
+    #[test]
+    fn x_search_config() {
+        let raw = json!({
+            "apiKey": "xai-key",
+            "model": "grok-3",
+            "maxResults": 5
+        });
+        let config: XSearchConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(config.api_key.as_deref(), Some("xai-key"));
+        assert_eq!(config.model.as_deref(), Some("grok-3"));
+    }
+
+    // -- WebFetch maxResponseBytes --
+
+    #[test]
+    fn web_fetch_max_response_bytes() {
+        let raw = json!({
+            "enabled": true,
+            "maxResponseBytes": 2097152
+        });
+        let config: WebFetchConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(config.max_response_bytes, Some(2097152));
+    }
+
+    // -- Memory FTS tokenizer --
+
+    #[test]
+    fn memory_fts_tokenizer_config() {
+        let raw = json!({
+            "driver": "sqlite",
+            "fts": { "tokenizer": "trigram" }
+        });
+        let config: MemorySearchStoreConfig = serde_json::from_value(raw).unwrap();
+        let fts = config.fts.unwrap();
+        assert_eq!(fts.tokenizer.as_deref(), Some("trigram"));
+    }
+
+    // -- Memory sync postCompactionForce --
+
+    #[test]
+    fn memory_sync_post_compaction_force() {
+        let raw = json!({
+            "onBoot": true,
+            "postCompactionForce": true
+        });
+        let config: MemorySearchSyncConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(config.post_compaction_force, Some(true));
+    }
+
+    // -- QMD extra collections --
+
+    #[test]
+    fn qmd_extra_collections() {
+        let raw = json!({
+            "searchMode": "hybrid",
+            "extraCollections": ["logs", "docs"]
+        });
+        let config: MemoryQmdConfig = serde_json::from_value(raw).unwrap();
+        let extras = config.extra_collections.unwrap();
+        assert_eq!(extras, vec!["logs", "docs"]);
+    }
+
+    // -- Auth cooldown config --
+
+    #[test]
+    fn auth_cooldown_config() {
+        let raw = json!({
+            "rateLimitedProfileRotations": 3,
+            "overloadedProfileRotations": 2,
+            "overloadedBackoffMs": 5000
+        });
+        let config: AuthCooldownConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(config.rate_limited_profile_rotations, Some(3));
+        assert_eq!(config.overloaded_profile_rotations, Some(2));
+        assert_eq!(config.overloaded_backoff_ms, Some(5000));
+    }
+
+    // -- Auth profile displayName --
+
+    #[test]
+    fn auth_profile_display_name() {
+        let raw = json!({
+            "provider": "anthropic",
+            "displayName": "Production Claude"
+        });
+        let config: AuthProfileConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(config.display_name.as_deref(), Some("Production Claude"));
+    }
+
+    // -- Bedrock guardrails --
+
+    #[test]
+    fn bedrock_guardrails_config() {
+        let raw = json!({
+            "enabled": true,
+            "guardrailId": "gr-123",
+            "guardrailVersion": "1",
+            "trace": "enabled"
+        });
+        let config: BedrockGuardrailsConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(config.enabled, Some(true));
+        assert_eq!(config.guardrail_id.as_deref(), Some("gr-123"));
+        assert_eq!(config.guardrail_version.as_deref(), Some("1"));
+        assert_eq!(config.trace.as_deref(), Some("enabled"));
+    }
+
+    // -- Cron default tools --
+
+    #[test]
+    fn cron_default_tools() {
+        let raw = json!({
+            "enabled": true,
+            "defaultTools": ["web_search", "memory_search"]
+        });
+        let config: CronConfig = serde_json::from_value(raw).unwrap();
+        let tools = config.default_tools.unwrap();
+        assert_eq!(tools, vec!["web_search", "memory_search"]);
+    }
+
+    // -- Channel health monitor --
+
+    #[test]
+    fn channel_health_monitor_config() {
+        let raw = json!({ "enabled": false });
+        let config: ChannelHealthMonitorConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(config.enabled, Some(false));
+    }
+
+    // -- WebSearchConfig new providers --
+
+    #[test]
+    fn web_search_config_with_searxng_and_x() {
+        let raw = json!({
+            "provider": "searxng",
+            "searxng": { "host": "http://localhost:8888" },
+            "xSearch": { "apiKey": "xai-key" },
+            "openaiCodex": true
+        });
+        let config: WebSearchConfig = serde_json::from_value(raw).unwrap();
+        assert!(config.searxng.is_some());
+        assert!(config.x_search.is_some());
+        assert_eq!(config.openai_codex, Some(true));
     }
 }

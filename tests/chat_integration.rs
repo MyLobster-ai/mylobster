@@ -541,9 +541,10 @@ async fn chat_send_provider_auth_error() {
     let last = events.last().unwrap();
     assert_eq!(last["state"], "error");
     let err = last["errorMessage"].as_str().unwrap();
+    // v2026.4.1: error messages are sanitized — auth errors return a safe message
     assert!(
-        err.contains("401"),
-        "error should mention 401 status, got: {}",
+        err.contains("Authentication error") || err.contains("401"),
+        "error should mention authentication issue, got: {}",
         err
     );
 

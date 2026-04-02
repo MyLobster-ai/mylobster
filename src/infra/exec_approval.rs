@@ -106,6 +106,9 @@ pub struct ApprovalDecision {
     pub action: ApprovalAction,
     /// Reason for the decision.
     pub reason: String,
+    /// v2026.4.1: Whether this approval should be persisted as durable
+    /// user-approved trust (allow-always) rather than transient allow-once.
+    pub durable: bool,
 }
 
 // ============================================================================
@@ -230,6 +233,7 @@ pub fn evaluate_exec_approval(
                     matched_policy: Some(policy.id.clone()),
                     action: ApprovalAction::Deny,
                     reason: format!("Denied by policy '{}'", policy.id),
+                    durable: false,
                 };
             }
             ApprovalAction::Allow => {
@@ -243,6 +247,7 @@ pub fn evaluate_exec_approval(
                             "Policy '{}' matched but env mismatch: {}",
                             policy.id, mismatch
                         ),
+                        durable: false,
                     };
                 }
                 return ApprovalDecision {
@@ -250,6 +255,8 @@ pub fn evaluate_exec_approval(
                     matched_policy: Some(policy.id.clone()),
                     action: ApprovalAction::Allow,
                     reason: format!("Allowed by policy '{}'", policy.id),
+                    // v2026.4.1: allow-always policies produce durable trust
+                    durable: policy.id.contains("allow-always"),
                 };
             }
             ApprovalAction::Ask => {
@@ -258,6 +265,7 @@ pub fn evaluate_exec_approval(
                     matched_policy: Some(policy.id.clone()),
                     action: ApprovalAction::Ask,
                     reason: format!("Approval required by policy '{}'", policy.id),
+                    durable: false,
                 };
             }
         }
@@ -269,7 +277,30 @@ pub fn evaluate_exec_approval(
         matched_policy: None,
         action: ApprovalAction::Ask,
         reason: format!("No matching policy for: {command_str}"),
+        durable: false,
     }
+}
+
+// ============================================================================
+// Inline-eval strict approval (v2026.4.1)
+// ============================================================================
+
+/// v2026.4.1: Require explicit approval for interpreter inline-eval forms
+/// when strictInlineEval is configured.
+pub fn requires_inline_eval_approval(command: &str, strict: bool) -> bool {
+    if !strict {
+        return false;
+    }
+    // Check for common inline-eval patterns
+    let eval_patterns = [
+        "python -c",
+        "python3 -c",
+        "node -e",
+        "ruby -e",
+        "perl -e",
+        "bash -c",
+    ];
+    eval_patterns.iter().any(|p| command.contains(p))
 }
 
 /// Check if an exec request matches a policy's command patterns.

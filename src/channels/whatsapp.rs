@@ -93,3 +93,27 @@ pub(crate) async fn send_message(config: &Config, to: &str, message: &str) -> Re
     let channel = WhatsAppChannel::new(config);
     channel.send_message(to, message).await
 }
+
+// v2026.4.1: Support HTML/XML/CSS MIME types + fallback for unknown types
+fn resolve_mime_type(filename: &str, content_type: Option<&str>) -> String {
+    if let Some(ct) = content_type {
+        return ct.to_string();
+    }
+    let ext = filename.rsplit('.').next().unwrap_or("");
+    match ext {
+        "html" | "htm" => "text/html".to_string(),
+        "xml" => "application/xml".to_string(),
+        "css" => "text/css".to_string(),
+        "js" => "application/javascript".to_string(),
+        "json" => "application/json".to_string(),
+        "pdf" => "application/pdf".to_string(),
+        "png" => "image/png".to_string(),
+        "jpg" | "jpeg" => "image/jpeg".to_string(),
+        "gif" => "image/gif".to_string(),
+        "mp4" => "video/mp4".to_string(),
+        "mp3" => "audio/mpeg".to_string(),
+        "ogg" => "audio/ogg".to_string(),
+        "webp" => "image/webp".to_string(),
+        _ => "application/octet-stream".to_string(),
+    }
+}

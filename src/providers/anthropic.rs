@@ -180,7 +180,8 @@ impl ModelProvider for AnthropicProvider {
             .post(format!("{}/v1/messages", self.base_url))
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json");
+            .header("content-type", "application/json")
+            .header("User-Agent", "MyLobster/2026.4.1");
 
         let mut betas = Vec::new();
         if thinking_enabled {
@@ -281,7 +282,8 @@ impl ModelProvider for AnthropicProvider {
                 .post(format!("{}/v1/messages", base_url))
                 .header("x-api-key", &api_key)
                 .header("anthropic-version", "2023-06-01")
-                .header("content-type", "application/json");
+                .header("content-type", "application/json")
+                .header("User-Agent", "MyLobster/2026.4.1");
 
             let mut betas = Vec::new();
             if thinking_enabled {

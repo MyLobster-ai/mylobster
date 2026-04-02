@@ -283,24 +283,29 @@ pub async fn process_chat_with_hooks(
                                 seq,
                                 state: ChatEventState::Error,
                                 message: None,
-                                error_message: Some(e),
+                                // v2026.4.1: sanitize before sending to client
+                                error_message: Some(sanitize_chat_error(&e)),
                                 usage: None,
                                 stop_reason: None,
                             };
                             let _ = event_tx.send(chat_event).await;
                             return Ok(());
                         }
+                        // Replay hook events are forwarded as metadata deltas (v2026.4.1).
+                        StreamEvent::Replay(_) => {}
                     }
                 }
             }
             Err(e) => {
+                let raw = format!("Provider error: {}", e);
                 let chat_event = ChatEvent {
                     run_id: run_id.clone(),
                     session_key: session_key.clone(),
                     seq: 0,
                     state: ChatEventState::Error,
                     message: None,
-                    error_message: Some(format!("Provider error: {}", e)),
+                    // v2026.4.1: sanitize before sending to client
+                    error_message: Some(sanitize_chat_error(&raw)),
                     usage: None,
                     stop_reason: None,
                 };
@@ -463,6 +468,30 @@ pub async fn process_chat_with_hooks(
     }
 
     Ok(())
+}
+
+// ============================================================================
+// Chat error sanitization (v2026.4.1)
+// ============================================================================
+
+/// Sanitize error messages before sending to chat channels (v2026.4.1).
+/// Prevents leaking raw provider/runtime failures to clients.
+fn sanitize_chat_error(err: &str) -> String {
+    // Don't expose internal error details to users
+    if err.contains("API key") || err.contains("authentication") || err.contains("credentials") {
+        return "Authentication error. Please check your configuration.".to_string();
+    }
+    if err.contains("rate limit") || err.contains("429") {
+        return "Rate limited. Please try again in a moment.".to_string();
+    }
+    if err.contains("timeout") || err.contains("timed out") {
+        return "Request timed out. Please try again.".to_string();
+    }
+    if err.contains("500") || err.contains("internal server error") {
+        return "Provider error. Please try again.".to_string();
+    }
+    // Generic fallback — don't leak raw error
+    "Something went wrong. Please try again.".to_string()
 }
 
 /// Build tool definitions in the format expected by providers.

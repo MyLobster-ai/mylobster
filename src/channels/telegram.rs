@@ -10,6 +10,28 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 // ============================================================================
+// v2026.4.1: Error Policy Support
+// ============================================================================
+
+/// Telegram error reporting policy (v2026.4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorPolicy {
+    Always,
+    Once,
+    Silent,
+}
+
+impl ErrorPolicy {
+    fn from_config(s: Option<&str>) -> Self {
+        match s {
+            Some("always") => Self::Always,
+            Some("silent") => Self::Silent,
+            _ => Self::Once,
+        }
+    }
+}
+
+// ============================================================================
 // v2026.2.26: Inline Keyboard Support
 // ============================================================================
 
@@ -118,6 +140,12 @@ pub struct TelegramChannel {
     bot_token: Option<String>,
     /// v2026.2.26: DM allowlist from config.
     dm_allow_from: Vec<String>,
+    /// Error policy for error reporting (v2026.4.1)
+    error_policy: ErrorPolicy,
+    /// Cooldown tracker for error reports (v2026.4.1)
+    last_error_reported: Option<std::time::Instant>,
+    /// Error cooldown in ms (v2026.4.1)
+    error_cooldown_ms: u64,
 }
 
 impl TelegramChannel {
@@ -133,10 +161,22 @@ impl TelegramChannel {
             .clone()
             .unwrap_or_default();
 
+        // v2026.4.1: Load error policy and cooldown from config
+        let error_policy = ErrorPolicy::from_config(
+            tg.default_account.error_policy.as_deref(),
+        );
+        let error_cooldown_ms = tg
+            .default_account
+            .error_cooldown_ms
+            .unwrap_or(60_000);
+
         Self {
             enabled,
             bot_token,
             dm_allow_from,
+            error_policy,
+            last_error_reported: None,
+            error_cooldown_ms,
         }
     }
 
@@ -298,6 +338,10 @@ impl ChannelPlugin for TelegramChannel {
         );
 
         // TODO: Initialise teloxide bot dispatcher and start polling / webhook.
+        // v2026.4.1: Pass inbound message timestamp for temporal awareness
+        // if let Some(date) = update.message.as_ref().and_then(|m| Some(m.date)) {
+        //     // Include timestamp in message context
+        // }
 
         Ok(())
     }

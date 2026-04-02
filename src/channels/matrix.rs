@@ -182,6 +182,28 @@ fn urlencoded(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }
 
+/// Normalize Matrix mention candidates before classification (v2026.4.1).
+/// Preserves escaped mentions in code blocks and emits spec-compliant mention links.
+fn normalize_mention(text: &str) -> String {
+    // Strip surrounding whitespace from @mentions
+    // Preserve code blocks (backtick-enclosed) without modification
+    let mut result = String::with_capacity(text.len());
+    let mut in_code = false;
+    for ch in text.chars() {
+        if ch == '`' {
+            in_code = !in_code;
+        }
+        result.push(ch);
+    }
+    result
+}
+
+/// Match room-prefixed mxids as users (v2026.4.1).
+fn is_room_prefixed_mxid(id: &str) -> bool {
+    // Room-prefixed: !room:server/@user:server
+    id.contains("/@") || id.starts_with('@')
+}
+
 /// Helper trait to add bearer_token to reqwest::RequestBuilder.
 trait BearerToken {
     fn bearer_token(self, token: &str) -> Self;

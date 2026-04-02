@@ -38,6 +38,11 @@ struct SessionInner {
     history: parking_lot::RwLock<Vec<ProviderMessage>>,
     /// Turn-source binding for reply routing (v2026.2.24).
     turn_source: parking_lot::RwLock<Option<TurnSource>>,
+    /// Whether this session is currently processing a turn (v2026.4.1).
+    is_busy: parking_lot::RwLock<bool>,
+    /// Whether a model switch is queued behind a busy run (v2026.4.1).
+    /// Prevents /model changes from interrupting active turns.
+    pending_model_switch: parking_lot::RwLock<Option<String>>,
 }
 
 impl SessionHandle {
@@ -47,8 +52,32 @@ impl SessionHandle {
                 info: parking_lot::RwLock::new(info),
                 history: parking_lot::RwLock::new(Vec::new()),
                 turn_source: parking_lot::RwLock::new(None),
+                is_busy: parking_lot::RwLock::new(false),
+                pending_model_switch: parking_lot::RwLock::new(None),
             }),
         }
+    }
+
+    /// Whether this session is currently processing a turn (v2026.4.1).
+    pub fn is_busy(&self) -> bool {
+        *self.inner.is_busy.read()
+    }
+
+    /// Mark the session as busy (turn started) (v2026.4.1).
+    pub fn set_busy(&self, busy: bool) {
+        *self.inner.is_busy.write() = busy;
+        // If clearing busy, apply any pending model switch.
+        if !busy {
+            let pending = self.inner.pending_model_switch.write().take();
+            if let Some(new_model) = pending {
+                self.inner.info.write().model = Some(new_model);
+            }
+        }
+    }
+
+    /// Get any pending model switch (v2026.4.1).
+    pub fn pending_model_switch(&self) -> Option<String> {
+        self.inner.pending_model_switch.read().clone()
     }
 
     /// Get the full conversation history for this session.
@@ -146,6 +175,18 @@ impl SessionStore {
         }
     }
 
+    /// Queue a model switch if session is busy, apply immediately if idle (v2026.4.1).
+    pub fn request_model_switch(&self, session_key: &str, new_model: String) {
+        if let Some(entry) = self.sessions.get(session_key) {
+            let handle = entry.value();
+            if handle.is_busy() {
+                *handle.inner.pending_model_switch.write() = Some(new_model);
+            } else {
+                handle.inner.info.write().model = Some(new_model);
+            }
+        }
+    }
+
     /// Get a session handle by its key (for direct access to history etc.).
     pub fn get_session_handle(&self, key: &str) -> Option<SessionHandle> {
         self.sessions.get(key).map(|entry| entry.value().clone())
@@ -156,6 +197,8 @@ impl SessionStore {
         if let Some(entry) = self.sessions.get(key) {
             entry.value().inner.history.write().clear();
             entry.value().inner.turn_source.write().take();
+            entry.value().inner.pending_model_switch.write().take();
+            *entry.value().inner.is_busy.write() = false;
             let mut info = entry.value().inner.info.write();
             info.updated_at = chrono::Utc::now().to_rfc3339();
             true

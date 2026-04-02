@@ -23,6 +23,8 @@ struct ConverseRequest {
     inference_config: Option<InferenceConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_config: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guardrail_config: Option<GuardrailConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -59,6 +61,16 @@ struct InferenceConfig {
     max_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
+}
+
+/// Bedrock Guardrails configuration (v2026.4.1).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GuardrailConfig {
+    guardrail_identifier: String,
+    guardrail_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trace: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,6 +245,8 @@ pub struct BedrockProvider {
     secret_key: String,
     session_token: Option<String>,
     client: Client,
+    /// Optional guardrail config: (guardrail_identifier, guardrail_version, trace).
+    guardrail_config: Option<(String, String, Option<String>)>,
 }
 
 impl BedrockProvider {
@@ -248,7 +262,27 @@ impl BedrockProvider {
             secret_key,
             session_token,
             client: Client::new(),
+            guardrail_config: None,
         }
+    }
+
+    /// Builder method to attach Bedrock Guardrails configuration (v2026.4.1).
+    pub fn with_guardrails(
+        mut self,
+        guardrail_identifier: String,
+        guardrail_version: String,
+        trace: Option<String>,
+    ) -> Self {
+        self.guardrail_config = Some((guardrail_identifier, guardrail_version, trace));
+        self
+    }
+
+    fn build_guardrail_config(&self) -> Option<GuardrailConfig> {
+        self.guardrail_config.as_ref().map(|(id, version, trace)| GuardrailConfig {
+            guardrail_identifier: id.clone(),
+            guardrail_version: version.clone(),
+            trace: trace.clone(),
+        })
     }
 
     fn endpoint_url(&self, stream: bool) -> String {
@@ -316,6 +350,7 @@ impl ModelProvider for BedrockProvider {
                 temperature: request.temperature,
             }),
             tool_config: None,
+            guardrail_config: self.build_guardrail_config(),
         };
 
         let body_bytes = serde_json::to_vec(&body)?;
@@ -405,6 +440,7 @@ impl ModelProvider for BedrockProvider {
                 temperature: request.temperature,
             }),
             tool_config: None,
+            guardrail_config: self.build_guardrail_config(),
         };
 
         let body_bytes = serde_json::to_vec(&body)?;

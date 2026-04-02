@@ -99,6 +99,8 @@ pub enum StreamEvent {
     ToolCall(serde_json::Value),
     Done(TokenUsage),
     Error(String),
+    /// Provider replay hook event (v2026.4.1).
+    Replay(serde_json::Value),
 }
 
 // ============================================================================
@@ -189,6 +191,11 @@ const OPENAI_COMPAT_PROVIDERS: &[OaiCompatDef] = &[
         name: "byteplus",
         default_base_url: "https://ark.ap-southeast.bytepluses.com/api/v3",
         env_key: "BYTEPLUS_API_KEY",
+    },
+    OaiCompatDef {
+        name: "zai",
+        default_base_url: "https://open.bigmodel.cn/api/paas/v4",
+        env_key: "ZAI_API_KEY",
     },
 ];
 

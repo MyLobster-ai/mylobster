@@ -3,6 +3,14 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+/// Shared search result type used by SearXNG and X search providers.
+#[derive(Debug)]
+struct SearchResult {
+    title: String,
+    url: String,
+    snippet: String,
+}
+
 /// Web search tool supporting Brave, Perplexity, and Grok (xAI) providers.
 pub struct WebSearchTool;
 
@@ -195,6 +203,14 @@ impl AgentTool for WebSearchTool {
             }
             "grok" => {
                 search_grok(query, context).await
+            }
+            // v2026.4.1: SearXNG bundled web search provider
+            "searxng" => {
+                searxng_search(query, &context.config).await
+            }
+            // v2026.4.1: X (Twitter) search via xAI Grok
+            "x" | "x_search" | "twitter" => {
+                x_search(query, &context.config).await
             }
             _ => Ok(ToolResult::error(format!(
                 "Unknown search provider: {}",
@@ -457,5 +473,170 @@ async fn search_grok(query: &str, context: &ToolContext) -> Result<ToolResult> {
         "citations": citations,
         "query": query,
         "provider": "grok"
+    })))
+}
+
+// ============================================================================
+// SearXNG Search (v2026.4.1)
+// ============================================================================
+
+/// SearXNG web search provider (v2026.4.1).
+async fn searxng_search(query: &str, config: &crate::config::Config) -> Result<ToolResult> {
+    let searxng_config = config.tools.web.search.as_ref()
+        .and_then(|s| s.searxng.as_ref());
+
+    let host = searxng_config
+        .and_then(|c| c.host.as_deref())
+        .unwrap_or("http://localhost:8888");
+
+    let max_results = searxng_config
+        .and_then(|c| c.max_results)
+        .unwrap_or(10);
+
+    let timeout_secs = searxng_config
+        .and_then(|c| c.timeout_seconds)
+        .unwrap_or(10);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()?;
+
+    let mut params: Vec<(&str, String)> = vec![
+        ("q", query.to_string()),
+        ("format", "json".to_string()),
+    ];
+
+    if let Some(engines) = searxng_config.and_then(|c| c.engines.as_ref()) {
+        params.push(("engines", engines.join(",")));
+    }
+    if let Some(lang) = searxng_config.and_then(|c| c.language.as_deref()) {
+        params.push(("language", lang.to_string()));
+    }
+
+    let response = client
+        .get(&format!("{}/search", host))
+        .query(&params)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Ok(ToolResult::error(format!(
+            "SearXNG returned status {}",
+            response.status()
+        )));
+    }
+
+    let resp: serde_json::Value = response.json().await?;
+
+    let results: Vec<SearchResult> = resp["results"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .take(max_results as usize)
+                .filter_map(|r| {
+                    Some(SearchResult {
+                        title: r["title"].as_str()?.to_string(),
+                        url: r["url"].as_str()?.to_string(),
+                        snippet: r["content"].as_str().unwrap_or("").to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let output: Vec<serde_json::Value> = results
+        .into_iter()
+        .map(|r| serde_json::json!({ "title": r.title, "url": r.url, "snippet": r.snippet }))
+        .collect();
+
+    Ok(ToolResult::json(serde_json::json!({
+        "results": output,
+        "query": query,
+        "provider": "searxng"
+    })))
+}
+
+// ============================================================================
+// X (Twitter) Search via xAI Grok (v2026.4.1)
+// ============================================================================
+
+/// X (Twitter) search via xAI Grok (v2026.4.1).
+async fn x_search(query: &str, config: &crate::config::Config) -> Result<ToolResult> {
+    let x_config = config.tools.web.search.as_ref()
+        .and_then(|s| s.x_search.as_ref());
+
+    let api_key = x_config
+        .and_then(|c| c.api_key.clone())
+        .or_else(|| std::env::var("XAI_API_KEY").ok())
+        .ok_or_else(|| anyhow::anyhow!("No xAI API key for X search"))?;
+
+    let model = x_config
+        .and_then(|c| c.model.as_deref())
+        .unwrap_or("grok-3");
+
+    let max_results = x_config
+        .and_then(|c| c.max_results)
+        .unwrap_or(10);
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post("https://api.x.ai/v1/chat/completions")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [{
+                "role": "user",
+                "content": format!("Search X/Twitter for: {}", query)
+            }],
+            "search": true,
+            "max_tokens": 1024
+        }))
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Ok(ToolResult::error(format!(
+            "xAI X search API error ({}): {}",
+            status, text
+        )));
+    }
+
+    let body: serde_json::Value = resp.json().await?;
+
+    let content = body["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("");
+
+    // Encode query for URL — use percent-encoding via the url crate
+    let encoded_query: String = query
+        .chars()
+        .flat_map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' {
+                vec![c]
+            } else {
+                format!("%{:02X}", c as u32).chars().collect()
+            }
+        })
+        .collect();
+
+    debug!("X search max_results config: {}", max_results);
+
+    let result = SearchResult {
+        title: format!("X search: {}", query),
+        url: format!("https://x.com/search?q={}", encoded_query),
+        snippet: content.chars().take(500).collect(),
+    };
+
+    Ok(ToolResult::json(serde_json::json!({
+        "results": [{
+            "title": result.title,
+            "url": result.url,
+            "snippet": result.snippet
+        }],
+        "query": query,
+        "provider": "x_search"
     })))
 }

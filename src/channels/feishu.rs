@@ -4,6 +4,7 @@ use crate::gateway::GatewayState;
 use anyhow::Result;
 use async_trait::async_trait;
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 // ============================================================================
@@ -29,6 +30,24 @@ pub struct FeishuChannel {
     enabled: Option<bool>,
     /// HTTP client for API calls.
     client: Client,
+}
+
+/// Feishu Drive comment event types (v2026.4.1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeishuDriveEvent {
+    CommentCreated {
+        comment_id: String,
+        doc_token: String,
+        content: String,
+        reply_to: Option<String>,
+    },
+    CommentReplied {
+        comment_id: String,
+        parent_id: String,
+        doc_token: String,
+        content: String,
+    },
 }
 
 /// Feishu API base URL.

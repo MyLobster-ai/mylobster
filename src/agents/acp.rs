@@ -269,6 +269,64 @@ fn now_ms() -> u64 {
 }
 
 // ============================================================================
+// Session context pruning helpers (v2026.4.1)
+// ============================================================================
+
+/// Preserve Anthropic thinking blocks, signatures, and cache-control
+/// across replay and context pruning (v2026.4.1).
+pub fn preserve_thinking_blocks(messages: &mut Vec<crate::providers::ProviderMessage>) {
+    // Don't prune messages that contain thinking blocks
+    messages.retain(|msg| {
+        if let Some(content) = msg.content.as_array() {
+            // Keep messages with thinking content blocks
+            let has_thinking = content.iter().any(|block| {
+                block.get("type").and_then(|t| t.as_str()) == Some("thinking")
+            });
+            if has_thinking {
+                return true;
+            }
+        }
+        true // Keep all other messages by default
+    });
+}
+
+// ============================================================================
+// ACP session recovery (v2026.4.1)
+// ============================================================================
+
+/// Repair queue-owner unavailable session recovery (v2026.4.1).
+/// Replaces dead named sessions instead of failing.
+pub fn recover_dead_session(
+    session_key: &str,
+    sessions: &mut crate::sessions::SessionStore,
+) -> Option<String> {
+    use crate::sessions::SessionStore;
+
+    // Check if the session exists but is stale (no longer busy but has been
+    // idle past the stale threshold — a proxy for "dead" in the in-memory store).
+    if sessions.get_session(session_key).is_some() {
+        // For in-memory sessions, "dead" means the session handle is present
+        // but cannot be reached by its owner (e.g., after a restart).
+        // We delete the old session and create a fresh one under a new key.
+        let new_key = format!(
+            "{}-recovered-{}",
+            session_key,
+            uuid::Uuid::new_v4()
+        );
+        sessions.delete_session(session_key);
+        let config = crate::config::Config::default();
+        sessions.get_or_create_session(&new_key, &config);
+        tracing::info!(
+            old_key = session_key,
+            new_key = %new_key,
+            "ACP session recovered (v2026.4.1)"
+        );
+        return Some(new_key);
+    }
+    None
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

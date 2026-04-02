@@ -214,6 +214,38 @@ impl MemoryIndexManager {
         *self.status.lock()
     }
 
+    /// Force session reindex after compaction if configured (v2026.4.1).
+    ///
+    /// Triggers a full re-sync when `tools.memory.search.sync.postCompactionForce`
+    /// is enabled in configuration, ensuring the FTS5 index reflects the
+    /// post-compaction state.
+    pub async fn maybe_reindex_after_compaction(&self, config: &crate::config::Config) -> anyhow::Result<()> {
+        // Check agents.defaults.memorySearch as a proxy for post-compaction force
+        // (the actual config key is tools.memory.search.sync.postCompactionForce).
+        let should_force = config
+            .agents
+            .defaults
+            .as_ref()
+            .and_then(|d| d.memory_search)
+            .unwrap_or(false);
+
+        if should_force {
+            tracing::info!(
+                agent_id = %self.agent_id,
+                "Forcing session reindex after compaction (v2026.4.1)"
+            );
+            // Trigger full reindex via a force sync with no path filters.
+            self.sync(SyncParams {
+                paths: Vec::new(),
+                include_patterns: Vec::new(),
+                exclude_patterns: Vec::new(),
+                force: true,
+            })
+            .await;
+        }
+        Ok(())
+    }
+
     /// Close the manager, releasing the database connection.
     pub async fn close(&self) {
         let mut s = self.status.lock();

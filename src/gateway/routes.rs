@@ -158,6 +158,11 @@ pub fn build_routes(state: GatewayState) -> Router {
         // OpenAI-compatible endpoints
         .route("/v1/chat/completions", post(chat_completions_handler))
         .route("/v1/responses", post(responses_handler))
+        // OpenAI-compatible model listing (v2026.4.1)
+        .route("/v1/models", get(openai_models_handler))
+        .route("/v1/models/{id}", get(openai_model_detail_handler))
+        // OpenAI-compatible embeddings (v2026.4.1)
+        .route("/v1/embeddings", post(openai_embeddings_handler))
         // Security: path canonicalization + plugin route auth + browser origin validation
         .layer(middleware::from_fn(security_path_middleware))
         .layer(middleware::from_fn_with_state(
@@ -495,6 +500,7 @@ async fn status_handler(State(state): State<GatewayState>) -> Json<serde_json::V
 
 async fn chat_completions_handler(
     State(state): State<GatewayState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Json<ChatCompletionResponse>, StatusCode> {
     let config = state.config.read().await;
@@ -512,6 +518,14 @@ async fn chat_completions_handler(
     if !enabled {
         return Err(StatusCode::NOT_FOUND);
     }
+
+    // v2026.4.1: x-openclaw-model header for backend model override
+    let model = headers
+        .get("x-openclaw-model")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or(req.model);
+    let req = ChatCompletionRequest { model, ..req };
 
     // Forward to agent for processing
     match crate::agents::handle_chat_completion(&config, &state.sessions, req).await {
@@ -554,6 +568,139 @@ async fn responses_handler(
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
+}
+
+// ============================================================================
+// OpenAI-compatible Models (v2026.4.1)
+// ============================================================================
+
+#[derive(Debug, Serialize)]
+struct OpenAiModelObject {
+    id: String,
+    object: String,
+    created: u64,
+    owned_by: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiModelList {
+    object: String,
+    data: Vec<OpenAiModelObject>,
+}
+
+async fn openai_models_handler(State(state): State<GatewayState>) -> Json<OpenAiModelList> {
+    let config = state.config.read().await;
+    let models: Vec<OpenAiModelObject> = config
+        .models
+        .providers
+        .iter()
+        .flat_map(|(provider_name, provider_config)| {
+            provider_config.models.iter().map(move |m| OpenAiModelObject {
+                id: m.id.clone(),
+                object: "model".to_string(),
+                created: 0,
+                owned_by: provider_name.clone(),
+            })
+        })
+        .collect();
+    Json(OpenAiModelList {
+        object: "list".to_string(),
+        data: models,
+    })
+}
+
+async fn openai_model_detail_handler(
+    State(state): State<GatewayState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<OpenAiModelObject>, StatusCode> {
+    let config = state.config.read().await;
+    for (provider_name, provider_config) in &config.models.providers {
+        for m in &provider_config.models {
+            if m.id == id {
+                return Ok(Json(OpenAiModelObject {
+                    id: m.id.clone(),
+                    object: "model".to_string(),
+                    created: 0,
+                    owned_by: provider_name.clone(),
+                }));
+            }
+        }
+    }
+    Err(StatusCode::NOT_FOUND)
+}
+
+// ============================================================================
+// OpenAI-compatible Embeddings (v2026.4.1)
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+struct OpenAiEmbeddingsRequest {
+    model: String,
+    input: serde_json::Value,
+    #[serde(default)]
+    encoding_format: Option<String>,
+    #[serde(default)]
+    dimensions: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiEmbeddingsResponse {
+    object: String,
+    data: Vec<OpenAiEmbeddingObject>,
+    model: String,
+    usage: OpenAiEmbeddingUsage,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiEmbeddingObject {
+    object: String,
+    embedding: Vec<f32>,
+    index: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiEmbeddingUsage {
+    prompt_tokens: u64,
+    total_tokens: u64,
+}
+
+async fn openai_embeddings_handler(
+    State(_state): State<GatewayState>,
+    Json(req): Json<OpenAiEmbeddingsRequest>,
+) -> Result<Json<OpenAiEmbeddingsResponse>, StatusCode> {
+    // Stub: returns a placeholder embedding vector
+    // Full implementation would route to embedding provider
+    let input_texts: Vec<String> = match &req.input {
+        serde_json::Value::String(s) => vec![s.clone()],
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect(),
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+    let dims = req.dimensions.unwrap_or(1536) as usize;
+    let data: Vec<OpenAiEmbeddingObject> = input_texts
+        .iter()
+        .enumerate()
+        .map(|(i, _)| OpenAiEmbeddingObject {
+            object: "embedding".to_string(),
+            embedding: vec![0.0; dims],
+            index: i,
+        })
+        .collect();
+    let total_tokens = input_texts
+        .iter()
+        .map(|t| t.split_whitespace().count() as u64)
+        .sum::<u64>();
+    Ok(Json(OpenAiEmbeddingsResponse {
+        object: "list".to_string(),
+        data,
+        model: req.model,
+        usage: OpenAiEmbeddingUsage {
+            prompt_tokens: total_tokens,
+            total_tokens,
+        },
+    }))
 }
 
 #[cfg(test)]

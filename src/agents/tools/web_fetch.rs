@@ -106,7 +106,28 @@ impl AgentTool for WebFetchTool {
             debug!("Cloudflare x-markdown-tokens: {}", md_tokens);
         }
 
-        let body = response.text().await?;
+        // v2026.4.1: configurable maxResponseBytes truncation limit
+        let max_bytes = context
+            .config
+            .tools
+            .web
+            .fetch
+            .as_ref()
+            .and_then(|f| f.max_response_bytes)
+            .unwrap_or(1_048_576); // 1MB default
+
+        let raw_bytes = response.bytes().await?;
+        let truncated_bytes = if raw_bytes.len() as u64 > max_bytes {
+            warn!(
+                "Response body truncated from {} to {} bytes (maxResponseBytes)",
+                raw_bytes.len(),
+                max_bytes
+            );
+            &raw_bytes[..max_bytes as usize]
+        } else {
+            &raw_bytes[..]
+        };
+        let body = String::from_utf8_lossy(truncated_bytes).into_owned();
 
         // Process content based on content-type
         let (text, extract_mode) = if content_type.contains("text/markdown") {

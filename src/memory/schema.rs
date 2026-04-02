@@ -126,6 +126,26 @@ fn migrate_v1(conn: &Connection) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// FTS5 configurable tokenizer (v2026.4.1)
+// ---------------------------------------------------------------------------
+
+/// Create FTS5 table SQL with configurable tokenizer (v2026.4.1).
+///
+/// Supports "unicode61" (default) and "trigram" (for CJK text).
+/// The combined "porter unicode61" tokenizer is used for `chunks_fts`
+/// in migration v1; this function is used when the tokenizer must be
+/// selected at runtime (e.g. per-agent memory configuration).
+pub fn create_fts_table_sql(tokenizer: Option<&str>) -> String {
+    let tok = tokenizer.unwrap_or("unicode61");
+    format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(\
+            content, source, session_key, tokenize='{}'\
+        )",
+        tok
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
