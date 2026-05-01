@@ -502,6 +502,14 @@ impl ModelProvider for AnthropicProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::ProviderMessage;
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // ------------------------------------------------------------------------
+    // 1M-context model eligibility
+    // ------------------------------------------------------------------------
 
     #[test]
     fn test_1m_eligible_opus_4() {
@@ -534,5 +542,676 @@ mod tests {
     fn test_not_1m_eligible_other_providers() {
         assert!(!is_1m_eligible_model("gpt-4"));
         assert!(!is_1m_eligible_model("gemini-pro"));
+    }
+
+    // ------------------------------------------------------------------------
+    // Test helpers
+    // ------------------------------------------------------------------------
+
+    fn user_msg(text: &str) -> ProviderMessage {
+        ProviderMessage {
+            role: "user".to_string(),
+            content: serde_json::Value::String(text.to_string()),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }
+    }
+
+    fn req(model: &str) -> ProviderRequest {
+        ProviderRequest {
+            model: model.to_string(),
+            messages: vec![user_msg("hi")],
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+        }
+    }
+
+    fn ok_response_json() -> serde_json::Value {
+        json!({
+            "id": "msg_01",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hello"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        })
+    }
+
+    async fn mock_with_body(body: serde_json::Value) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// Capture and decode the first POSTed request body and return (headers, body json).
+    async fn captured(
+        server: &MockServer,
+    ) -> (
+        std::collections::HashMap<String, String>,
+        serde_json::Value,
+    ) {
+        let reqs = server.received_requests().await.expect("requests recorded");
+        let r = reqs.first().expect("at least one request");
+        let mut hdrs = std::collections::HashMap::new();
+        for (name, val) in r.headers.iter() {
+            hdrs.insert(
+                name.as_str().to_ascii_lowercase(),
+                val.to_str().unwrap_or("").to_string(),
+            );
+        }
+        let body: serde_json::Value =
+            serde_json::from_slice(&r.body).expect("body is valid JSON");
+        (hdrs, body)
+    }
+
+    // ------------------------------------------------------------------------
+    // Headers
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn chat_sets_required_headers() {
+        let server = mock_with_body(ok_response_json()).await;
+        let p = AnthropicProvider::new(
+            "test-key".into(),
+            server.uri(),
+            "claude-3-5-sonnet-20241022".into(),
+        );
+        p.chat(req("claude-3-5-sonnet-20241022")).await.unwrap();
+        let (h, _) = captured(&server).await;
+        assert_eq!(h.get("x-api-key").map(String::as_str), Some("test-key"));
+        assert_eq!(
+            h.get("anthropic-version").map(String::as_str),
+            Some("2023-06-01")
+        );
+        assert_eq!(
+            h.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+        assert!(h
+            .get("user-agent")
+            .map(|v| v.starts_with("MyLobster/"))
+            .unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn chat_omits_anthropic_beta_when_no_thinking_no_1m() {
+        let server = mock_with_body(ok_response_json()).await;
+        let p = AnthropicProvider::new(
+            "k".into(),
+            server.uri(),
+            "claude-3-5-sonnet-20241022".into(),
+        );
+        p.chat(req("claude-3-5-sonnet-20241022")).await.unwrap();
+        let (h, _) = captured(&server).await;
+        assert!(h.get("anthropic-beta").is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_sets_thinking_beta_when_thinking_enabled() {
+        let server = mock_with_body(ok_response_json()).await;
+        let p = AnthropicProvider::new("k".into(), server.uri(), "claude-opus-4-20250514".into());
+        let mut r = req("claude-opus-4-20250514");
+        r.thinking = Some(ThinkingConfig { budget_tokens: 1024 });
+        p.chat(r).await.unwrap();
+        let (h, _) = captured(&server).await;
+        assert_eq!(
+            h.get("anthropic-beta").map(String::as_str),
+            Some("interleaved-thinking-2025-05-14")
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_sets_1m_beta_when_context1m_and_eligible_model() {
+        let server = mock_with_body(ok_response_json()).await;
+        let p = AnthropicProvider::new("k".into(), server.uri(), "claude-opus-4-20250514".into())
+            .with_context1m(true);
+        p.chat(req("claude-opus-4-20250514")).await.unwrap();
+        let (h, _) = captured(&server).await;
+        assert_eq!(
+            h.get("anthropic-beta").map(String::as_str),
+            Some("context-1m-2025-08-07")
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_omits_1m_beta_when_context1m_but_ineligible_model() {
+        let server = mock_with_body(ok_response_json()).await;
+        let p = AnthropicProvider::new(
+            "k".into(),
+            server.uri(),
+            "claude-3-5-sonnet-20241022".into(),
+        )
+        .with_context1m(true);
+        p.chat(req("claude-3-5-sonnet-20241022")).await.unwrap();
+        let (h, _) = captured(&server).await;
+        assert!(h.get("anthropic-beta").is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_combines_betas_when_thinking_and_1m() {
+        let server = mock_with_body(ok_response_json()).await;
+        let p = AnthropicProvider::new("k".into(), server.uri(), "claude-opus-4-20250514".into())
+            .with_context1m(true);
+        let mut r = req("claude-opus-4-20250514");
+        r.thinking = Some(ThinkingConfig { budget_tokens: 512 });
+        p.chat(r).await.unwrap();
+        let (h, _) = captured(&server).await;
+        let beta = h.get("anthropic-beta").map(String::as_str).unwrap_or("");
+        assert!(beta.contains("interleaved-thinking-2025-05-14"));
+        assert!(beta.contains("context-1m-2025-08-07"));
+        assert!(beta.contains(','), "betas should be comma-separated");
+    }
+
+    // ------------------------------------------------------------------------
+    // Request body
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn chat_default_max_tokens_4096_when_not_thinking() {
+        let server = mock_with_body(ok_response_json()).await;
+        let p = AnthropicProvider::new("k".into(), server.uri(), "m".into());
+        p.chat(req("m")).await.unwrap();
+        let (_, b) = captured(&server).await;
+        assert_eq!(b["max_tokens"], 4096);
+    }
+
+    #[tokio::test]
+    async fn chat_default_max_tokens_budget_plus_8192_when_thinking() {
+        let server = mock_with_body(ok_response_json()).await;
+        let p = AnthropicProvider::new("k".into(), server.uri(), "m".into());
+        let mut r = req("m");
+        r.thinking = Some(ThinkingConfig { budget_tokens: 1024 });
+        p.chat(r).await.unwrap();
+        let (_, b) = captured(&server).await;
+        assert_eq!(b["max_tokens"], 1024 + 8192);
+    }
+
+    #[tokio::test]
+    async fn chat_respects_explicit_max_tokens() {
+        let server = mock_with_body(ok_response_json()).await;
+        let p = AnthropicProvider::new("k".into(), server.uri(), "m".into());
+        let mut r = req("m");
+        r.max_tokens = Some(2048);
+        p.chat(r).await.unwrap();
+        let (_, b) = captured(&server).await;
+        assert_eq!(b["max_tokens"], 2048);
+    }
+
+    #[tokio::test]
+    async fn chat_passes_through_temperature_when_not_thinking() {
+        let server = mock_with_body(ok_response_json()).await;
+        let p = AnthropicProvider::new("k".into(), server.uri(), "m".into());
+        let mut r = req("m");
+        r.temperature = Some(0.7);
+        p.chat(r).await.unwrap();
+        let (_, b) = captured(&server).await;
+        assert_eq!(b["temperature"], 0.7);
+    }
+
+    #[tokio::test]
+    async fn chat_drops_temperature_when_thinking() {
+        let server = mock_with_body(ok_response_json()).await;
+        let p = AnthropicProvider::new("k".into(), server.uri(), "m".into());
+        let mut r = req("m");
+        r.temperature = Some(0.7);
+        r.thinking = Some(ThinkingConfig { budget_tokens: 100 });
+        p.chat(r).await.unwrap();
+        let (_, b) = captured(&server).await;
+        assert!(
+            b.get("temperature").is_none() || b["temperature"].is_null(),
+            "temperature should be omitted when thinking is enabled, got {:?}",
+            b.get("temperature")
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_sends_thinking_object_when_enabled() {
+        let server = mock_with_body(ok_response_json()).await;
+        let p = AnthropicProvider::new("k".into(), server.uri(), "m".into());
+        let mut r = req("m");
+        r.thinking = Some(ThinkingConfig { budget_tokens: 4096 });
+        p.chat(r).await.unwrap();
+        let (_, b) = captured(&server).await;
+        assert_eq!(b["thinking"]["type"], "enabled");
+        assert_eq!(b["thinking"]["budget_tokens"], 4096);
+    }
+
+    #[tokio::test]
+    async fn chat_does_not_send_stream_field() {
+        let server = mock_with_body(ok_response_json()).await;
+        let p = AnthropicProvider::new("k".into(), server.uri(), "m".into());
+        p.chat(req("m")).await.unwrap();
+        let (_, b) = captured(&server).await;
+        assert!(
+            b.get("stream").is_none() || b["stream"].is_null(),
+            "non-streaming chat should omit stream field"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_passes_through_tools_and_tool_choice() {
+        let server = mock_with_body(ok_response_json()).await;
+        let p = AnthropicProvider::new("k".into(), server.uri(), "m".into());
+        let mut r = req("m");
+        r.tools = Some(vec![json!({"name": "ping", "description": "p", "input_schema": {}})]);
+        r.tool_choice = Some(json!({"type": "auto"}));
+        p.chat(r).await.unwrap();
+        let (_, b) = captured(&server).await;
+        assert_eq!(b["tools"][0]["name"], "ping");
+        assert_eq!(b["tool_choice"]["type"], "auto");
+    }
+
+    #[tokio::test]
+    async fn chat_endpoint_is_v1_messages() {
+        let server = mock_with_body(ok_response_json()).await;
+        let p = AnthropicProvider::new("k".into(), server.uri(), "m".into());
+        p.chat(req("m")).await.unwrap();
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs[0].url.path(), "/v1/messages");
+    }
+
+    // ------------------------------------------------------------------------
+    // Non-streaming response parsing
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn chat_parses_text_response() {
+        let server = mock_with_body(json!({
+            "content": [{"type": "text", "text": "world"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        }))
+        .await;
+        let p = AnthropicProvider::new("k".into(), server.uri(), "m".into());
+        let r = p.chat(req("m")).await.unwrap();
+        assert_eq!(r.content.len(), 1);
+        assert!(matches!(&r.content[0], ContentBlock::Text(t) if t == "world"));
+        assert_eq!(r.stop_reason.as_deref(), Some("end_turn"));
+    }
+
+    #[tokio::test]
+    async fn chat_parses_thinking_response() {
+        let server = mock_with_body(json!({
+            "content": [
+                {"type": "thinking", "thinking": "reasoning..."},
+                {"type": "text", "text": "answer"}
+            ],
+            "stop_reason": "end_turn"
+        }))
+        .await;
+        let p = AnthropicProvider::new("k".into(), server.uri(), "m".into());
+        let r = p.chat(req("m")).await.unwrap();
+        assert_eq!(r.content.len(), 2);
+        assert!(matches!(&r.content[0], ContentBlock::Thinking(t) if t == "reasoning..."));
+        assert!(matches!(&r.content[1], ContentBlock::Text(t) if t == "answer"));
+    }
+
+    #[tokio::test]
+    async fn chat_parses_tool_use_response() {
+        let server = mock_with_body(json!({
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "weather",
+                "input": {"city": "SF"}
+            }],
+            "stop_reason": "tool_use"
+        }))
+        .await;
+        let p = AnthropicProvider::new("k".into(), server.uri(), "m".into());
+        let r = p.chat(req("m")).await.unwrap();
+        match &r.content[0] {
+            ContentBlock::ToolUse { id, name, input } => {
+                assert_eq!(id, "toolu_1");
+                assert_eq!(name, "weather");
+                assert_eq!(input["city"], "SF");
+            }
+            other => panic!("expected ToolUse, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_parses_usage_with_cache_tokens() {
+        let server = mock_with_body(json!({
+            "content": [{"type": "text", "text": "x"}],
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cache_read_input_tokens": 70,
+                "cache_creation_input_tokens": 30
+            }
+        }))
+        .await;
+        let p = AnthropicProvider::new("k".into(), server.uri(), "m".into());
+        let r = p.chat(req("m")).await.unwrap();
+        assert_eq!(r.usage.input_tokens, Some(100));
+        assert_eq!(r.usage.output_tokens, Some(50));
+        assert_eq!(r.usage.cache_read_tokens, Some(70));
+        assert_eq!(r.usage.cache_write_tokens, Some(30));
+    }
+
+    #[tokio::test]
+    async fn chat_handles_missing_usage() {
+        let server = mock_with_body(json!({
+            "content": [{"type": "text", "text": "x"}]
+        }))
+        .await;
+        let p = AnthropicProvider::new("k".into(), server.uri(), "m".into());
+        let r = p.chat(req("m")).await.unwrap();
+        assert!(r.usage.input_tokens.is_none());
+        assert!(r.usage.output_tokens.is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_returns_error_on_non_2xx() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(429).set_body_string(r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#),
+            )
+            .mount(&server)
+            .await;
+        let p = AnthropicProvider::new("k".into(), server.uri(), "m".into());
+        let err = p.chat(req("m")).await.unwrap_err().to_string();
+        assert!(err.contains("429"), "error should mention status: {}", err);
+        assert!(err.to_lowercase().contains("anthropic"), "error should mention provider: {}", err);
+    }
+
+    // ------------------------------------------------------------------------
+    // Streaming
+    // ------------------------------------------------------------------------
+
+    fn sse_response(body: &str) -> ResponseTemplate {
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string(body.to_string())
+    }
+
+    async fn collect_stream(
+        mut rx: mpsc::Receiver<StreamEvent>,
+    ) -> Vec<StreamEvent> {
+        let mut out = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            let done = matches!(ev, StreamEvent::Done(_) | StreamEvent::Error(_));
+            out.push(ev);
+            if done {
+                break;
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn stream_chat_sends_stream_true() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(sse_response(
+                "data: {\"type\":\"message_stop\"}\n\n",
+            ))
+            .mount(&server)
+            .await;
+        let p = AnthropicProvider::new("k".into(), server.uri(), "m".into());
+        let rx = p.stream_chat(req("m")).await.unwrap();
+        let _ = collect_stream(rx).await;
+        let (_, b) = captured(&server).await;
+        assert_eq!(b["stream"], true);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_emits_text_deltas() {
+        let body = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hel\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(sse_response(body))
+            .mount(&server)
+            .await;
+        let p = AnthropicProvider::new("k".into(), server.uri(), "m".into());
+        let rx = p.stream_chat(req("m")).await.unwrap();
+        let events = collect_stream(rx).await;
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Delta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["hel", "lo"]);
+        assert!(matches!(events.last(), Some(StreamEvent::Done(_))));
+    }
+
+    #[tokio::test]
+    async fn stream_chat_emits_thinking_deltas() {
+        let body = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"because\"}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(sse_response(body))
+            .mount(&server)
+            .await;
+        let p = AnthropicProvider::new("k".into(), server.uri(), "m".into());
+        let rx = p.stream_chat(req("m")).await.unwrap();
+        let events = collect_stream(rx).await;
+        let thinking: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Thinking(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking, vec!["because"]);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_accumulates_tool_use_and_emits_on_block_stop() {
+        let body = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_42\",\"name\":\"calc\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"x\\\":\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"42}\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(sse_response(body))
+            .mount(&server)
+            .await;
+        let p = AnthropicProvider::new("k".into(), server.uri(), "m".into());
+        let rx = p.stream_chat(req("m")).await.unwrap();
+        let events = collect_stream(rx).await;
+        let tool_calls: Vec<&serde_json::Value> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolCall(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_calls.len(), 1, "exactly one tool call should be emitted");
+        let tc = tool_calls[0];
+        assert_eq!(tc["id"], "tu_42");
+        assert_eq!(tc["name"], "calc");
+        assert_eq!(tc["input"]["x"], 42);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_captures_usage_from_message_start_and_delta() {
+        let body = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":40,\"cache_creation_input_tokens\":20}}}\n\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":17}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(sse_response(body))
+            .mount(&server)
+            .await;
+        let p = AnthropicProvider::new("k".into(), server.uri(), "m".into());
+        let rx = p.stream_chat(req("m")).await.unwrap();
+        let events = collect_stream(rx).await;
+        let usage = match events.last() {
+            Some(StreamEvent::Done(u)) => u.clone(),
+            other => panic!("expected Done as last event, got {:?}", other.is_some()),
+        };
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(17));
+        assert_eq!(usage.cache_read_tokens, Some(40));
+        assert_eq!(usage.cache_write_tokens, Some(20));
+    }
+
+    #[tokio::test]
+    async fn stream_chat_terminates_on_message_stop() {
+        let body = concat!(
+            "data: {\"type\":\"message_stop\"}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"AFTER\"}}\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(sse_response(body))
+            .mount(&server)
+            .await;
+        let p = AnthropicProvider::new("k".into(), server.uri(), "m".into());
+        let rx = p.stream_chat(req("m")).await.unwrap();
+        let events = collect_stream(rx).await;
+        let saw_after = events.iter().any(|e| matches!(e, StreamEvent::Delta(t) if t == "AFTER"));
+        assert!(!saw_after, "deltas after message_stop must not be emitted");
+    }
+
+    #[tokio::test]
+    async fn stream_chat_terminates_on_done_sentinel() {
+        let body = concat!(
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "data: [DONE]\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"AFTER\"}}\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(sse_response(body))
+            .mount(&server)
+            .await;
+        let p = AnthropicProvider::new("k".into(), server.uri(), "m".into());
+        let rx = p.stream_chat(req("m")).await.unwrap();
+        let events = collect_stream(rx).await;
+        let saw_after = events.iter().any(|e| matches!(e, StreamEvent::Delta(t) if t == "AFTER"));
+        assert!(!saw_after, "[DONE] sentinel must terminate stream");
+    }
+
+    #[tokio::test]
+    async fn stream_chat_emits_error_on_error_event() {
+        let body = concat!(
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"servers busy\"}}\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(sse_response(body))
+            .mount(&server)
+            .await;
+        let p = AnthropicProvider::new("k".into(), server.uri(), "m".into());
+        let rx = p.stream_chat(req("m")).await.unwrap();
+        let events = collect_stream(rx).await;
+        let last = events.last().expect("at least one event");
+        match last {
+            StreamEvent::Error(msg) => assert!(msg.contains("servers busy")),
+            _ => panic!("expected Error event, got something else"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_chat_ignores_ping_and_comment_lines() {
+        let body = concat!(
+            ": this is a comment\n",
+            "\n",
+            "data: {\"type\":\"ping\"}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(sse_response(body))
+            .mount(&server)
+            .await;
+        let p = AnthropicProvider::new("k".into(), server.uri(), "m".into());
+        let rx = p.stream_chat(req("m")).await.unwrap();
+        let events = collect_stream(rx).await;
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Delta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["ok"]);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_emits_error_on_non_2xx() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
+            .mount(&server)
+            .await;
+        let p = AnthropicProvider::new("bad-key".into(), server.uri(), "m".into());
+        let rx = p.stream_chat(req("m")).await.unwrap();
+        let events = collect_stream(rx).await;
+        match events.last() {
+            Some(StreamEvent::Error(msg)) => {
+                assert!(msg.contains("401"), "error should mention status: {}", msg);
+            }
+            other => panic!("expected Error event, got {:?}", other.is_some()),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_chat_skips_unparseable_events() {
+        let body = concat!(
+            "data: {this is not valid json}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"survived\"}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(sse_response(body))
+            .mount(&server)
+            .await;
+        let p = AnthropicProvider::new("k".into(), server.uri(), "m".into());
+        let rx = p.stream_chat(req("m")).await.unwrap();
+        let events = collect_stream(rx).await;
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Delta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["survived"]);
     }
 }
