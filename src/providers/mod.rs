@@ -1,6 +1,7 @@
 mod anthropic;
 mod anthropic_compat;
 mod bedrock;
+pub mod catalog;
 mod copilot;
 mod gemini;
 mod groq;
