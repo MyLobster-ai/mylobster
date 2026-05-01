@@ -651,4 +651,385 @@ mod tests {
         let ctx = registry.get_plugin_context().await.unwrap();
         assert_eq!(ctx.trigger.as_deref(), Some("cron"));
     }
+
+    // ====================================================================
+    // Parity expansion (OpenClaw v2026.4.29)
+    // ====================================================================
+
+    fn empty_session_event() -> HookEvent {
+        HookEvent::SessionStart {
+            session_key: String::new(),
+        }
+    }
+
+    /// Every documented HookEvent variant returns its declared event_type name.
+    #[test]
+    fn all_24_event_type_names_round_trip() {
+        let cases: &[(HookEvent, &str)] = &[
+            (HookEvent::BeforeModelResolve { prompt: String::new() }, "before_model_resolve"),
+            (HookEvent::BeforePromptBuild { session_key: String::new() }, "before_prompt_build"),
+            (HookEvent::BeforeAgentStart { session_key: String::new() }, "before_agent_start"),
+            (HookEvent::LlmInput { model: String::new(), messages: vec![] }, "llm_input"),
+            (HookEvent::LlmOutput { model: String::new(), response: serde_json::Value::Null }, "llm_output"),
+            (HookEvent::AgentEnd { session_key: String::new(), input_tokens: None, output_tokens: None }, "agent_end"),
+            (HookEvent::BeforeCompaction { session_key: String::new() }, "before_compaction"),
+            (HookEvent::AfterCompaction { session_key: String::new() }, "after_compaction"),
+            (HookEvent::BeforeReset { session_key: String::new() }, "before_reset"),
+            (HookEvent::MessageReceived { from: String::new(), content: String::new(), timestamp: None }, "message_received"),
+            (HookEvent::MessageSending { to: String::new(), content: String::new() }, "message_sending"),
+            (HookEvent::MessageSent { to: String::new(), content: String::new(), success: true, error: None }, "message_sent"),
+            (HookEvent::BeforeToolCall { tool: String::new(), params: serde_json::Value::Null }, "before_tool_call"),
+            (HookEvent::AfterToolCall { tool: String::new(), result: serde_json::Value::Null }, "after_tool_call"),
+            (HookEvent::ToolResultPersist { tool: String::new(), result: serde_json::Value::Null }, "tool_result_persist"),
+            (HookEvent::BeforeMessageWrite { message: serde_json::Value::Null }, "before_message_write"),
+            (HookEvent::SessionStart { session_key: String::new() }, "session_start"),
+            (HookEvent::SessionEnd { session_key: String::new() }, "session_end"),
+            (HookEvent::SubagentSpawning { parent: String::new(), child: String::new() }, "subagent_spawning"),
+            (HookEvent::SubagentSpawned { parent: String::new(), child: String::new() }, "subagent_spawned"),
+            (HookEvent::SubagentDeliveryTarget { session_key: String::new() }, "subagent_delivery_target"),
+            (HookEvent::SubagentEnded { session_key: String::new() }, "subagent_ended"),
+            (HookEvent::GatewayStart, "gateway_start"),
+            (HookEvent::GatewayStop, "gateway_stop"),
+        ];
+        for (ev, expected) in cases {
+            assert_eq!(ev.event_type(), *expected, "wrong event_type for {:?}", ev);
+        }
+        assert_eq!(cases.len(), 24, "should cover all 24 hook event variants");
+    }
+
+    /// All seven event variants documented as modifying return is_modifying() == true.
+    #[test]
+    fn all_modifying_events_classified_as_modifying() {
+        let modifying: &[HookEvent] = &[
+            HookEvent::BeforeModelResolve { prompt: String::new() },
+            HookEvent::MessageSending { to: String::new(), content: String::new() },
+            HookEvent::BeforeToolCall { tool: String::new(), params: serde_json::Value::Null },
+            HookEvent::ToolResultPersist { tool: String::new(), result: serde_json::Value::Null },
+            HookEvent::BeforeMessageWrite { message: serde_json::Value::Null },
+            HookEvent::SubagentSpawning { parent: String::new(), child: String::new() },
+            HookEvent::SubagentDeliveryTarget { session_key: String::new() },
+        ];
+        for ev in modifying {
+            assert!(ev.is_modifying(), "{:?} should be modifying", ev);
+        }
+    }
+
+    /// Non-modifying events that flowed through the chain in v2026.4.29 — emitted as
+    /// notifications only, never able to cancel/override.
+    #[test]
+    fn non_modifying_events_classified_as_not_modifying() {
+        let non_modifying: &[HookEvent] = &[
+            HookEvent::BeforePromptBuild { session_key: String::new() },
+            HookEvent::BeforeAgentStart { session_key: String::new() },
+            HookEvent::LlmInput { model: String::new(), messages: vec![] },
+            HookEvent::LlmOutput { model: String::new(), response: serde_json::Value::Null },
+            HookEvent::AgentEnd { session_key: String::new(), input_tokens: None, output_tokens: None },
+            HookEvent::BeforeCompaction { session_key: String::new() },
+            HookEvent::AfterCompaction { session_key: String::new() },
+            HookEvent::BeforeReset { session_key: String::new() },
+            HookEvent::MessageReceived { from: String::new(), content: String::new(), timestamp: None },
+            HookEvent::MessageSent { to: String::new(), content: String::new(), success: true, error: None },
+            HookEvent::AfterToolCall { tool: String::new(), result: serde_json::Value::Null },
+            HookEvent::SessionStart { session_key: String::new() },
+            HookEvent::SessionEnd { session_key: String::new() },
+            HookEvent::SubagentSpawned { parent: String::new(), child: String::new() },
+            HookEvent::SubagentEnded { session_key: String::new() },
+            HookEvent::GatewayStart,
+            HookEvent::GatewayStop,
+        ];
+        for ev in non_modifying {
+            assert!(!ev.is_modifying(), "{:?} should NOT be modifying", ev);
+        }
+    }
+
+    #[test]
+    fn modifying_hook_override_returns_data() {
+        let mut registry = HookRegistry::new();
+        registry.on_modifying(
+            "before_message_write",
+            Arc::new(|_| HookResult::Override {
+                data: serde_json::json!({"replaced": true}),
+            }),
+        );
+        let result = registry.emit_modifying(HookEvent::BeforeMessageWrite {
+            message: serde_json::json!({"original": true}),
+        });
+        match result {
+            HookResult::Override { data } => assert_eq!(data["replaced"], true),
+            other => panic!("expected Override, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn modifying_hook_transform_returns_content() {
+        let mut registry = HookRegistry::new();
+        registry.on_modifying(
+            "message_sending",
+            Arc::new(|ev| match ev {
+                HookEvent::MessageSending { content, .. } => HookResult::Transform {
+                    content: format!("[censored] {}", content),
+                },
+                _ => HookResult::Continue,
+            }),
+        );
+        let result = registry.emit_modifying(HookEvent::MessageSending {
+            to: "u".into(),
+            content: "secret".into(),
+        });
+        match result {
+            HookResult::Transform { content } => assert_eq!(content, "[censored] secret"),
+            _ => panic!("expected Transform"),
+        }
+    }
+
+    #[test]
+    fn modifying_hook_chain_runs_through_continue_results() {
+        let mut registry = HookRegistry::new();
+        let counter = Arc::new(AtomicUsize::new(0));
+        for _ in 0..3 {
+            let c = counter.clone();
+            registry.on_modifying(
+                "before_tool_call",
+                Arc::new(move |_| {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    HookResult::Continue
+                }),
+            );
+        }
+        let result = registry.emit_modifying(HookEvent::BeforeToolCall {
+            tool: "x".into(),
+            params: serde_json::Value::Null,
+        });
+        assert!(matches!(result, HookResult::Continue));
+        assert_eq!(counter.load(Ordering::SeqCst), 3, "all 3 handlers ran");
+    }
+
+    #[test]
+    fn modifying_hook_cancel_short_circuits_remaining_handlers() {
+        let mut registry = HookRegistry::new();
+        let after_counter = Arc::new(AtomicUsize::new(0));
+
+        registry.on_modifying_with_priority(
+            "before_tool_call",
+            1,
+            Arc::new(|_| HookResult::Cancel { reason: "stop".into() }),
+        );
+        let c = after_counter.clone();
+        registry.on_modifying_with_priority(
+            "before_tool_call",
+            2,
+            Arc::new(move |_| {
+                c.fetch_add(1, Ordering::SeqCst);
+                HookResult::Continue
+            }),
+        );
+
+        let result = registry.emit_modifying(HookEvent::BeforeToolCall {
+            tool: "x".into(),
+            params: serde_json::Value::Null,
+        });
+        assert!(matches!(result, HookResult::Cancel { .. }));
+        assert_eq!(
+            after_counter.load(Ordering::SeqCst),
+            0,
+            "handlers after Cancel must not run"
+        );
+    }
+
+    #[test]
+    fn modifying_hook_override_short_circuits_remaining_handlers() {
+        let mut registry = HookRegistry::new();
+        let after_counter = Arc::new(AtomicUsize::new(0));
+
+        registry.on_modifying_with_priority(
+            "before_message_write",
+            1,
+            Arc::new(|_| HookResult::Override { data: serde_json::Value::Null }),
+        );
+        let c = after_counter.clone();
+        registry.on_modifying_with_priority(
+            "before_message_write",
+            2,
+            Arc::new(move |_| {
+                c.fetch_add(1, Ordering::SeqCst);
+                HookResult::Continue
+            }),
+        );
+
+        let _ = registry.emit_modifying(HookEvent::BeforeMessageWrite {
+            message: serde_json::Value::Null,
+        });
+        assert_eq!(after_counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn modifying_priority_runs_sequentially_in_ascending_order() {
+        let mut registry = HookRegistry::new();
+        let order = Arc::new(std::sync::Mutex::new(Vec::<i32>::new()));
+
+        let make_handler = |o: Arc<std::sync::Mutex<Vec<i32>>>, mark: i32| {
+            Arc::new(move |_ev: HookEvent| {
+                o.lock().unwrap().push(mark);
+                HookResult::Continue
+            }) as ModifyingHookHandler
+        };
+
+        registry.on_modifying_with_priority("before_tool_call", 50, make_handler(order.clone(), 50));
+        registry.on_modifying_with_priority("before_tool_call", 1, make_handler(order.clone(), 1));
+        registry.on_modifying_with_priority("before_tool_call", 10, make_handler(order.clone(), 10));
+
+        let _ = registry.emit_modifying(HookEvent::BeforeToolCall {
+            tool: "x".into(),
+            params: serde_json::Value::Null,
+        });
+        assert_eq!(*order.lock().unwrap(), vec![1, 10, 50]);
+    }
+
+    #[test]
+    fn emit_modifying_with_no_handlers_returns_continue() {
+        let registry = HookRegistry::new();
+        let result = registry.emit_modifying(empty_session_event());
+        assert!(matches!(result, HookResult::Continue));
+    }
+
+    #[test]
+    fn emit_modifying_falls_through_to_fire_and_forget_when_all_continue() {
+        let mut registry = HookRegistry::new();
+        let fire_counter = Arc::new(AtomicUsize::new(0));
+
+        registry.on_modifying(
+            "before_tool_call",
+            Arc::new(|_| HookResult::Continue),
+        );
+        let c = fire_counter.clone();
+        registry.on(
+            "before_tool_call",
+            Arc::new(move |_| {
+                c.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        let _ = registry.emit_modifying(HookEvent::BeforeToolCall {
+            tool: "x".into(),
+            params: serde_json::Value::Null,
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(fire_counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn emit_modifying_skips_fire_and_forget_when_short_circuited() {
+        let mut registry = HookRegistry::new();
+        let fire_counter = Arc::new(AtomicUsize::new(0));
+
+        registry.on_modifying(
+            "before_tool_call",
+            Arc::new(|_| HookResult::Cancel { reason: "no".into() }),
+        );
+        let c = fire_counter.clone();
+        registry.on(
+            "before_tool_call",
+            Arc::new(move |_| {
+                c.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        let _ = registry.emit_modifying(HookEvent::BeforeToolCall {
+            tool: "x".into(),
+            params: serde_json::Value::Null,
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            fire_counter.load(Ordering::SeqCst),
+            0,
+            "short-circuited result must not fire fire-and-forget handlers"
+        );
+    }
+
+    #[test]
+    fn fire_and_forget_handler_receives_event_data() {
+        let mut registry = HookRegistry::new();
+        let captured = Arc::new(std::sync::Mutex::new(None::<(String, String)>));
+        let cap = captured.clone();
+        registry.on(
+            "message_received",
+            Arc::new(move |ev| {
+                if let HookEvent::MessageReceived { from, content, .. } = ev {
+                    *cap.lock().unwrap() = Some((from, content));
+                }
+            }),
+        );
+        registry.emit(HookEvent::MessageReceived {
+            from: "alice".into(),
+            content: "hi".into(),
+            timestamp: Some(100),
+        });
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        let got = captured.lock().unwrap().clone();
+        assert_eq!(got, Some(("alice".to_string(), "hi".to_string())));
+    }
+
+    #[tokio::test]
+    async fn shared_registry_emit_runs_fire_and_forget() {
+        let registry = SharedHookRegistry::new();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+        registry
+            .on(
+                "gateway_start",
+                Arc::new(move |_| {
+                    c.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
+            .await;
+        registry.emit(HookEvent::GatewayStart).await;
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn shared_registry_emit_modifying_returns_handler_result() {
+        let registry = SharedHookRegistry::new();
+        registry
+            .on_modifying(
+                "message_sending",
+                Arc::new(|_| HookResult::Transform {
+                    content: "rewritten".into(),
+                }),
+            )
+            .await;
+        let result = registry
+            .emit_modifying(HookEvent::MessageSending {
+                to: "u".into(),
+                content: "original".into(),
+            })
+            .await;
+        match result {
+            HookResult::Transform { content } => assert_eq!(content, "rewritten"),
+            _ => panic!("expected Transform"),
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_registry_isolated_event_types() {
+        // Handlers registered for one event type must not fire for another.
+        let registry = SharedHookRegistry::new();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+        registry
+            .on(
+                "gateway_start",
+                Arc::new(move |_| {
+                    c.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
+            .await;
+        registry.emit(HookEvent::GatewayStop).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "gateway_start handler must not fire on gateway_stop"
+        );
+    }
 }
