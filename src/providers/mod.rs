@@ -197,6 +197,16 @@ const OPENAI_COMPAT_PROVIDERS: &[OaiCompatDef] = &[
         default_base_url: "https://open.bigmodel.cn/api/paas/v4",
         env_key: "ZAI_API_KEY",
     },
+    OaiCompatDef {
+        name: "cerebras",
+        default_base_url: "https://api.cerebras.ai/v1",
+        env_key: "CEREBRAS_API_KEY",
+    },
+    OaiCompatDef {
+        name: "deepinfra",
+        default_base_url: "https://api.deepinfra.com/v1/openai",
+        env_key: "DEEPINFRA_API_KEY",
+    },
 ];
 
 /// Configuration for an Anthropic-compatible provider.
@@ -504,6 +514,8 @@ fn detect_provider(config: &Config, model: &str) -> &'static str {
             "xai" | "grok" => "xai",
             "copilot" | "github" => "copilot",
             "bedrock" | "aws" => "bedrock",
+            "cerebras" => "cerebras",
+            "deepinfra" => "deepinfra",
             _ => "",
         };
         if !mapped.is_empty() {
@@ -587,6 +599,8 @@ pub fn resolve_implicit_providers() -> Vec<&'static str> {
         ("MIMO_API_KEY", "mimo"),
         ("KIMI_API_KEY", "kimi"),
         ("CLOUDFLARE_AI_API_KEY", "cloudflare"),
+        ("CEREBRAS_API_KEY", "cerebras"),
+        ("DEEPINFRA_API_KEY", "deepinfra"),
     ];
 
     for (env_var, provider) in env_checks {
@@ -865,4 +879,77 @@ mod tests {
         assert!(names.contains(&"mimo"));
         assert!(names.contains(&"kimi"));
     }
+
+    // ====================================================================
+    // v2026.4.26 — Cerebras as bundled OpenAI-compatible provider
+    // ====================================================================
+
+    #[test]
+    fn detect_cerebras_prefix() {
+        let config = Config::default();
+        assert_eq!(detect_provider(&config, "cerebras/llama-3.3-70b"), "cerebras");
+    }
+
+    #[test]
+    fn openai_compat_includes_cerebras() {
+        assert!(OPENAI_COMPAT_PROVIDERS.iter().any(|p| p.name == "cerebras"));
+    }
+
+    #[test]
+    fn openai_compat_cerebras_base_url() {
+        let cerebras = OPENAI_COMPAT_PROVIDERS
+            .iter()
+            .find(|p| p.name == "cerebras")
+            .unwrap();
+        assert_eq!(cerebras.default_base_url, "https://api.cerebras.ai/v1");
+    }
+
+    #[test]
+    fn openai_compat_cerebras_env_key() {
+        let cerebras = OPENAI_COMPAT_PROVIDERS
+            .iter()
+            .find(|p| p.name == "cerebras")
+            .unwrap();
+        assert_eq!(cerebras.env_key, "CEREBRAS_API_KEY");
+    }
+
+    // ====================================================================
+    // v2026.4.27 — DeepInfra as bundled OpenAI-compatible provider
+    // ====================================================================
+
+    #[test]
+    fn detect_deepinfra_prefix() {
+        let config = Config::default();
+        assert_eq!(
+            detect_provider(&config, "deepinfra/meta-llama/Llama-3.3-70B-Instruct"),
+            "deepinfra"
+        );
+    }
+
+    #[test]
+    fn openai_compat_includes_deepinfra() {
+        assert!(OPENAI_COMPAT_PROVIDERS.iter().any(|p| p.name == "deepinfra"));
+    }
+
+    #[test]
+    fn openai_compat_deepinfra_base_url() {
+        let deepinfra = OPENAI_COMPAT_PROVIDERS
+            .iter()
+            .find(|p| p.name == "deepinfra")
+            .unwrap();
+        assert_eq!(
+            deepinfra.default_base_url,
+            "https://api.deepinfra.com/v1/openai"
+        );
+    }
+
+    #[test]
+    fn openai_compat_deepinfra_env_key() {
+        let deepinfra = OPENAI_COMPAT_PROVIDERS
+            .iter()
+            .find(|p| p.name == "deepinfra")
+            .unwrap();
+        assert_eq!(deepinfra.env_key, "DEEPINFRA_API_KEY");
+    }
+
 }
