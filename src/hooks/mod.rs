@@ -3,7 +3,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 // ============================================================================
-// Hook Events (24 types matching OpenClaw)
+// Hook Events (26 types matching OpenClaw — 24 base + before_agent_finalize
+// (v2026.4.25) + cron_changed (v2026.4.26))
 // ============================================================================
 
 /// Events fired during the agent/gateway lifecycle.
@@ -31,6 +32,13 @@ pub enum HookEvent {
         session_key: String,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
+    },
+    /// Fires after the agent has produced its response and before it is
+    /// finalized/persisted. Modifying hook; can override or cancel.
+    /// (OpenClaw v2026.4.25)
+    BeforeAgentFinalize {
+        session_key: String,
+        response: serde_json::Value,
     },
     BeforeCompaction {
         session_key: String,
@@ -103,6 +111,32 @@ pub enum HookEvent {
     // Gateway hooks
     GatewayStart,
     GatewayStop,
+
+    /// Fires when a gateway-owned cron job is created, updated, or removed.
+    /// (OpenClaw v2026.4.26)
+    CronChanged {
+        job_id: String,
+        change: CronChangeKind,
+        schedule: Option<String>,
+    },
+}
+
+/// Kind of change for a `CronChanged` hook event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CronChangeKind {
+    Created,
+    Updated,
+    Removed,
+}
+
+impl CronChangeKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CronChangeKind::Created => "created",
+            CronChangeKind::Updated => "updated",
+            CronChangeKind::Removed => "removed",
+        }
+    }
 }
 
 /// Plugin context carried through all hook phases (v2026.3.11).
@@ -131,6 +165,7 @@ impl HookEvent {
             HookEvent::LlmInput { .. } => "llm_input",
             HookEvent::LlmOutput { .. } => "llm_output",
             HookEvent::AgentEnd { .. } => "agent_end",
+            HookEvent::BeforeAgentFinalize { .. } => "before_agent_finalize",
             HookEvent::BeforeCompaction { .. } => "before_compaction",
             HookEvent::AfterCompaction { .. } => "after_compaction",
             HookEvent::BeforeReset { .. } => "before_reset",
@@ -149,6 +184,7 @@ impl HookEvent {
             HookEvent::SubagentEnded { .. } => "subagent_ended",
             HookEvent::GatewayStart => "gateway_start",
             HookEvent::GatewayStop => "gateway_stop",
+            HookEvent::CronChanged { .. } => "cron_changed",
         }
     }
 
@@ -163,6 +199,7 @@ impl HookEvent {
                 | HookEvent::BeforeMessageWrite { .. }
                 | HookEvent::SubagentSpawning { .. }
                 | HookEvent::SubagentDeliveryTarget { .. }
+                | HookEvent::BeforeAgentFinalize { .. }
         )
     }
 }
@@ -664,7 +701,7 @@ mod tests {
 
     /// Every documented HookEvent variant returns its declared event_type name.
     #[test]
-    fn all_24_event_type_names_round_trip() {
+    fn all_event_type_names_round_trip() {
         let cases: &[(HookEvent, &str)] = &[
             (HookEvent::BeforeModelResolve { prompt: String::new() }, "before_model_resolve"),
             (HookEvent::BeforePromptBuild { session_key: String::new() }, "before_prompt_build"),
@@ -672,6 +709,7 @@ mod tests {
             (HookEvent::LlmInput { model: String::new(), messages: vec![] }, "llm_input"),
             (HookEvent::LlmOutput { model: String::new(), response: serde_json::Value::Null }, "llm_output"),
             (HookEvent::AgentEnd { session_key: String::new(), input_tokens: None, output_tokens: None }, "agent_end"),
+            (HookEvent::BeforeAgentFinalize { session_key: String::new(), response: serde_json::Value::Null }, "before_agent_finalize"),
             (HookEvent::BeforeCompaction { session_key: String::new() }, "before_compaction"),
             (HookEvent::AfterCompaction { session_key: String::new() }, "after_compaction"),
             (HookEvent::BeforeReset { session_key: String::new() }, "before_reset"),
@@ -690,14 +728,15 @@ mod tests {
             (HookEvent::SubagentEnded { session_key: String::new() }, "subagent_ended"),
             (HookEvent::GatewayStart, "gateway_start"),
             (HookEvent::GatewayStop, "gateway_stop"),
+            (HookEvent::CronChanged { job_id: String::new(), change: CronChangeKind::Created, schedule: None }, "cron_changed"),
         ];
         for (ev, expected) in cases {
             assert_eq!(ev.event_type(), *expected, "wrong event_type for {:?}", ev);
         }
-        assert_eq!(cases.len(), 24, "should cover all 24 hook event variants");
+        assert_eq!(cases.len(), 26, "should cover all 26 hook event variants (24 base + before_agent_finalize v2026.4.25 + cron_changed v2026.4.26)");
     }
 
-    /// All seven event variants documented as modifying return is_modifying() == true.
+    /// All event variants documented as modifying return is_modifying() == true.
     #[test]
     fn all_modifying_events_classified_as_modifying() {
         let modifying: &[HookEvent] = &[
@@ -708,6 +747,9 @@ mod tests {
             HookEvent::BeforeMessageWrite { message: serde_json::Value::Null },
             HookEvent::SubagentSpawning { parent: String::new(), child: String::new() },
             HookEvent::SubagentDeliveryTarget { session_key: String::new() },
+            // v2026.4.25 — before_agent_finalize is modifying so plugins can
+            // intercept the final response.
+            HookEvent::BeforeAgentFinalize { session_key: String::new(), response: serde_json::Value::Null },
         ];
         for ev in modifying {
             assert!(ev.is_modifying(), "{:?} should be modifying", ev);
@@ -736,10 +778,117 @@ mod tests {
             HookEvent::SubagentEnded { session_key: String::new() },
             HookEvent::GatewayStart,
             HookEvent::GatewayStop,
+            // v2026.4.26 — cron_changed is notification-only, never modifying.
+            HookEvent::CronChanged { job_id: String::new(), change: CronChangeKind::Updated, schedule: None },
         ];
         for ev in non_modifying {
             assert!(!ev.is_modifying(), "{:?} should NOT be modifying", ev);
         }
+    }
+
+    // ====================================================================
+    // v2026.4.25 — before_agent_finalize hook
+    // ====================================================================
+
+    #[test]
+    fn before_agent_finalize_event_type() {
+        let ev = HookEvent::BeforeAgentFinalize {
+            session_key: "abc".into(),
+            response: serde_json::json!({"text": "hi"}),
+        };
+        assert_eq!(ev.event_type(), "before_agent_finalize");
+    }
+
+    #[test]
+    fn before_agent_finalize_is_modifying() {
+        let ev = HookEvent::BeforeAgentFinalize {
+            session_key: String::new(),
+            response: serde_json::Value::Null,
+        };
+        assert!(ev.is_modifying());
+    }
+
+    #[tokio::test]
+    async fn before_agent_finalize_can_transform_response() {
+        let registry = SharedHookRegistry::new();
+        registry
+            .on_modifying(
+                "before_agent_finalize",
+                Arc::new(|_| HookResult::Transform {
+                    content: "redacted".into(),
+                }),
+            )
+            .await;
+
+        let result = registry
+            .emit_modifying(HookEvent::BeforeAgentFinalize {
+                session_key: "s".into(),
+                response: serde_json::json!({"text": "secret token: ABC123"}),
+            })
+            .await;
+
+        match result {
+            HookResult::Transform { content } => assert_eq!(content, "redacted"),
+            other => panic!("expected Transform, got {:?}", other),
+        }
+    }
+
+    // ====================================================================
+    // v2026.4.26 — cron_changed typed hook
+    // ====================================================================
+
+    #[test]
+    fn cron_changed_event_type() {
+        let ev = HookEvent::CronChanged {
+            job_id: "daily-summary".into(),
+            change: CronChangeKind::Created,
+            schedule: Some("0 9 * * *".into()),
+        };
+        assert_eq!(ev.event_type(), "cron_changed");
+    }
+
+    #[test]
+    fn cron_changed_is_not_modifying() {
+        let ev = HookEvent::CronChanged {
+            job_id: String::new(),
+            change: CronChangeKind::Removed,
+            schedule: None,
+        };
+        assert!(!ev.is_modifying());
+    }
+
+    #[test]
+    fn cron_change_kind_strings() {
+        assert_eq!(CronChangeKind::Created.as_str(), "created");
+        assert_eq!(CronChangeKind::Updated.as_str(), "updated");
+        assert_eq!(CronChangeKind::Removed.as_str(), "removed");
+    }
+
+    #[tokio::test]
+    async fn cron_changed_handlers_receive_event() {
+        let registry = SharedHookRegistry::new();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+        registry
+            .on(
+                "cron_changed",
+                Arc::new(move |_| {
+                    c.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
+            .await;
+
+        registry
+            .emit(HookEvent::CronChanged {
+                job_id: "test".into(),
+                change: CronChangeKind::Created,
+                schedule: Some("*/5 * * * *".into()),
+            })
+            .await;
+
+        // Give fire-and-forget tasks a moment to run.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
     #[test]
