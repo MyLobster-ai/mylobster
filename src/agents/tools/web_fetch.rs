@@ -50,12 +50,25 @@ impl AgentTool for WebFetchTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(200_000) as usize;
 
-        // SSRF protection
+        // SSRF protection — first the static URL/hostname check
         let url = Url::parse(url_str)?;
         if is_ssrf_target(&url) {
             return Ok(ToolResult::error(
                 "URL targets a private/internal address (SSRF protection)",
             ));
+        }
+
+        // Then the dynamic DNS-resolution check: if the hostname resolves to any
+        // private/internal IP, block the request. Defends against DNS rebinding
+        // and against hostnames that resolve to RFC1918 / link-local space.
+        if let Some(host) = url.host_str() {
+            // Skip when the host is already an IP literal — is_ssrf_target above
+            // already validated it. Only re-resolve names.
+            if host.parse::<std::net::IpAddr>().is_err() && hostname_resolves_to_private_ip(host).await {
+                return Ok(ToolResult::error(
+                    "URL hostname resolves to a private/internal address (SSRF protection)",
+                ));
+            }
         }
 
         let client = reqwest::Client::builder()
@@ -186,8 +199,13 @@ fn is_ssrf_target(url: &Url) -> bool {
             return true;
         }
 
-        // Block private IP ranges
-        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        // Block private IP ranges. host_str() returns IPv6 in bracketed form
+        // (e.g. "[fc00::1]") per RFC 3986; strip the brackets before parsing.
+        let ip_str = host
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(host);
+        if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
             return is_private_ip(ip);
         }
 
@@ -378,11 +396,142 @@ fn is_private_ip(ip: std::net::IpAddr) -> bool {
                 return is_private_ipv4(&embedded);
             }
 
-            // TODO: Add DNS re-check — currently we only check the URL hostname,
-            // not the resolved IP. A future enhancement should perform async DNS
-            // resolution and re-validate the resolved address.
-
             false
         }
+    }
+}
+
+/// Resolve the hostname and return true if ANY resolved address is private/
+/// internal. Uses port 80 as a placeholder since we only need the address
+/// list. On resolution failure, returns false — the request will then fail
+/// at connection time, which is acceptable.
+async fn hostname_resolves_to_private_ip(host: &str) -> bool {
+    let target = format!("{}:80", host);
+    match tokio::net::lookup_host(target).await {
+        Ok(addrs) => {
+            for addr in addrs {
+                if is_private_ip(addr.ip()) {
+                    return true;
+                }
+            }
+            false
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod ssrf_tests {
+    use super::*;
+
+    fn url(s: &str) -> Url {
+        Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn ssrf_blocks_localhost_literal() {
+        assert!(is_ssrf_target(&url("http://localhost/x")));
+        assert!(is_ssrf_target(&url("https://localhost:8080/x")));
+    }
+
+    #[test]
+    fn ssrf_blocks_127_0_0_1() {
+        assert!(is_ssrf_target(&url("http://127.0.0.1/")));
+    }
+
+    #[test]
+    fn ssrf_blocks_ipv6_loopback() {
+        assert!(is_ssrf_target(&url("http://[::1]/")));
+    }
+
+    #[test]
+    fn ssrf_blocks_aws_imdsv2_endpoint() {
+        assert!(is_ssrf_target(&url("http://169.254.169.254/latest/meta-data/")));
+    }
+
+    #[test]
+    fn ssrf_blocks_gcp_metadata_endpoint() {
+        assert!(is_ssrf_target(&url(
+            "http://metadata.google.internal/computeMetadata/v1/"
+        )));
+    }
+
+    #[test]
+    fn ssrf_blocks_internal_tld() {
+        assert!(is_ssrf_target(&url("http://service.internal/")));
+    }
+
+    #[test]
+    fn ssrf_blocks_local_tld() {
+        assert!(is_ssrf_target(&url("http://printer.local/")));
+    }
+
+    #[test]
+    fn ssrf_blocks_kubernetes_svc_dns() {
+        assert!(is_ssrf_target(&url("http://api.default.svc.cluster.local/")));
+    }
+
+    #[test]
+    fn ssrf_blocks_dotted_localhost_subdomain() {
+        assert!(is_ssrf_target(&url("http://foo.localhost/")));
+    }
+
+    #[test]
+    fn ssrf_blocks_non_http_schemes() {
+        assert!(is_ssrf_target(&url("ftp://example.com/file")));
+        assert!(is_ssrf_target(&url("file:///etc/passwd")));
+        assert!(is_ssrf_target(&url("gopher://example.com/")));
+    }
+
+    #[test]
+    fn ssrf_allows_public_https_url() {
+        // Public domains pass the static check; the runtime DNS check is the
+        // second layer (covered separately).
+        assert!(!is_ssrf_target(&url("https://example.com/path")));
+    }
+
+    #[test]
+    fn ssrf_blocks_rfc1918_literals() {
+        assert!(is_ssrf_target(&url("http://10.0.0.1/")));
+        assert!(is_ssrf_target(&url("http://172.16.0.1/")));
+        assert!(is_ssrf_target(&url("http://192.168.1.1/")));
+    }
+
+    #[test]
+    fn ssrf_blocks_link_local_169_254() {
+        assert!(is_ssrf_target(&url("http://169.254.0.50/")));
+    }
+
+    #[test]
+    fn ssrf_blocks_ipv4_mapped_ipv6_loopback() {
+        // ::ffff:127.0.0.1 must apply IPv4 rules and resolve to loopback
+        assert!(is_ssrf_target(&url("http://[::ffff:127.0.0.1]/")));
+    }
+
+    #[test]
+    fn ssrf_blocks_ipv6_unique_local() {
+        // fc00::/7 — unique local addresses
+        assert!(is_ssrf_target(&url("http://[fc00::1]/")));
+        assert!(is_ssrf_target(&url("http://[fd00::1]/")));
+    }
+
+    #[test]
+    fn ssrf_blocks_ipv6_link_local() {
+        // fe80::/10
+        assert!(is_ssrf_target(&url("http://[fe80::1]/")));
+    }
+
+    // ---- DNS re-check ------------------------------------------------------
+
+    #[tokio::test]
+    async fn dns_recheck_blocks_localhost_hostname() {
+        // "localhost" resolves to 127.0.0.1 / ::1 on essentially all systems.
+        assert!(hostname_resolves_to_private_ip("localhost").await);
+    }
+
+    #[tokio::test]
+    async fn dns_recheck_returns_false_on_resolution_failure() {
+        // .invalid is reserved (RFC 2606) and must never resolve.
+        assert!(!hostname_resolves_to_private_ip("nonexistent-host.invalid").await);
     }
 }
