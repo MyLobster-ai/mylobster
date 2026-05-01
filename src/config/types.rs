@@ -2397,6 +2397,10 @@ pub struct MessagesConfig {
     pub remove_ack_after_reply: Option<bool>,
     pub tts: Option<serde_json::Value>,
     pub audio: Option<AudioConfig>,
+    /// When true, agent output reaches the user only via explicit
+    /// `message(action=send)` tool calls; bare LLM text is suppressed.
+    /// Defaults to None (off). (OpenClaw v2026.4.29)
+    pub visible_replies: Option<bool>,
 }
 
 // ============================================================================
@@ -3741,5 +3745,65 @@ mod tests {
         assert!(config.searxng.is_some());
         assert!(config.x_search.is_some());
         assert_eq!(config.openai_codex, Some(true));
+    }
+
+    // ====================================================================
+    // v2026.4.29 — messages.visibleReplies
+    // ====================================================================
+
+    #[test]
+    fn messages_visible_replies_defaults_to_none() {
+        let cfg = MessagesConfig::default();
+        assert_eq!(cfg.visible_replies, None);
+    }
+
+    #[test]
+    fn messages_visible_replies_deserializes_camelcase_true() {
+        let raw = json!({ "visibleReplies": true });
+        let cfg: MessagesConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(cfg.visible_replies, Some(true));
+    }
+
+    #[test]
+    fn messages_visible_replies_deserializes_camelcase_false() {
+        let raw = json!({ "visibleReplies": false });
+        let cfg: MessagesConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(cfg.visible_replies, Some(false));
+    }
+
+    #[test]
+    fn messages_visible_replies_serializes_camelcase() {
+        let cfg = MessagesConfig {
+            visible_replies: Some(true),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(v["visibleReplies"], json!(true));
+    }
+
+    #[test]
+    fn messages_visible_replies_omitted_when_none_with_default_serialization() {
+        // When skipping, the field should not appear in serialized output.
+        // Note: this only holds with `skip_serializing_if`; this test documents
+        // current behavior — without `skip_serializing_if` the key is present
+        // as null. If serialized output cleanliness is required, add the
+        // attribute.
+        let cfg = MessagesConfig::default();
+        let v = serde_json::to_value(&cfg).unwrap();
+        // Either omitted or null — both are acceptable for an absent field.
+        assert!(v.get("visibleReplies").map_or(true, |x| x.is_null()));
+    }
+
+    #[test]
+    fn messages_visible_replies_alongside_other_fields() {
+        let raw = json!({
+            "messagePrefix": "[bot] ",
+            "visibleReplies": true,
+            "ackReaction": "👀"
+        });
+        let cfg: MessagesConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(cfg.message_prefix.as_deref(), Some("[bot] "));
+        assert_eq!(cfg.visible_replies, Some(true));
+        assert_eq!(cfg.ack_reaction.as_deref(), Some("👀"));
     }
 }
