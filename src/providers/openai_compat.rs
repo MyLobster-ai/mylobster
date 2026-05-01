@@ -306,3 +306,633 @@ pub(crate) async fn openai_compat_stream_chat(
 
     Ok(rx)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // ------------------------------------------------------------------------
+    // Test helpers
+    // ------------------------------------------------------------------------
+
+    fn user_msg(text: &str) -> ProviderMessage {
+        ProviderMessage {
+            role: "user".to_string(),
+            content: serde_json::Value::String(text.to_string()),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }
+    }
+
+    fn req(model: &str) -> ProviderRequest {
+        ProviderRequest {
+            model: model.to_string(),
+            messages: vec![user_msg("hi")],
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+        }
+    }
+
+    fn ok_response_json() -> serde_json::Value {
+        json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hello"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+        })
+    }
+
+    async fn mock_with_body(body: serde_json::Value) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn captured(
+        server: &MockServer,
+    ) -> (
+        std::collections::HashMap<String, String>,
+        serde_json::Value,
+    ) {
+        let reqs = server.received_requests().await.expect("requests recorded");
+        let r = reqs.first().expect("at least one request");
+        let mut hdrs = std::collections::HashMap::new();
+        for (name, val) in r.headers.iter() {
+            hdrs.insert(
+                name.as_str().to_ascii_lowercase(),
+                val.to_str().unwrap_or("").to_string(),
+            );
+        }
+        let body: serde_json::Value =
+            serde_json::from_slice(&r.body).expect("body is valid JSON");
+        (hdrs, body)
+    }
+
+    fn sse_response(body: &str) -> ResponseTemplate {
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string(body.to_string())
+    }
+
+    async fn collect_stream(
+        mut rx: mpsc::Receiver<StreamEvent>,
+    ) -> Vec<StreamEvent> {
+        let mut out = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            let done = matches!(ev, StreamEvent::Done(_) | StreamEvent::Error(_));
+            out.push(ev);
+            if done {
+                break;
+            }
+        }
+        out
+    }
+
+    // ------------------------------------------------------------------------
+    // build_request
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn build_request_omits_max_tokens_when_none() {
+        let body = build_request(req("gpt-4o"), false);
+        assert!(body.max_tokens.is_none());
+        let serialized = serde_json::to_value(&body).unwrap();
+        assert!(serialized.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn build_request_omits_temperature_when_none() {
+        let body = build_request(req("gpt-4o"), false);
+        let serialized = serde_json::to_value(&body).unwrap();
+        assert!(serialized.get("temperature").is_none());
+    }
+
+    #[test]
+    fn build_request_omits_stream_when_not_streaming() {
+        let body = build_request(req("gpt-4o"), false);
+        let serialized = serde_json::to_value(&body).unwrap();
+        assert!(serialized.get("stream").is_none());
+    }
+
+    #[test]
+    fn build_request_sets_stream_true_when_streaming() {
+        let body = build_request(req("gpt-4o"), true);
+        let serialized = serde_json::to_value(&body).unwrap();
+        assert_eq!(serialized["stream"], true);
+    }
+
+    #[test]
+    fn build_request_passes_through_tools_and_tool_choice() {
+        let mut r = req("gpt-4o");
+        r.tools = Some(vec![json!({"type": "function", "function": {"name": "f"}})]);
+        r.tool_choice = Some(json!("auto"));
+        let serialized = serde_json::to_value(&build_request(r, false)).unwrap();
+        assert_eq!(serialized["tools"][0]["function"]["name"], "f");
+        assert_eq!(serialized["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn convert_messages_preserves_all_fields() {
+        let msgs = vec![ProviderMessage {
+            role: "tool".to_string(),
+            content: json!("result"),
+            name: Some("calc".to_string()),
+            tool_call_id: Some("call_1".to_string()),
+            tool_calls: Some(vec![json!({"id": "call_1"})]),
+        }];
+        let converted = convert_messages(msgs);
+        assert_eq!(converted[0].role, "tool");
+        assert_eq!(converted[0].name.as_deref(), Some("calc"));
+        assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_1"));
+        assert!(converted[0].tool_calls.is_some());
+    }
+
+    // ------------------------------------------------------------------------
+    // Headers + URL
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn chat_sets_bearer_auth_and_required_headers() {
+        let server = mock_with_body(ok_response_json()).await;
+        let client = Client::new();
+        openai_compat_chat(&client, &server.uri(), "secret-key", req("gpt-4o"), "OpenAI")
+            .await
+            .unwrap();
+        let (h, _) = captured(&server).await;
+        assert_eq!(
+            h.get("authorization").map(String::as_str),
+            Some("Bearer secret-key")
+        );
+        assert_eq!(
+            h.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+        assert!(h
+            .get("user-agent")
+            .map(|v| v.starts_with("MyLobster/"))
+            .unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn chat_endpoint_is_chat_completions() {
+        let server = mock_with_body(ok_response_json()).await;
+        let client = Client::new();
+        openai_compat_chat(&client, &server.uri(), "k", req("gpt-4o"), "OpenAI")
+            .await
+            .unwrap();
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs[0].url.path(), "/chat/completions");
+    }
+
+    #[tokio::test]
+    async fn chat_respects_base_url_with_trailing_path() {
+        // OPENAI_BASE_URL overrides should be honored verbatim.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_response_json()))
+            .mount(&server)
+            .await;
+        let base = format!("{}/v1", server.uri());
+        let client = Client::new();
+        openai_compat_chat(&client, &base, "k", req("gpt-4o"), "OpenAI")
+            .await
+            .unwrap();
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs[0].url.path(), "/v1/chat/completions");
+    }
+
+    // ------------------------------------------------------------------------
+    // Request body shaping
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn chat_passes_through_max_tokens() {
+        let server = mock_with_body(ok_response_json()).await;
+        let client = Client::new();
+        let mut r = req("gpt-4o");
+        r.max_tokens = Some(2048);
+        openai_compat_chat(&client, &server.uri(), "k", r, "OpenAI")
+            .await
+            .unwrap();
+        let (_, b) = captured(&server).await;
+        assert_eq!(b["max_tokens"], 2048);
+    }
+
+    #[tokio::test]
+    async fn chat_passes_through_temperature() {
+        let server = mock_with_body(ok_response_json()).await;
+        let client = Client::new();
+        let mut r = req("gpt-4o");
+        r.temperature = Some(0.3);
+        openai_compat_chat(&client, &server.uri(), "k", r, "OpenAI")
+            .await
+            .unwrap();
+        let (_, b) = captured(&server).await;
+        assert_eq!(b["temperature"], 0.3);
+    }
+
+    #[tokio::test]
+    async fn chat_does_not_send_stream_field() {
+        let server = mock_with_body(ok_response_json()).await;
+        let client = Client::new();
+        openai_compat_chat(&client, &server.uri(), "k", req("gpt-4o"), "OpenAI")
+            .await
+            .unwrap();
+        let (_, b) = captured(&server).await;
+        assert!(b.get("stream").is_none() || b["stream"].is_null());
+    }
+
+    #[tokio::test]
+    async fn chat_omits_optional_fields_when_unset() {
+        let server = mock_with_body(ok_response_json()).await;
+        let client = Client::new();
+        openai_compat_chat(&client, &server.uri(), "k", req("gpt-4o"), "OpenAI")
+            .await
+            .unwrap();
+        let (_, b) = captured(&server).await;
+        assert!(b.get("max_tokens").is_none());
+        assert!(b.get("temperature").is_none());
+        assert!(b.get("tools").is_none());
+        assert!(b.get("tool_choice").is_none());
+    }
+
+    // ------------------------------------------------------------------------
+    // Response parsing
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn parses_text_response() {
+        let server = mock_with_body(json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "world"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2}
+        }))
+        .await;
+        let client = Client::new();
+        let r = openai_compat_chat(&client, &server.uri(), "k", req("gpt-4o"), "OpenAI")
+            .await
+            .unwrap();
+        assert_eq!(r.content.len(), 1);
+        assert!(matches!(&r.content[0], ContentBlock::Text(t) if t == "world"));
+        assert_eq!(r.stop_reason.as_deref(), Some("stop"));
+        assert_eq!(r.usage.input_tokens, Some(1));
+        assert_eq!(r.usage.output_tokens, Some(2));
+    }
+
+    #[tokio::test]
+    async fn parses_tool_call_response() {
+        let server = mock_with_body(json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_42",
+                        "type": "function",
+                        "function": {
+                            "name": "weather",
+                            "arguments": "{\"city\":\"SF\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .await;
+        let client = Client::new();
+        let r = openai_compat_chat(&client, &server.uri(), "k", req("gpt-4o"), "OpenAI")
+            .await
+            .unwrap();
+        match &r.content[0] {
+            ContentBlock::ToolUse { id, name, input } => {
+                assert_eq!(id, "call_42");
+                assert_eq!(name, "weather");
+                assert_eq!(input["city"], "SF");
+            }
+            other => panic!("expected ToolUse, got {:?}", other),
+        }
+        assert_eq!(r.stop_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[tokio::test]
+    async fn parses_tool_call_with_invalid_arguments_json_falls_back_to_empty_object() {
+        let server = mock_with_body(json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_x",
+                        "function": {"name": "f", "arguments": "not-json"}
+                    }]
+                }
+            }]
+        }))
+        .await;
+        let client = Client::new();
+        let r = openai_compat_chat(&client, &server.uri(), "k", req("gpt-4o"), "OpenAI")
+            .await
+            .unwrap();
+        match &r.content[0] {
+            ContentBlock::ToolUse { input, .. } => {
+                assert!(input.is_object());
+                assert_eq!(input.as_object().unwrap().len(), 0);
+            }
+            other => panic!("expected ToolUse with empty input, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn skips_empty_text_content() {
+        let server = mock_with_body(json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": ""},
+                "finish_reason": "stop"
+            }]
+        }))
+        .await;
+        let client = Client::new();
+        let r = openai_compat_chat(&client, &server.uri(), "k", req("gpt-4o"), "OpenAI")
+            .await
+            .unwrap();
+        assert!(r.content.is_empty(), "empty content should not produce a Text block");
+    }
+
+    #[tokio::test]
+    async fn errors_on_empty_choices() {
+        let server = mock_with_body(json!({
+            "choices": [],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0}
+        }))
+        .await;
+        let client = Client::new();
+        let err = openai_compat_chat(&client, &server.uri(), "k", req("gpt-4o"), "OpenAI")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("no choices"));
+    }
+
+    #[tokio::test]
+    async fn handles_missing_usage() {
+        let server = mock_with_body(json!({
+            "choices": [{"message": {"role": "assistant", "content": "x"}}]
+        }))
+        .await;
+        let client = Client::new();
+        let r = openai_compat_chat(&client, &server.uri(), "k", req("gpt-4o"), "OpenAI")
+            .await
+            .unwrap();
+        assert!(r.usage.input_tokens.is_none());
+        assert!(r.usage.output_tokens.is_none());
+        assert!(r.usage.cache_read_tokens.is_none());
+        assert!(r.usage.cache_write_tokens.is_none());
+    }
+
+    #[tokio::test]
+    async fn errors_include_provider_name_and_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_string(r#"{"error":{"message":"bad key"}}"#),
+            )
+            .mount(&server)
+            .await;
+        let client = Client::new();
+        let err = openai_compat_chat(&client, &server.uri(), "k", req("gpt-4o"), "Groq")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("401"), "should include status: {}", err);
+        assert!(err.contains("Groq"), "should include provider name: {}", err);
+    }
+
+    // ------------------------------------------------------------------------
+    // Streaming
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn stream_sends_stream_true() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(sse_response("data: [DONE]\n\n"))
+            .mount(&server)
+            .await;
+        let client = Client::new();
+        let rx = openai_compat_stream_chat(&client, &server.uri(), "k", req("gpt-4o"), "OpenAI")
+            .await
+            .unwrap();
+        let _ = collect_stream(rx).await;
+        let (_, b) = captured(&server).await;
+        assert_eq!(b["stream"], true);
+    }
+
+    #[tokio::test]
+    async fn stream_emits_text_deltas_in_order() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(sse_response(body))
+            .mount(&server)
+            .await;
+        let client = Client::new();
+        let rx = openai_compat_stream_chat(&client, &server.uri(), "k", req("gpt-4o"), "OpenAI")
+            .await
+            .unwrap();
+        let events = collect_stream(rx).await;
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Delta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["hel", "lo"]);
+        assert!(matches!(events.last(), Some(StreamEvent::Done(_))));
+    }
+
+    #[tokio::test]
+    async fn stream_skips_empty_content_deltas() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(sse_response(body))
+            .mount(&server)
+            .await;
+        let client = Client::new();
+        let rx = openai_compat_stream_chat(&client, &server.uri(), "k", req("gpt-4o"), "OpenAI")
+            .await
+            .unwrap();
+        let events = collect_stream(rx).await;
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Delta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["x"]);
+    }
+
+    #[tokio::test]
+    async fn stream_emits_tool_call_deltas() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(sse_response(body))
+            .mount(&server)
+            .await;
+        let client = Client::new();
+        let rx = openai_compat_stream_chat(&client, &server.uri(), "k", req("gpt-4o"), "OpenAI")
+            .await
+            .unwrap();
+        let events = collect_stream(rx).await;
+        let tool_calls: Vec<&serde_json::Value> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolCall(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0]["id"], "call_1");
+        assert_eq!(tool_calls[0]["function"]["name"], "f");
+    }
+
+    #[tokio::test]
+    async fn stream_captures_usage_from_chunk() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":7}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(sse_response(body))
+            .mount(&server)
+            .await;
+        let client = Client::new();
+        let rx = openai_compat_stream_chat(&client, &server.uri(), "k", req("gpt-4o"), "OpenAI")
+            .await
+            .unwrap();
+        let events = collect_stream(rx).await;
+        let usage = match events.last() {
+            Some(StreamEvent::Done(u)) => u.clone(),
+            other => panic!("expected Done last, got {:?}", other.is_some()),
+        };
+        assert_eq!(usage.input_tokens, Some(42));
+        assert_eq!(usage.output_tokens, Some(7));
+    }
+
+    #[tokio::test]
+    async fn stream_skips_unparseable_chunks_and_comments() {
+        let body = concat!(
+            ": this is a comment line\n",
+            "\n",
+            "data: not-json\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"survived\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(sse_response(body))
+            .mount(&server)
+            .await;
+        let client = Client::new();
+        let rx = openai_compat_stream_chat(&client, &server.uri(), "k", req("gpt-4o"), "OpenAI")
+            .await
+            .unwrap();
+        let events = collect_stream(rx).await;
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Delta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["survived"]);
+    }
+
+    #[tokio::test]
+    async fn stream_terminates_on_done_sentinel() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n",
+            "data: [DONE]\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"AFTER\"}}]}\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(sse_response(body))
+            .mount(&server)
+            .await;
+        let client = Client::new();
+        let rx = openai_compat_stream_chat(&client, &server.uri(), "k", req("gpt-4o"), "OpenAI")
+            .await
+            .unwrap();
+        let events = collect_stream(rx).await;
+        let saw_after = events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Delta(t) if t == "AFTER"));
+        assert!(!saw_after, "[DONE] sentinel must terminate the stream");
+    }
+
+    #[tokio::test]
+    async fn stream_emits_error_on_non_2xx() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+            .mount(&server)
+            .await;
+        let client = Client::new();
+        let rx = openai_compat_stream_chat(&client, &server.uri(), "k", req("gpt-4o"), "Groq")
+            .await
+            .unwrap();
+        let events = collect_stream(rx).await;
+        match events.last() {
+            Some(StreamEvent::Error(msg)) => {
+                assert!(msg.contains("429"), "should include status: {}", msg);
+                assert!(msg.contains("Groq"), "should include provider: {}", msg);
+            }
+            other => panic!("expected Error last, got {:?}", other.is_some()),
+        }
+    }
+}
