@@ -598,3 +598,168 @@ async fn execute_tool(
 
     tool.execute(input.clone(), &context).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ------------------------------------------------------------------------
+    // sanitize_chat_error — security-relevant: must NEVER leak raw provider
+    // errors that could expose API keys, internal hostnames, etc.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn sanitize_masks_api_key_phrase() {
+        let raw = "Anthropic API error (401): Invalid API key sk-ant-abc123def";
+        let safe = sanitize_chat_error(raw);
+        assert!(!safe.contains("sk-ant-"), "raw key must not appear: {}", safe);
+        assert!(!safe.contains("API key"));
+        assert!(safe.to_lowercase().contains("authentication"));
+    }
+
+    #[test]
+    fn sanitize_masks_authentication_phrase() {
+        let raw = "Provider authentication failed for user@host.internal";
+        let safe = sanitize_chat_error(raw);
+        assert!(!safe.contains("user@host.internal"));
+        assert!(!safe.contains("authentication failed"));
+    }
+
+    #[test]
+    fn sanitize_masks_credentials_phrase() {
+        let raw = "Unable to load credentials from /home/user/.aws/credentials";
+        let safe = sanitize_chat_error(raw);
+        assert!(!safe.contains("/home/user"));
+        assert!(!safe.contains("credentials"));
+    }
+
+    #[test]
+    fn sanitize_maps_rate_limit_phrase() {
+        assert_eq!(
+            sanitize_chat_error("hit rate limit on tier 1"),
+            "Rate limited. Please try again in a moment."
+        );
+    }
+
+    #[test]
+    fn sanitize_maps_429_status() {
+        assert_eq!(
+            sanitize_chat_error("got HTTP 429 from upstream"),
+            "Rate limited. Please try again in a moment."
+        );
+    }
+
+    #[test]
+    fn sanitize_maps_timeout_phrase() {
+        assert_eq!(
+            sanitize_chat_error("operation timeout"),
+            "Request timed out. Please try again."
+        );
+        assert_eq!(
+            sanitize_chat_error("connection timed out after 30s"),
+            "Request timed out. Please try again."
+        );
+    }
+
+    #[test]
+    fn sanitize_maps_500_status() {
+        assert_eq!(
+            sanitize_chat_error("HTTP 500 Bad Gateway"),
+            "Provider error. Please try again."
+        );
+    }
+
+    #[test]
+    fn sanitize_maps_internal_server_error_phrase() {
+        assert_eq!(
+            sanitize_chat_error("internal server error from provider"),
+            "Provider error. Please try again."
+        );
+    }
+
+    #[test]
+    fn sanitize_falls_back_to_generic_for_unknown_errors() {
+        // Random raw error text — must not be echoed back to the user.
+        let raw = "panic: thread 'tokio-1' panicked at 'unexpected None' src/foo.rs:42";
+        let safe = sanitize_chat_error(raw);
+        assert_eq!(safe, "Something went wrong. Please try again.");
+        assert!(!safe.contains("panic"));
+        assert!(!safe.contains("src/foo.rs"));
+    }
+
+    #[test]
+    fn sanitize_first_match_wins_when_multiple_phrases_present() {
+        // "API key" matched before "rate limit" in the implementation.
+        let safe = sanitize_chat_error("API key invalid AND rate limit exceeded");
+        assert!(safe.contains("Authentication"));
+    }
+
+    // ------------------------------------------------------------------------
+    // build_tool_definitions
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn build_tool_definitions_emits_provider_format() {
+        let config = Config::default();
+        let defs = build_tool_definitions(&config);
+        // Each entry should be a JSON object with the keys providers expect.
+        for d in &defs {
+            assert!(d.is_object(), "tool def must be a JSON object");
+            assert!(d.get("name").and_then(|v| v.as_str()).is_some(), "missing name");
+            assert!(
+                d.get("description").and_then(|v| v.as_str()).is_some(),
+                "missing description"
+            );
+            assert!(
+                d.get("input_schema").is_some(),
+                "missing input_schema"
+            );
+        }
+    }
+
+    #[test]
+    fn build_tool_definitions_filters_hidden_tools() {
+        let config = Config::default();
+        let defs = build_tool_definitions(&config);
+        // Re-fetch raw catalog and confirm none of the returned definitions
+        // correspond to hidden tools.
+        let raw = crate::agents::tools::list_available_tools(&config);
+        let hidden_names: std::collections::HashSet<&str> = raw
+            .iter()
+            .filter(|t| t.hidden)
+            .map(|t| t.name.as_str())
+            .collect();
+        for d in &defs {
+            let name = d["name"].as_str().unwrap();
+            assert!(
+                !hidden_names.contains(name),
+                "build_tool_definitions returned hidden tool {}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn build_tool_definitions_uses_input_schema_field_name() {
+        // Anthropic and OpenAI both expect `input_schema` (not `parameters`)
+        // when the gateway emits unified tool defs to providers. Regression
+        // guard against accidentally renaming.
+        let config = Config::default();
+        let defs = build_tool_definitions(&config);
+        if let Some(first) = defs.first() {
+            assert!(first.get("input_schema").is_some());
+            assert!(first.get("parameters").is_none());
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // MAX_TOOL_ITERATIONS
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn max_tool_iterations_is_documented_constant() {
+        // Bumping this changes user-visible behavior (longer agent runs);
+        // pin it so the change requires a deliberate test edit.
+        assert_eq!(MAX_TOOL_ITERATIONS, 25);
+    }
+}
