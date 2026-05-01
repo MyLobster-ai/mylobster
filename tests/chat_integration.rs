@@ -137,6 +137,7 @@ async fn start_chat_gateway(mock_url: &str) -> (String, broadcast::Sender<()>) {
         shutdown_tx: shutdown_tx.clone(),
         start_time: std::time::Instant::now(),
         version: "test".to_string(),
+        connected_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
 
     let app = mylobster::gateway::routes::build_routes(state);

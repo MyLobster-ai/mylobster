@@ -33,6 +33,7 @@ async fn start_test_gateway(auth: ResolvedGatewayAuth) -> (String, broadcast::Se
         shutdown_tx: shutdown_tx.clone(),
         start_time: std::time::Instant::now(),
         version: "test".to_string(),
+        connected_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
 
     let app = mylobster::gateway::routes::build_routes(state);

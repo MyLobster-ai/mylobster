@@ -24,6 +24,17 @@ use uuid::Uuid;
 /// 3. Validate token auth and device identity
 /// 4. Send success/failure response
 /// 5. Process subsequent requests (chat.send, sessions.*, config.*, etc.)
+/// RAII guard that increments the gateway's connected-client counter on
+/// construction and decrements it on drop — survives early returns and panics.
+struct ClientCountGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for ClientCountGuard {
+    fn drop(&mut self) {
+        self.0
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub async fn handle_websocket(
     socket: WebSocket,
     state: GatewayState,
@@ -31,6 +42,10 @@ pub async fn handle_websocket(
     _query_token: Option<String>,
 ) {
     let client_id = Uuid::new_v4().to_string();
+    state
+        .connected_clients
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _client_count_guard = ClientCountGuard(state.connected_clients.clone());
     info!("WebSocket client connected: {} from {}", client_id, addr);
 
     let (mut ws_tx, mut ws_rx) = socket.split();
@@ -3661,5 +3676,56 @@ fn handle_task_cancel(state: &GatewayState, task_id: &str) -> serde_json::Value 
         serde_json::json!({ "cancelled": true, "id": task_id })
     } else {
         serde_json::json!({ "error": "task not found" })
+    }
+}
+
+#[cfg(test)]
+mod connected_clients_tests {
+    use super::ClientCountGuard;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn guard_decrements_counter_on_drop() {
+        let counter = Arc::new(AtomicUsize::new(1));
+        {
+            let _g = ClientCountGuard(counter.clone());
+            assert_eq!(counter.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn multiple_guards_track_concurrent_clients() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        counter.fetch_add(1, Ordering::Relaxed);
+        let g1 = ClientCountGuard(counter.clone());
+        counter.fetch_add(1, Ordering::Relaxed);
+        let g2 = ClientCountGuard(counter.clone());
+        counter.fetch_add(1, Ordering::Relaxed);
+        let g3 = ClientCountGuard(counter.clone());
+        assert_eq!(counter.load(Ordering::Relaxed), 3);
+        drop(g2);
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
+        drop(g1);
+        drop(g3);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn guard_decrements_even_on_unwind() {
+        // Panicking inside the scope must still drop the guard.
+        let counter = Arc::new(AtomicUsize::new(0));
+        counter.fetch_add(1, Ordering::Relaxed);
+        let counter_for_thread = counter.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _g = ClientCountGuard(counter_for_thread);
+            panic!("simulated handler panic");
+        }));
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "guard must decrement on panic-unwind"
+        );
     }
 }

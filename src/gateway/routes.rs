@@ -312,7 +312,9 @@ async fn gateway_info_handler(State(state): State<GatewayState>) -> Json<Gateway
         protocol: PROTOCOL_VERSION,
         uptime_seconds: uptime,
         sessions_active: state.sessions.active_count() as u32,
-        clients_connected: 0, // TODO: track connected clients
+        clients_connected: state
+            .connected_clients
+            .load(std::sync::atomic::Ordering::Relaxed) as u32,
     })
 }
 

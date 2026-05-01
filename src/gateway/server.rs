@@ -12,6 +12,7 @@ use anyhow::Result;
 use axum::Router;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::{broadcast, RwLock};
@@ -124,6 +125,9 @@ pub struct GatewayState {
     pub shutdown_tx: broadcast::Sender<()>,
     pub start_time: std::time::Instant,
     pub version: String,
+    /// Live count of connected WebSocket clients. Incremented on
+    /// `handle_websocket` entry, decremented on exit.
+    pub connected_clients: Arc<AtomicUsize>,
 }
 
 /// The gateway server.
@@ -161,6 +165,7 @@ impl GatewayServer {
             shutdown_tx,
             start_time: std::time::Instant::now(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            connected_clients: Arc::new(AtomicUsize::new(0)),
         };
 
         // Start channel monitors
