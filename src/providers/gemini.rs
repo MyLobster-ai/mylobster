@@ -135,6 +135,33 @@ fn convert_messages(messages: Vec<ProviderMessage>) -> Vec<GeminiContent> {
 }
 
 // ============================================================================
+// Thinking-budget policy (v2026.5.2 parity)
+// ============================================================================
+
+/// Lowest thinking budget (in output tokens) accepted by Gemini 2.5 Flash-Lite.
+///
+/// v2026.5.2 raised the floor for `gemini-2.5-flash-lite` because requests with
+/// `reasoning: "minimal"` (which had been mapped to budget=128 or similar) were
+/// being rejected by the Google API. Pro / Flash variants still accept lower
+/// minimal presets, so the floor is model-specific.
+pub const GEMINI_2_5_FLASH_LITE_MIN_BUDGET: u32 = 512;
+
+/// Apply v2026.5.2 thinking-budget policy: clamp the requested budget up to
+/// the per-model minimum where the upstream API rejects values below it.
+///
+/// Returns `requested` unchanged for models without a known floor. Pro/Flash
+/// "minimal" presets are intentionally untouched — only Flash-Lite raises the
+/// floor.
+pub fn effective_thinking_budget(model: &str, requested: u32) -> u32 {
+    let lower = model.to_ascii_lowercase();
+    if lower.contains("gemini-2.5-flash-lite") || lower.contains("gemini-2.5-flashlite") {
+        requested.max(GEMINI_2_5_FLASH_LITE_MIN_BUDGET)
+    } else {
+        requested
+    }
+}
+
+// ============================================================================
 // ModelProvider Implementation
 // ============================================================================
 
@@ -713,5 +740,53 @@ mod tests {
             DEFAULT_GEMINI_BASE_URL,
             "https://generativelanguage.googleapis.com/v1beta"
         );
+    }
+
+    // ------------------------------------------------------------------------
+    // Thinking budget floor (v2026.5.2)
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn flash_lite_raises_low_budget_to_floor() {
+        assert_eq!(
+            effective_thinking_budget("gemini-2.5-flash-lite", 128),
+            GEMINI_2_5_FLASH_LITE_MIN_BUDGET
+        );
+        assert_eq!(
+            effective_thinking_budget("gemini-2.5-flash-lite", 0),
+            GEMINI_2_5_FLASH_LITE_MIN_BUDGET
+        );
+    }
+
+    #[test]
+    fn flash_lite_preserves_higher_budget() {
+        assert_eq!(
+            effective_thinking_budget("gemini-2.5-flash-lite", 4096),
+            4096
+        );
+    }
+
+    #[test]
+    fn flash_lite_match_is_case_insensitive_and_tolerates_separator_variants() {
+        assert_eq!(
+            effective_thinking_budget("Gemini-2.5-Flash-Lite", 32),
+            GEMINI_2_5_FLASH_LITE_MIN_BUDGET
+        );
+        assert_eq!(
+            effective_thinking_budget("gemini-2.5-flashlite-preview", 32),
+            GEMINI_2_5_FLASH_LITE_MIN_BUDGET
+        );
+    }
+
+    #[test]
+    fn pro_and_flash_minimal_budgets_unchanged() {
+        // The fix is Flash-Lite-specific; Pro and Flash still accept low presets.
+        assert_eq!(effective_thinking_budget("gemini-2.5-pro", 32), 32);
+        assert_eq!(effective_thinking_budget("gemini-2.5-flash", 64), 64);
+    }
+
+    #[test]
+    fn unknown_model_passes_budget_through() {
+        assert_eq!(effective_thinking_budget("some-other-model", 17), 17);
     }
 }

@@ -14,6 +14,16 @@ struct SearchResult {
 /// Web search tool supporting Brave, Perplexity, and Grok (xAI) providers.
 pub struct WebSearchTool;
 
+/// Default HTTP timeout for the xAI Grok `web_search` Responses-API call,
+/// in seconds. Mirrors the v2026.5.2 default (#58063, #58733) — historical
+/// no-timeout behavior could hang the tool loop when xAI was slow.
+pub const GROK_WEB_SEARCH_DEFAULT_TIMEOUT_SECS: u64 = 60;
+
+/// Default Brave web-search endpoint. v2026.5.2 made this overridable per
+/// deployment (compatible proxies / corporate gateways) via
+/// `tools.web.search.brave.baseUrl` — see [`crate::config::types::BraveSearchConfig`].
+pub const BRAVE_DEFAULT_BASE_URL: &str = "https://api.search.brave.com/res/v1/web/search";
+
 // ============================================================================
 // Brave Search Types
 // ============================================================================
@@ -196,7 +206,27 @@ impl AgentTool for WebSearchTool {
                     return Ok(ToolResult::error("No Brave search API key configured"));
                 }
 
-                search_brave(query, max_results, api_key, freshness.as_deref()).await
+                let brave_cfg = context
+                    .config
+                    .tools
+                    .web
+                    .search
+                    .as_ref()
+                    .and_then(|s| s.brave.as_ref());
+                let base_url = brave_cfg
+                    .and_then(|b| b.base_url.as_deref())
+                    .unwrap_or(BRAVE_DEFAULT_BASE_URL);
+                let http_diag = brave_cfg.and_then(|b| b.http).unwrap_or(false);
+
+                search_brave(
+                    query,
+                    max_results,
+                    api_key,
+                    freshness.as_deref(),
+                    base_url,
+                    http_diag,
+                )
+                .await
             }
             "perplexity" => {
                 search_perplexity(query, context, freshness.as_deref()).await
@@ -229,6 +259,8 @@ async fn search_brave(
     max_results: usize,
     api_key: &str,
     freshness: Option<&str>,
+    base_url: &str,
+    http_diag: bool,
 ) -> Result<ToolResult> {
     let client = reqwest::Client::new();
 
@@ -241,14 +273,38 @@ async fn search_brave(
         query_params.push(("freshness".to_string(), f.to_string()));
     }
 
+    if http_diag {
+        // v2026.5.2 brave.http diagnostics: log endpoint + non-secret query
+        // params, never the API key or response body.
+        debug!(
+            target: "brave.http",
+            base_url = base_url,
+            query = query,
+            count = max_results,
+            freshness = ?freshness,
+            "brave.http: outbound request"
+        );
+    }
+
+    let send_started = std::time::Instant::now();
     let response = client
-        .get("https://api.search.brave.com/res/v1/web/search")
+        .get(base_url)
         .header("Accept", "application/json")
         .header("Accept-Encoding", "gzip")
         .header("X-Subscription-Token", api_key)
         .query(&query_params)
         .send()
         .await?;
+
+    if http_diag {
+        debug!(
+            target: "brave.http",
+            base_url = base_url,
+            status = %response.status(),
+            duration_ms = send_started.elapsed().as_millis() as u64,
+            "brave.http: response"
+        );
+    }
 
     if !response.status().is_success() {
         return Ok(ToolResult::error(format!(
@@ -423,14 +479,36 @@ async fn search_grok(query: &str, context: &ToolContext) -> Result<ToolResult> {
         }],
     };
 
-    let client = reqwest::Client::new();
-    let response = client
+    // v2026.5.2: 60s default timeout (configurable). Historical no-timeout
+    // builds let slow xAI Responses API calls hang the tool loop.
+    let timeout_secs = grok_config
+        .and_then(|c| c.timeout_seconds)
+        .unwrap_or(GROK_WEB_SEARCH_DEFAULT_TIMEOUT_SECS);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()?;
+    let send_result = client
         .post("https://api.x.ai/v1/responses")
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
         .json(&body)
         .send()
-        .await?;
+        .await;
+
+    let response = match send_result {
+        Ok(r) => r,
+        Err(e) if e.is_timeout() => {
+            // v2026.5.2: structured timeout error instead of aborting tool call.
+            return Ok(ToolResult::json(serde_json::json!({
+                "error": "timeout",
+                "provider": "grok",
+                "query": query,
+                "timeout_seconds": timeout_secs,
+                "message": format!("xAI Grok web_search timed out after {timeout_secs}s")
+            })));
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     if !response.status().is_success() {
         let status = response.status();
@@ -639,4 +717,81 @@ async fn x_search(query: &str, config: &crate::config::Config) -> Result<ToolRes
         "query": query,
         "provider": "x_search"
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grok_web_search_default_timeout_is_60s() {
+        // v2026.5.2 default. The structured timeout error path keys off this
+        // value, so any future change must update both the helper text and
+        // the consumer expectation.
+        assert_eq!(GROK_WEB_SEARCH_DEFAULT_TIMEOUT_SECS, 60);
+    }
+
+    #[test]
+    fn brave_default_base_url_points_to_brave_api() {
+        assert_eq!(
+            BRAVE_DEFAULT_BASE_URL,
+            "https://api.search.brave.com/res/v1/web/search"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_brave_uses_provided_base_url() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/res/v1/web/search"))
+            .and(query_param("q", "rustlang"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "web": {
+                    "results": [{
+                        "title": "Rust Programming Language",
+                        "url": "https://www.rust-lang.org",
+                        "description": "Empowering everyone to build reliable and efficient software."
+                    }]
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let base = format!("{}/res/v1/web/search", server.uri());
+        let result = search_brave("rustlang", 5, "fake-key", None, &base, false)
+            .await
+            .expect("brave search ok");
+
+        let payload = result.json.expect("brave search returns json");
+        let body = payload.to_string();
+        assert!(body.contains("Rust Programming Language"), "body: {body}");
+        assert!(body.contains("rust-lang.org"));
+    }
+
+    #[tokio::test]
+    async fn search_brave_diagnostics_flag_does_not_alter_response() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/res/v1/web/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "web": {"results": []}
+            })))
+            .mount(&server)
+            .await;
+
+        let base = format!("{}/res/v1/web/search", server.uri());
+        let off = search_brave("q", 5, "k", None, &base, false).await.unwrap();
+        let on = search_brave("q", 5, "k", None, &base, true).await.unwrap();
+
+        // The diagnostic flag is a logging-only side effect; the JSON
+        // payload returned must be identical so plugins/agents observing
+        // the result aren't sensitive to operator log preferences.
+        assert_eq!(off.json, on.json);
+    }
 }

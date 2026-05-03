@@ -353,3 +353,147 @@ impl ModelProvider for AnthropicCompatProvider {
         &self.provider_name
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::ProviderMessage;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn user_msg(text: &str) -> ProviderMessage {
+        ProviderMessage {
+            role: "user".to_string(),
+            content: serde_json::Value::String(text.to_string()),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }
+    }
+
+    fn req(model: &str) -> ProviderRequest {
+        ProviderRequest {
+            model: model.to_string(),
+            messages: vec![user_msg("hi")],
+            max_tokens: None,
+            temperature: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+        }
+    }
+
+    fn sse_response(body: &str) -> ResponseTemplate {
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string(body.to_string())
+    }
+
+    async fn collect_stream(mut rx: mpsc::Receiver<StreamEvent>) -> Vec<StreamEvent> {
+        let mut out = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            let done = matches!(ev, StreamEvent::Done(_) | StreamEvent::Error(_));
+            out.push(ev);
+            if done {
+                break;
+            }
+        }
+        out
+    }
+
+    fn deltas_only(events: &[StreamEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Delta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn make(server: &MockServer) -> AnthropicCompatProvider {
+        AnthropicCompatProvider::new(
+            "k".into(),
+            server.uri(),
+            "m".into(),
+            "anthropic-compat".into(),
+        )
+    }
+
+    /// v2026.5.2 regression: text deltas that arrive *before* their matching
+    /// content_block_start must still be forwarded. Some Anthropic-compatible
+    /// providers (e.g. third-party OAI bridges) emit content_block_delta
+    /// frames immediately, racing the synthetic content_block_start. The Rust
+    /// stream parser does not gate text deltas on prior block registration,
+    /// so the consumer should observe both pre- and post-start deltas in
+    /// arrival order.
+    #[tokio::test]
+    async fn text_deltas_arriving_before_content_block_start_are_forwarded() {
+        let body = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+            // Text delta arrives BEFORE the matching content_block_start.
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"early-\"}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"late\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(sse_response(body))
+            .mount(&server)
+            .await;
+        let p = make(&server);
+        let rx = p.stream_chat(req("m")).await.unwrap();
+        let events = collect_stream(rx).await;
+        assert_eq!(deltas_only(&events), vec!["early-", "late"]);
+        assert!(matches!(events.last(), Some(StreamEvent::Done(_))));
+    }
+
+    /// Sanity: the well-formed canonical sequence still works.
+    #[tokio::test]
+    async fn text_deltas_in_canonical_order_are_forwarded() {
+        let body = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":2}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hel\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(sse_response(body))
+            .mount(&server)
+            .await;
+        let p = make(&server);
+        let rx = p.stream_chat(req("m")).await.unwrap();
+        let events = collect_stream(rx).await;
+        assert_eq!(deltas_only(&events), vec!["hel", "lo"]);
+    }
+
+    /// Stream parser must not collapse adjacent text deltas across blocks —
+    /// a delta routed to block 1 and another routed to block 0 should still
+    /// be forwarded in the order they arrive on the wire.
+    #[tokio::test]
+    async fn text_deltas_across_blocks_preserve_arrival_order() {
+        let body = concat!(
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"B\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"A\"}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(sse_response(body))
+            .mount(&server)
+            .await;
+        let p = make(&server);
+        let rx = p.stream_chat(req("m")).await.unwrap();
+        let events = collect_stream(rx).await;
+        assert_eq!(deltas_only(&events), vec!["B", "A"]);
+    }
+}

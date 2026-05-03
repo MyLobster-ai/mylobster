@@ -1859,6 +1859,28 @@ pub struct WebSearchConfig {
     pub x_search: Option<XSearchConfig>,
     /// Native Codex web search for eligible models (v2026.4.1).
     pub openai_codex: Option<bool>,
+    /// Brave-specific overrides (v2026.5.2): base_url for compatible proxies
+    /// and opt-in HTTP diagnostics flag.
+    pub brave: Option<BraveSearchConfig>,
+}
+
+/// Brave web-search provider configuration (v2026.5.2).
+///
+/// `base_url` lets operators point at a Brave-compatible search proxy (e.g.
+/// a corporate Brave gateway) instead of `api.search.brave.com`. The endpoint
+/// is fed into cache-key derivation so two different base URLs do not collide
+/// in any future LRU. `http` opts into diagnostic logging of request URL,
+/// query params, response status/timing, and cache hit/miss/write — never
+/// API keys or response bodies.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BraveSearchConfig {
+    /// Override for the Brave search base URL. Defaults to
+    /// `https://api.search.brave.com/res/v1/web/search` when unset.
+    pub base_url: Option<String>,
+    /// Opt-in `brave.http` diagnostics. Logs request URL, status, timing,
+    /// and cache events without ever logging the API key or response body.
+    pub http: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1875,6 +1897,11 @@ pub struct GrokSearchConfig {
     pub api_key: Option<String>,
     pub model: Option<String>,
     pub inline_citations: Option<bool>,
+    /// HTTP timeout for Grok web_search calls in seconds (v2026.5.2).
+    /// Defaults to 60s upstream — historical default of "no timeout" caused
+    /// hung tool calls when xAI's Responses API took >30s. Configurable so
+    /// operators can tighten or loosen the budget per deployment.
+    pub timeout_seconds: Option<u64>,
 }
 
 /// SearXNG bundled web search provider configuration (v2026.4.1).

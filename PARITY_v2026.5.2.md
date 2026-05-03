@@ -19,22 +19,22 @@
 | Item | Status | Notes |
 |------|--------|-------|
 | xAI Grok 4.3 default chat model + bundled catalog entry | ✅ | `providers/catalog.rs` (`XAI_CATALOG`, `XAI_DEFAULT_MODEL = "grok-4.3"`) |
-| xAI `web_search` 60s default timeout + structured timeout error + malformed Responses parse hardening | ❌ | `xai.rs` |
+| xAI `web_search` 60s default timeout + structured timeout error + malformed Responses parse hardening | 🚧 | `agents/tools/web_search.rs::search_grok` (timeout + structured error done; malformed Responses parse hardening still ❌) |
 | OpenAI-compat TTS `extraBody` / `extra_body` passthrough (`/audio/speech` `lang` etc.) | ❌ | `openai_compat.rs` + tts pipeline |
 | OpenAI Realtime + voice bridge: resolve `keychain:<service>:<account>` `OPENAI_API_KEY` refs (cached) | ❌ | `openai.rs` (we don't yet read keychain refs at all) |
 | OpenAI GPT-5 sessions default to SSE Responses transport unless WS explicit | ❌ | `openai.rs` transport selection |
 | OpenRouter/DeepSeek replay: fill DeepSeek V4 `reasoning_content` placeholders for `openrouter/deepseek/deepseek-v4-flash`/`-pro` | ❌ | `openrouter.rs` |
 | LM Studio binary reasoning normalization (Gemma 4 etc.) | ❌ | `lm_studio.rs` |
 | LM Studio `models.providers.lmstudio.params.preload: false` to skip native model-load (let JIT/idle TTL own lifecycle) | ❌ | `lm_studio.rs` |
-| Anthropic-compatible stream text deltas that arrive before their matching content block | ❌ | `anthropic.rs` streaming buffer |
+| Anthropic-compatible stream text deltas that arrive before their matching content block | ✅ | `providers/anthropic_compat.rs` (already permissive — locked in by regression tests) |
 | OpenRouter strip trailing assistant prefill turns from verified Anthropic-routed requests when reasoning enabled | ❌ | `openrouter.rs` |
 | z.ai-style providers (z.ai direct, openrouter z-ai/\*, in-house GLM) — keep prior context on consecutive turns (no Pi state reset) | ❌ | provider compaction integration |
-| Gemini 2.5 Flash-Lite `reasoning: "minimal"` → raise thinking-budget floor to 512 | ❌ | `gemini.rs` |
+| Gemini 2.5 Flash-Lite `reasoning: "minimal"` → raise thinking-budget floor to 512 | ✅ | `providers/gemini.rs::effective_thinking_budget` |
 | Gemini 3.1 Pro Preview: keep thinking-signature-only stream chunks active during reasoning (no idle timeout) | ❌ | `gemini.rs` |
 | Gemini provider abort signals routed into fetches | ❌ | `gemini.rs` |
 | Gemini `web_search` reuses Google provider API key/base URL as fallback + freshness/date filters via grounding | ❌ | `gemini.rs` |
-| Brave web search: `webSearch.baseUrl` override + endpoint-aware cache keys (web + LLM Context) | ❌ | new `web_search/brave.rs` |
-| Brave `brave.http` opt-in diagnostics flag (URLs, status, timing, cache hit/miss) | ❌ | `brave.rs` |
+| Brave web search: `webSearch.baseUrl` override + endpoint-aware cache keys (web + LLM Context) | 🚧 | `agents/tools/web_search.rs::search_brave` (`base_url` override done; LRU/cache layer not present yet) |
+| Brave `brave.http` opt-in diagnostics flag (URLs, status, timing, cache hit/miss) | ✅ | `agents/tools/web_search.rs::search_brave` (`http_diag` → `target: "brave.http"` debug logs) |
 | Brave LLM Context freshness/date ranges | ❌ | `brave.rs` |
 | Exa `webSearch.baseUrl` override w/ endpoint-partitioned caches | ❌ | new `web_search/exa.rs` |
 | MiniMax Search: `MINIMAX_API_KEY` + `MINIMAX_OAUTH_TOKEN` auto-detection; Coding Plan polling derives from configured base URL | ❌ | `minimax.rs` |
