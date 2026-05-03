@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::hooks::{CronChangeKind, HookEvent, SharedHookRegistry};
+
 /// A cron schedule with optional stagger delay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -89,6 +91,67 @@ fn is_top_of_hour(expr: &str) -> bool {
 
 pub fn list_jobs() -> Vec<serde_json::Value> {
     vec![]
+}
+
+// ============================================================================
+// cron_changed hook lifecycle helpers (v2026.4.26)
+// ============================================================================
+
+/// Fire a `cron_changed` hook event onto the gateway hook registry.
+///
+/// Job-management code (CronScheduleTool, doctor migrations, etc.) calls
+/// this when a cron job is created, updated, or removed so that plugins
+/// listening on `cron_changed` can react to lifecycle changes without
+/// scraping job storage themselves.
+pub async fn fire_cron_changed(
+    registry: &SharedHookRegistry,
+    job_id: &str,
+    change: CronChangeKind,
+    schedule: Option<&str>,
+) {
+    registry
+        .emit(HookEvent::CronChanged {
+            job_id: job_id.to_string(),
+            change,
+            schedule: schedule.map(|s| s.to_string()),
+        })
+        .await;
+}
+
+/// Convenience: fire `cron_changed` with `Created` when a new job is added.
+pub async fn fire_cron_created(
+    registry: &SharedHookRegistry,
+    job_id: &str,
+    schedule_expr: &str,
+) {
+    fire_cron_changed(
+        registry,
+        job_id,
+        CronChangeKind::Created,
+        Some(schedule_expr),
+    )
+    .await;
+}
+
+/// Convenience: fire `cron_changed` with `Updated` when a job's schedule or
+/// metadata changes.
+pub async fn fire_cron_updated(
+    registry: &SharedHookRegistry,
+    job_id: &str,
+    schedule_expr: &str,
+) {
+    fire_cron_changed(
+        registry,
+        job_id,
+        CronChangeKind::Updated,
+        Some(schedule_expr),
+    )
+    .await;
+}
+
+/// Convenience: fire `cron_changed` with `Removed` when a job is deleted.
+pub async fn fire_cron_removed(registry: &SharedHookRegistry, job_id: &str) {
+    fire_cron_changed(registry, job_id, CronChangeKind::Removed, None).await;
 }
 
 /// Migrate legacy cron storage to v2026.3.11 format.
@@ -305,5 +368,57 @@ mod tests {
         let mut jobs: Vec<CronJob> = vec![];
         migrate_legacy_storage(&mut jobs);
         assert!(jobs.is_empty());
+    }
+
+    // ====================================================================
+    // cron_changed lifecycle helpers (v2026.4.26)
+    // ====================================================================
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn fire_cron_created_emits_created_event() {
+        let registry = SharedHookRegistry::default();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+        registry
+            .on(
+                "cron_changed",
+                Arc::new(move |_| {
+                    c.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
+            .await;
+
+        fire_cron_created(&registry, "job-1", "*/5 * * * *").await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fire_cron_updated_and_removed_emit_distinct_changes() {
+        let registry = SharedHookRegistry::default();
+        let kinds: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let k = kinds.clone();
+        registry
+            .on(
+                "cron_changed",
+                Arc::new(move |ev| {
+                    if let HookEvent::CronChanged { change, .. } = ev {
+                        k.lock().unwrap().push(change.as_str().to_string());
+                    }
+                }),
+            )
+            .await;
+
+        fire_cron_updated(&registry, "job-2", "@hourly").await;
+        fire_cron_removed(&registry, "job-2").await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let observed = kinds.lock().unwrap().clone();
+        assert_eq!(observed, vec!["updated", "removed"]);
     }
 }
