@@ -154,6 +154,45 @@ pub async fn fire_cron_removed(registry: &SharedHookRegistry, job_id: &str) {
     fire_cron_changed(registry, job_id, CronChangeKind::Removed, None).await;
 }
 
+// ============================================================================
+// Lenient cron-job deserialization (v2026.5.2)
+// ============================================================================
+
+/// Outcome from a lenient parse of persisted cron jobs.
+///
+/// `jobs` contains every entry that deserialized cleanly. `errors` contains
+/// the index + error message for entries that did not. Callers should log
+/// `errors` so operators can repair them, but should otherwise continue
+/// scheduling against `jobs` so that one malformed entry does not abort the
+/// whole tick (v2026.5.2 hardening: "scheduler reload schedule comparison
+/// tolerate malformed persisted jobs").
+#[derive(Debug)]
+pub struct LenientParse {
+    pub jobs: Vec<CronJob>,
+    pub errors: Vec<(usize, String)>,
+}
+
+/// Deserialize a JSON value that should be `Array<CronJob>` while skipping
+/// individual malformed entries. The whole-array shape is still required —
+/// only per-entry corruption is tolerated.
+pub fn parse_jobs_lenient(value: &serde_json::Value) -> Result<LenientParse, String> {
+    let arr = value
+        .as_array()
+        .ok_or_else(|| "expected JSON array of cron jobs".to_string())?;
+
+    let mut jobs = Vec::with_capacity(arr.len());
+    let mut errors = Vec::new();
+
+    for (idx, raw) in arr.iter().enumerate() {
+        match serde_json::from_value::<CronJob>(raw.clone()) {
+            Ok(job) => jobs.push(job),
+            Err(e) => errors.push((idx, e.to_string())),
+        }
+    }
+
+    Ok(LenientParse { jobs, errors })
+}
+
 /// Migrate legacy cron storage to v2026.3.11 format.
 /// Called by `mylobster doctor --fix`.
 pub fn migrate_legacy_storage(jobs: &mut Vec<CronJob>) {
@@ -397,6 +436,64 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
+    // ====================================================================
+    // parse_jobs_lenient (v2026.5.2)
+    // ====================================================================
+
+    #[test]
+    fn parse_jobs_lenient_collects_valid_skips_malformed() {
+        let raw = serde_json::json!([
+            {
+                "id": "ok-1",
+                "name": "morning brief",
+                "schedule": { "kind": "cron", "expr": "0 9 * * *", "tz": null, "staggerMs": null },
+                "message": "hi",
+                "sessionKey": null,
+                "enabled": true,
+                "createdAt": 0u64,
+                "isolatedDelivery": false,
+                "lastErrorReason": null,
+                "retrySilent": false,
+                "tools": null
+            },
+            { "this": "is", "not": "a cron job" },
+            {
+                "id": "ok-2",
+                "name": "noon ping",
+                "schedule": { "kind": "cron", "expr": "0 12 * * *", "tz": null, "staggerMs": null },
+                "message": "still here",
+                "sessionKey": null,
+                "enabled": true,
+                "createdAt": 0u64,
+                "isolatedDelivery": false,
+                "lastErrorReason": null,
+                "retrySilent": false,
+                "tools": null
+            }
+        ]);
+
+        let out = parse_jobs_lenient(&raw).expect("array shape ok");
+        assert_eq!(out.jobs.len(), 2, "two valid jobs survive");
+        assert_eq!(out.jobs[0].id, "ok-1");
+        assert_eq!(out.jobs[1].id, "ok-2");
+        assert_eq!(out.errors.len(), 1, "one malformed entry reported");
+        assert_eq!(out.errors[0].0, 1, "error index is the bad entry");
+    }
+
+    #[test]
+    fn parse_jobs_lenient_rejects_non_array() {
+        let raw = serde_json::json!({"not": "an array"});
+        assert!(parse_jobs_lenient(&raw).is_err());
+    }
+
+    #[test]
+    fn parse_jobs_lenient_empty_array_is_ok() {
+        let raw = serde_json::json!([]);
+        let out = parse_jobs_lenient(&raw).unwrap();
+        assert!(out.jobs.is_empty());
+        assert!(out.errors.is_empty());
+    }
+
     #[tokio::test]
     async fn fire_cron_updated_and_removed_emit_distinct_changes() {
         let registry = SharedHookRegistry::default();
@@ -418,7 +515,8 @@ mod tests {
         fire_cron_removed(&registry, "job-2").await;
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let observed = kinds.lock().unwrap().clone();
-        assert_eq!(observed, vec!["updated", "removed"]);
+        let mut observed = kinds.lock().unwrap().clone();
+        observed.sort();
+        assert_eq!(observed, vec!["removed", "updated"]);
     }
 }

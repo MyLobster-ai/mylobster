@@ -147,10 +147,53 @@ pub const DEEPINFRA_CATALOG: &[ModelCatalogEntry] = &[
     },
 ];
 
+/// xAI Grok static catalog (v2026.5.2).
+///
+/// Hosted at `https://api.x.ai/v1` (OpenAI-compatible). v5.2 introduced
+/// Grok 4.3 as the default chat model alongside the existing Grok 2/3/4
+/// family. Tool use and vision are supported on the recent series.
+pub const XAI_CATALOG: &[ModelCatalogEntry] = &[
+    ModelCatalogEntry {
+        name: "grok-4.3",
+        provider: "xai",
+        context_length: Some(256_000),
+        supports_tools: true,
+        supports_vision: true,
+        supports_thinking: true,
+    },
+    ModelCatalogEntry {
+        name: "grok-4",
+        provider: "xai",
+        context_length: Some(256_000),
+        supports_tools: true,
+        supports_vision: true,
+        supports_thinking: true,
+    },
+    ModelCatalogEntry {
+        name: "grok-3",
+        provider: "xai",
+        context_length: Some(131_072),
+        supports_tools: true,
+        supports_vision: true,
+        supports_thinking: false,
+    },
+    ModelCatalogEntry {
+        name: "grok-2",
+        provider: "xai",
+        context_length: Some(131_072),
+        supports_tools: true,
+        supports_vision: true,
+        supports_thinking: false,
+    },
+];
+
+/// Default xAI chat model (v2026.5.2 promoted Grok 4.3 to default).
+pub const XAI_DEFAULT_MODEL: &str = "grok-4.3";
+
 /// Concatenation of every bundled provider catalog. Use for global lookup by
 /// canonical model name, e.g. via `find_model`.
 pub const ALL_CATALOGS: &[&[ModelCatalogEntry]] =
-    &[NVIDIA_CATALOG, CEREBRAS_CATALOG, DEEPINFRA_CATALOG];
+    &[NVIDIA_CATALOG, CEREBRAS_CATALOG, DEEPINFRA_CATALOG, XAI_CATALOG];
 
 /// Look up a model by its canonical name across every bundled catalog.
 ///
@@ -281,6 +324,26 @@ mod tests {
                 assert!(!entry.name.is_empty(), "empty name in {:?}", entry);
                 assert!(!entry.provider.is_empty(), "empty provider in {:?}", entry);
             }
+        }
+    }
+
+    #[test]
+    fn xai_catalog_includes_grok_4_3_default() {
+        let entry = find_model(XAI_DEFAULT_MODEL).expect("default xAI model present");
+        assert_eq!(entry.provider, "xai");
+        assert!(entry.supports_tools);
+        assert!(entry.supports_vision);
+    }
+
+    #[test]
+    fn xai_catalog_default_is_grok_4_3() {
+        assert_eq!(XAI_DEFAULT_MODEL, "grok-4.3");
+    }
+
+    #[test]
+    fn xai_catalog_all_have_xai_provider() {
+        for entry in XAI_CATALOG {
+            assert_eq!(entry.provider, "xai");
         }
     }
 }

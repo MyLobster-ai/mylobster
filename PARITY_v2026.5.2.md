@@ -18,7 +18,7 @@
 
 | Item | Status | Notes |
 |------|--------|-------|
-| xAI Grok 4.3 default chat model + bundled catalog entry | ❌ | `xai.rs` |
+| xAI Grok 4.3 default chat model + bundled catalog entry | ✅ | `providers/catalog.rs` (`XAI_CATALOG`, `XAI_DEFAULT_MODEL = "grok-4.3"`) |
 | xAI `web_search` 60s default timeout + structured timeout error + malformed Responses parse hardening | ❌ | `xai.rs` |
 | OpenAI-compat TTS `extraBody` / `extra_body` passthrough (`/audio/speech` `lang` etc.) | ❌ | `openai_compat.rs` + tts pipeline |
 | OpenAI Realtime + voice bridge: resolve `keychain:<service>:<account>` `OPENAI_API_KEY` refs (cached) | ❌ | `openai.rs` (we don't yet read keychain refs at all) |
@@ -187,7 +187,7 @@
 | Item | Status | Notes |
 |------|--------|-------|
 | `cron_changed` lifecycle helpers (created/updated/removed) *(v4.26)* | ✅ | landed `0b7dc36` |
-| Tolerate malformed persisted cron jobs (one bad entry doesn't abort the whole tick) | ❌ | `cron/scheduler.rs` |
+| Tolerate malformed persisted cron jobs (one bad entry doesn't abort the whole tick) | ✅ | `cron/mod.rs::parse_jobs_lenient` |
 | Retry recurring wake-now main-session jobs through temporary heartbeat busy skips before recording success | ❌ | `cron/scheduler.rs` |
 | Keep implicit/default isolated cron announce deliveries out of main session awareness queue | ❌ | `cron/dispatch.rs` |
 | Run cron announce payloads through normal TTS directive transform before outbound delivery | ❌ | `cron/dispatch.rs` |
@@ -305,9 +305,9 @@
 
 | Item | Status | Notes |
 |------|--------|-------|
-| Logging: redaction patterns for Tencent Cloud, Alibaba Cloud, HuggingFace, Replicate API keys | ❌ | `logging/redact.rs` |
-| Logging: redact payment credential field names (card number, CVC/CVV, shared payment token) | ❌ | `logging/redact.rs` |
-| Logging: extend `sanitizeForLog` to redact `?password=`/`?token=` query params and `Authorization:` headers | ❌ | `logging/redact.rs` |
+| Logging: redaction patterns for Tencent Cloud, Alibaba Cloud, HuggingFace, Replicate API keys | ✅ | `logging/redact.rs` |
+| Logging: redact payment credential field names (card number, CVC/CVV, shared payment token) | ✅ | `logging/redact.rs` |
+| Logging: extend `sanitizeForLog` to redact `?password=`/`?token=` query params and `Authorization:` headers | ✅ | `logging/redact.rs::redact_text` |
 | Path guards: fast path for canonical absolute POSIX containment checks | ❌ | `infra/path.rs` |
 | Security: block `COMSPEC` in workspace `.env`; case-insensitive Windows shell trust-root family | ❌ | `infra/env.rs` |
 | Security/audit: keep plain `security audit` on cold config/filesystem path; reserve plugin runtime collectors for `--deep` | ❌ | `cli/security.rs` |

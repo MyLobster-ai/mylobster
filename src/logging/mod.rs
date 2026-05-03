@@ -1,3 +1,7 @@
+pub mod redact;
+
+pub use redact::{redact_text, REDACTED};
+
 pub fn init() {
     tracing_subscriber::fmt()
         .with_env_filter(
