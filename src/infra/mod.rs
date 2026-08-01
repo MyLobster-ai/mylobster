@@ -8,5 +8,6 @@ pub mod proxy;
 pub mod secrets;
 pub mod security_path;
 pub mod state_migrations;
+pub mod text;
 pub mod timeouts;
 pub mod web_fetch;
