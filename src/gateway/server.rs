@@ -69,6 +69,38 @@ pub struct RpcState {
     pub route_manager: RwLock<RouteManager>,
     /// Model fallback state (v2026.3.11).
     pub model_fallback: parking_lot::RwLock<crate::agents::model_fallback::ModelFallbackState>,
+    /// Startup gate: shared retryable startup-sidecars error (v2026.5.2).
+    pub startup_gate: crate::gateway::startup::StartupGate,
+    /// Restart coordination (v2026.5.2 --force/--wait gateway-side support).
+    pub restart: crate::gateway::restart::RestartCoordinator,
+    /// Session organization state: archive/unread/groups (v2026.7.1).
+    pub session_org: crate::gateway::sessions_rpc::SessionOrgState,
+    /// Bounded sessions.list cache (v2026.5.2 large-store responsiveness).
+    pub sessions_list_cache: crate::gateway::sessions_rpc::SessionsListCache,
+    /// Cached health snapshot keyed by channel-state fingerprint (v2026.5.2).
+    pub health_cache: crate::gateway::health::HealthSnapshotCache,
+    /// Channels stopped via channels.stop (v2026.5.2).
+    pub stopped_channels: parking_lot::RwLock<std::collections::HashSet<String>>,
+    /// Terminal session registry (v2026.7.1 terminal.* RPCs).
+    pub terminals: crate::gateway::system_rpc::TerminalRegistry,
+    /// Talk session controller (v2026.7.1 talk.session.* RPCs).
+    pub talk_sessions: crate::gateway::system_rpc::TalkSessionController,
+    /// Bounded redacted startup errors for stability bundles (v2026.5.2).
+    pub startup_errors: crate::gateway::diagnostics::StartupErrorLog,
+    /// Idle liveness telemetry (v2026.5.2 — samples never hit warn logs).
+    pub idle_liveness: crate::gateway::diagnostics::IdleLivenessTelemetry,
+    /// Pairing-request flood guard (v2026.7.1).
+    pub pairing_limiter: crate::gateway::trust::SlidingWindowRateLimiter,
+    /// Plugin-tool-descriptor hash cache (v2026.5.2).
+    pub descriptor_hash_cache: crate::gateway::dispatch::ToolDescriptorHashCache,
+    /// Config generation counter for descriptor-hash cache keys (v2026.5.2).
+    pub config_generation: crate::gateway::dispatch::ConfigGeneration,
+    /// Descriptor-backed plugin method registry (v2026.7.1).
+    pub method_registry: crate::gateway::method_registry::MethodRegistry,
+    /// Dead-lettered delivery surfacing (v2026.7.1).
+    pub dead_letters: crate::gateway::delivery_recovery::DeadLetterQueue,
+    /// Control-plane-safe mode flag (crash-loop protection, v2026.7.1).
+    pub safe_mode: std::sync::atomic::AtomicBool,
 }
 
 impl RpcState {
@@ -103,6 +135,22 @@ impl RpcState {
             model_fallback: parking_lot::RwLock::new(
                 crate::agents::model_fallback::ModelFallbackState::default(),
             ),
+            startup_gate: crate::gateway::startup::StartupGate::new(),
+            restart: crate::gateway::restart::RestartCoordinator::new(),
+            session_org: crate::gateway::sessions_rpc::SessionOrgState::new(),
+            sessions_list_cache: crate::gateway::sessions_rpc::SessionsListCache::default(),
+            health_cache: crate::gateway::health::HealthSnapshotCache::default(),
+            stopped_channels: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            terminals: crate::gateway::system_rpc::TerminalRegistry::new(),
+            talk_sessions: crate::gateway::system_rpc::TalkSessionController::new(),
+            startup_errors: crate::gateway::diagnostics::StartupErrorLog::new(),
+            idle_liveness: crate::gateway::diagnostics::IdleLivenessTelemetry::new(),
+            pairing_limiter: crate::gateway::trust::SlidingWindowRateLimiter::pairing_default(),
+            descriptor_hash_cache: crate::gateway::dispatch::ToolDescriptorHashCache::new(),
+            config_generation: crate::gateway::dispatch::ConfigGeneration::new(),
+            method_registry: crate::gateway::method_registry::MethodRegistry::new(),
+            dead_letters: crate::gateway::delivery_recovery::DeadLetterQueue::new(),
+            safe_mode: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -140,6 +188,7 @@ pub struct GatewayServer {
 impl GatewayServer {
     /// Start the gateway server with the given configuration.
     pub async fn start(config: Config, opts: GatewayOpts) -> Result<Self> {
+        let boot_started = std::time::Instant::now();
         let port = opts.port.unwrap_or(config.gateway.port);
         let bind_addr = resolve_bind_address(&config, opts.bind.as_deref(), port);
 
@@ -147,13 +196,67 @@ impl GatewayServer {
         let env_token = std::env::var("MYLOBSTER_GATEWAY_TOKEN").ok();
         let auth = resolve_gateway_auth(Some(&config.gateway.auth), env_token.as_deref());
 
+        // v2026.7.1: fail closed when binding beyond loopback without any
+        // shared secret / trusted proxy; likewise reject no-auth Tailscale
+        // exposure.
+        let bind_is_loopback = bind_addr.ip().is_loopback();
+        crate::gateway::trust::require_auth_for_nonloopback(
+            bind_is_loopback,
+            auth.token.is_some(),
+            auth.password.is_some(),
+            config
+                .gateway
+                .trusted_proxies
+                .as_ref()
+                .map(|p| !p.is_empty())
+                .unwrap_or(false),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let tailscale_enabled = !matches!(
+            config.gateway.tailscale.mode,
+            crate::config::GatewayTailscaleMode::Off
+        );
+        crate::gateway::trust::reject_noauth_tailscale_exposure(
+            tailscale_enabled,
+            auth.token.is_some(),
+            auth.password.is_some(),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
+        let phase_start = std::time::Instant::now();
         let sessions = SessionStore::new(&config);
         let channels = ChannelManager::new(&config);
         let plugins = PluginRegistry::new(&config);
+        crate::gateway::startup::record_startup_phase("stores", phase_start);
 
         let rpc = RpcState::new();
+
+        // Crash-loop safe mode: repeated unclean boots hold transports until
+        // an operator recovers (v2026.7.1).
+        let ledger_path = crate::gateway::boot_ledger::boot_ledger_path();
+        let prior_boots = crate::gateway::boot_ledger::read_ledger(&ledger_path);
+        let safe_mode = crate::gateway::boot_ledger::assess_safe_mode(&prior_boots);
+        if safe_mode {
+            tracing::warn!(
+                "entering control-plane-safe mode after repeated unclean starts; \
+                 channels are held until a clean shutdown resets the boot ledger"
+            );
+            rpc.safe_mode
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        if let Err(e) = crate::gateway::boot_ledger::record_boot_start(
+            &ledger_path,
+            env!("CARGO_PKG_VERSION"),
+            now_ms,
+        ) {
+            tracing::debug!("boot ledger unavailable: {e}");
+        }
 
         let state = GatewayState {
             config: Arc::new(RwLock::new(config)),
@@ -168,8 +271,43 @@ impl GatewayServer {
             connected_clients: Arc::new(AtomicUsize::new(0)),
         };
 
-        // Start channel monitors
-        state.channels.start_all(&state).await?;
+        // v2026.4.29: stale-session recovery — clear busy flags / turn
+        // sources left behind by a previous run before serving traffic.
+        recover_stale_sessions(&state.sessions);
+
+        // Start channel monitors (held in control-plane-safe mode).
+        let phase_start = std::time::Instant::now();
+        if !state
+            .rpc
+            .safe_mode
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            if let Err(e) = state.channels.start_all(&state).await {
+                state.rpc.startup_errors.record(&format!("{e:#}"));
+                return Err(e);
+            }
+        }
+        crate::gateway::startup::record_startup_phase("channels", phase_start);
+
+        // Sidecars ready — early control-plane RPCs stop returning the
+        // shared retryable startup error (v2026.5.2).
+        state.rpc.startup_gate.mark_sidecars_ready();
+
+        // Slow-host startup diagnostics + event-loop readiness (v2026.4.27).
+        crate::gateway::startup::record_startup_phase("total-boot", boot_started);
+        let timeline = crate::gateway::startup::startup_timeline();
+        if timeline.is_slow_host() {
+            info!(
+                "slow-host startup detected ({} ms total); phases: {:?}",
+                timeline.total_ms(),
+                timeline.slow_phases()
+            );
+        }
+        let lag = crate::gateway::startup::measure_event_loop_lag().await;
+        if !crate::gateway::startup::event_loop_ready(lag) {
+            info!("event loop lag {}ms at startup (host under load)", lag.as_millis());
+        }
+        state.rpc.idle_liveness.record_sample(lag.as_millis() as u64);
 
         info!("Gateway server binding to {}", bind_addr);
 
@@ -201,6 +339,13 @@ impl GatewayServer {
         .with_graceful_shutdown(shutdown_signal(self.state.shutdown_tx.clone()))
         .await?;
 
+        // Clean shutdown → upgrade this boot's ledger record so crash-loop
+        // safe mode never triggers off graceful restarts (v2026.7.1).
+        let ledger_path = crate::gateway::boot_ledger::boot_ledger_path();
+        if let Err(e) = crate::gateway::boot_ledger::mark_clean_exit(&ledger_path) {
+            tracing::debug!("boot ledger clean-exit mark failed: {e}");
+        }
+
         info!("Gateway server shut down gracefully");
         Ok(())
     }
@@ -219,6 +364,25 @@ impl GatewayServer {
 /// Build the Axum router with all routes.
 fn build_router(state: GatewayState) -> Router {
     routes::build_routes(state)
+}
+
+/// Stale-session recovery (v2026.4.29): clear busy flags and turn sources
+/// left behind by an unclean previous run so fresh traffic is never blocked
+/// behind phantom in-flight turns.
+fn recover_stale_sessions(sessions: &SessionStore) {
+    let mut recovered = 0usize;
+    for info in sessions.list_sessions() {
+        if let Some(handle) = sessions.get_session_handle(&info.session_key) {
+            if handle.is_busy() {
+                handle.set_busy(false);
+                handle.clear_turn_source();
+                recovered += 1;
+            }
+        }
+    }
+    if recovered > 0 {
+        info!("recovered {recovered} stale busy session(s) at startup");
+    }
 }
 
 /// Wait for shutdown signal (Ctrl+C or SIGTERM).

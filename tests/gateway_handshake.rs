@@ -315,8 +315,9 @@ async fn post_handshake_method_returns_oc_response_format() {
     assert_eq!(list_resp["type"], "res");
     assert_eq!(list_resp["id"], "list-1");
     assert_eq!(list_resp["ok"], true);
-    // payload should be an array (possibly empty)
-    assert!(list_resp["payload"].is_array());
+    // Bounded sessions.list returns a paged object (upstream
+    // `SessionsListResultBase`); `sessions` holds the rows.
+    assert!(list_resp["payload"]["sessions"].is_array());
 
     let _ = shutdown.send(());
 }
@@ -811,8 +812,11 @@ async fn sessions_list_returns_empty() {
     let list_resp = recv_text(&mut rx).await;
     assert_eq!(list_resp["type"], "res");
     assert_eq!(list_resp["ok"], true);
-    // payload is the sessions array directly
-    assert!(list_resp["payload"].is_array());
+    // Bounded sessions.list (v2026.5.2/v2026.7.1) returns a paged object
+    // shaped like upstream `SessionsListResultBase`, not a bare array.
+    assert!(list_resp["payload"]["sessions"].is_array());
+    assert_eq!(list_resp["payload"]["count"], 0);
+    assert_eq!(list_resp["payload"]["hasMore"], false);
 
     let _ = shutdown.send(());
 }
@@ -1550,8 +1554,35 @@ async fn config_reload_changes_hash() {
     let reload_resp = recv_text(&mut rx).await;
     let hash2 = reload_resp["payload"]["hash"].as_str().unwrap().to_string();
 
-    // Hashes should differ after reload
-    assert_ne!(hash1, hash2, "config hash should change after reload");
+    // v2026.7.1 hot-path perf: a reload whose resulting config is byte-identical
+    // is a no-op and deliberately commits the EXISTING snapshot, so downstream
+    // descriptor-hash caches keep their memoized entries. The hash must not
+    // rotate and the response says so explicitly.
+    assert_eq!(hash1, hash2, "no-op reload must not rotate the config hash");
+    assert_eq!(reload_resp["payload"]["noop"], true);
+
+    // ...but a reload that actually changes the config still rotates the hash.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("changed.json");
+    std::fs::write(
+        &cfg_path,
+        serde_json::to_string(&json!({ "gateway": { "port": 24601 } })).unwrap(),
+    )
+    .unwrap();
+    let reload2 = json!({
+        "type": "req",
+        "id": "cr-2",
+        "method": "config.reload",
+        "params": { "configPath": cfg_path.to_string_lossy() }
+    });
+    tx.send(Message::Text(reload2.to_string().into()))
+        .await
+        .unwrap();
+    let reload2_resp = recv_text(&mut rx).await;
+    assert_eq!(reload2_resp["ok"], true, "reload failed: {reload2_resp}");
+    let hash3 = reload2_resp["payload"]["hash"].as_str().unwrap().to_string();
+    assert_ne!(hash2, hash3, "changed config must rotate the hash");
+    assert_ne!(reload2_resp["payload"]["noop"], true);
 
     let _ = shutdown.send(());
 }

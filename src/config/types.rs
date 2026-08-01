@@ -91,6 +91,10 @@ pub struct GatewayControlUiConfig {
     pub allow_insecure_auth: bool,
     #[serde(default)]
     pub dangerously_disable_device_auth: bool,
+    /// Max chat message bubble width in px for the Control UI, validated
+    /// config replacing patched bundled CSS (v2026.5.2). Valid range
+    /// 240–4096.
+    pub chat_message_max_width: Option<u32>,
 }
 
 impl Default for GatewayControlUiConfig {
@@ -102,6 +106,7 @@ impl Default for GatewayControlUiConfig {
             allowed_origins: None,
             allow_insecure_auth: false,
             dangerously_disable_device_auth: false,
+            chat_message_max_width: None,
         }
     }
 }
@@ -115,6 +120,22 @@ pub struct GatewayAuthConfig {
     pub password: Option<String>,
     #[serde(default)]
     pub allow_tailscale: bool,
+    /// Remote auth-attempt rate limit (v2026.7.1). Applied by default to
+    /// non-loopback peers; loopback is exempt unless `loopbackExempt` is
+    /// explicitly false.
+    pub rate_limit: Option<GatewayAuthRateLimitConfig>,
+}
+
+/// Remote auth rate limiting (v2026.7.1: `gateway.auth.rateLimit`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayAuthRateLimitConfig {
+    /// Max failed attempts per window (default 10).
+    pub max_attempts: Option<u32>,
+    /// Window in seconds (default 60).
+    pub window_seconds: Option<u32>,
+    /// Exempt loopback peers (default true).
+    pub loopback_exempt: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -493,6 +514,12 @@ pub struct AgentCompactionConfig {
     pub memory_flush: Option<AgentCompactionMemoryFlushConfig>,
     /// Whether to notify user when compaction occurs (v2026.4.1).
     pub notify_user: Option<bool>,
+    /// Mid-turn compaction precheck between tool-loop iterations
+    /// (`agents.defaults.compaction.midTurnPrecheck`, v2026.5.2). Default off.
+    pub mid_turn_precheck: Option<bool>,
+    /// Preflight compaction trigger: compact before a turn when the active
+    /// transcript exceeds this many bytes (v2026.4.26). Unset/0 = disabled.
+    pub max_active_transcript_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -585,6 +612,9 @@ pub struct HeartbeatConfig {
     #[serde(default)]
     pub include_reasoning: bool,
     pub direct_policy: Option<DirectPolicy>,
+    /// Skip heartbeat wakes while the agent has an active run
+    /// (agent-scoped, v2026.7.1 heartbeat overhaul).
+    pub skip_when_busy: Option<bool>,
 }
 
 impl Default for HeartbeatConfig {
@@ -601,6 +631,7 @@ impl Default for HeartbeatConfig {
             ack_max_chars: 30,
             include_reasoning: false,
             direct_policy: None,
+            skip_when_busy: None,
         }
     }
 }
@@ -660,6 +691,12 @@ pub struct SubagentsConfig {
     pub run_timeout_seconds: Option<u64>,
     /// Require explicit agentId in sessions_spawn calls (v2026.4.1).
     pub require_agent_id: Option<bool>,
+    /// Timeout for the child's completion announcement back to the parent
+    /// (`announceTimeoutMs`, v2026.7.1). Unset = runtime default.
+    pub announce_timeout_ms: Option<u64>,
+    /// Delegation mode for subagent-capable agents: `"suggest"` (default)
+    /// or `"prefer"` (v2026.7.1 `agents.defaults.subagents.delegationMode`).
+    pub delegation_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -708,6 +745,10 @@ pub struct AgentDefaultsConfig {
     pub subagents: Option<SubagentsConfig>,
     pub sandbox: Option<AgentSandboxConfig>,
     pub cli_backends: Option<HashMap<String, CliBackendConfig>>,
+    /// Skip optional workspace bootstrap files (TOOLS.md etc.) when building
+    /// the agent bootstrap context (`agents.defaults.skipOptionalBootstrapFiles`,
+    /// v2026.5.2). Default off.
+    pub skip_optional_bootstrap_files: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -778,6 +819,10 @@ pub struct AgentEntry {
     pub reasoning_default: Option<ThinkingLevel>,
     /// Per-agent fast mode default (v2026.4.1).
     pub fast_mode_default: Option<bool>,
+    /// Per-agent TTS overrides (`agents.list[].tts`, v2026.4.26). Resolved
+    /// via `agents::resolve_agent_tts`; falls back to the global `tts`
+    /// config when unset.
+    pub tts: Option<TtsConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -871,6 +916,35 @@ pub struct ModelProviderConfig {
     pub auth_header: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelDefinitionConfig>,
+    /// Provider-specific request/runtime params (v2026.5.2), e.g.
+    /// `models.providers.lmstudio.params.preload: false` or OpenAI-compat
+    /// `extraBody` passthrough fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+    /// On-demand local model service startup (v2026.6.x `localService`) —
+    /// e.g. the `ds4` local DeepSeek V4 Flash server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_service: Option<LocalServiceConfig>,
+}
+
+/// Provider-level local model service (v2026.6.x): starts an on-demand local
+/// model server before OpenAI-compatible requests hit it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalServiceConfig {
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_stop_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -936,6 +1010,8 @@ impl ModelsConfig {
                 headers: None,
                 auth_header: None,
                 models: vec![],
+                params: None,
+                local_service: None,
             });
     }
 
@@ -951,6 +1027,8 @@ impl ModelsConfig {
                 headers: None,
                 auth_header: None,
                 models: vec![],
+                params: None,
+                local_service: None,
             });
     }
 
@@ -966,6 +1044,8 @@ impl ModelsConfig {
                 headers: None,
                 auth_header: None,
                 models: vec![],
+                params: None,
+                local_service: None,
             });
     }
 
@@ -981,6 +1061,8 @@ impl ModelsConfig {
                 headers: None,
                 auth_header: None,
                 models: vec![],
+                params: None,
+                local_service: None,
             });
     }
 
@@ -996,6 +1078,8 @@ impl ModelsConfig {
                 headers: None,
                 auth_header: None,
                 models: vec![],
+                params: None,
+                local_service: None,
             });
     }
 }
@@ -1030,6 +1114,26 @@ pub enum ReplyToMode {
     Off,
     First,
     All,
+    /// Reply once per batched delivery (single-use like `First`) (v2026.7.1).
+    Batched,
+}
+
+/// Shared per-pair bot loop-guard settings (`channels.defaults.botLoopProtection`).
+///
+/// Ported from OpenClaw `src/plugin-sdk/pair-loop-guard-runtime.ts` +
+/// `src/channels/turn/bot-loop-protection.ts` (v2026.5.x). Defaults:
+/// `maxEventsPerWindow: 20`, `windowSeconds: 60`, `cooldownSeconds: 60`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BotLoopProtectionConfig {
+    /// Enables or disables loop protection for the channel/account scope.
+    pub enabled: Option<bool>,
+    /// Number of pair events allowed before cooldown starts.
+    pub max_events_per_window: Option<u32>,
+    /// Rolling event window size in seconds.
+    pub window_seconds: Option<u32>,
+    /// Suppression duration in seconds once the threshold is exceeded.
+    pub cooldown_seconds: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1037,6 +1141,25 @@ pub enum ReplyToMode {
 pub struct ChannelDefaultsConfig {
     pub group_policy: Option<GroupPolicy>,
     pub heartbeat: Option<HeartbeatConfig>,
+    /// Shared channel-turn kernel bot loop-guard defaults (v2026.5.x).
+    pub bot_loop_protection: Option<BotLoopProtectionConfig>,
+}
+
+/// A reusable message-channel access group (`accessGroups.<name>` at config
+/// root). `accessGroup:<name>` allowFrom entries reference these.
+///
+/// Ported from OpenClaw `src/channels/message-access/*` (v2026.5.x): static
+/// `message.senders` groups expand to sender ids during allowlist
+/// normalization; other (dynamic) group types resolve through runtime
+/// membership hooks and stay symbolic until then.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AccessGroupConfig {
+    /// Group type. `"message.senders"` (default) is a static sender-id list.
+    #[serde(rename = "type")]
+    pub group_type: Option<String>,
+    /// Sender ids for static `message.senders` groups.
+    pub senders: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1116,6 +1239,11 @@ pub struct TelegramGroupConfig {
     pub enabled: Option<bool>,
     pub allow_from: Option<Vec<String>>,
     pub system_prompt: Option<String>,
+    /// Restrict group control commands to chat admins (super-group support,
+    /// carryover v2026.4.9). Defaults to true in groups.
+    pub admin_only_commands: Option<bool>,
+    /// Agent bound to this group (account-scoped routing, v2026.7.1).
+    pub agent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1127,6 +1255,8 @@ pub struct TelegramTopicConfig {
     pub enabled: Option<bool>,
     pub allow_from: Option<Vec<String>>,
     pub system_prompt: Option<String>,
+    /// Agent bound to this forum topic (account-scoped routing, v2026.7.1).
+    pub agent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1181,6 +1311,23 @@ pub struct TelegramAccountConfig {
     pub auto_topic_label: Option<bool>,
     /// Suppress error reply messages (v2026.4.1).
     pub silent_error_replies: Option<bool>,
+    /// Account-level default for group admin-only control commands
+    /// (super-group support, carryover v2026.4.9).
+    pub admin_only_commands: Option<bool>,
+    /// Rich-message delivery flag, default false (v2026.7.1).
+    pub rich_messages: Option<bool>,
+    /// getUpdates watchdog stall threshold in ms, clamped 30_000..=600_000,
+    /// default 120_000 (v2026.7.1).
+    pub polling_stall_threshold_ms: Option<u64>,
+    /// Media-group buffer flush window in ms, default 500, floor 10
+    /// (v2026.7.1).
+    pub media_group_flush_ms: Option<u64>,
+    /// Roots under which local file paths may be sent through a local Bot API
+    /// server (v2026.7.1 `trustedLocalFileRoots`).
+    pub trusted_local_file_roots: Option<Vec<String>>,
+    /// DM exec-approval allowlist: sender ids exempt from exec approval even
+    /// with `ask: off` semantics preserved (v2026.7.1).
+    pub exec_approval_allow_from: Option<Vec<String>>,
 }
 
 impl Default for TelegramAccountConfig {
@@ -1229,6 +1376,12 @@ impl Default for TelegramAccountConfig {
             api_root: None,
             auto_topic_label: None,
             silent_error_replies: None,
+            admin_only_commands: None,
+            rich_messages: None,
+            polling_stall_threshold_ms: None,
+            media_group_flush_ms: None,
+            trusted_local_file_roots: None,
+            exec_approval_allow_from: None,
         }
     }
 }
@@ -1237,6 +1390,9 @@ impl Default for TelegramAccountConfig {
 #[serde(rename_all = "camelCase")]
 pub struct TelegramNetworkConfig {
     pub auto_select_family: Option<bool>,
+    /// DNS result order for Bot API transport: "ipv4first" | "verbatim".
+    /// Unset = inherit the process resolver order (v2026.5.2).
+    pub dns_result_order: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1334,6 +1490,120 @@ pub struct DiscordExecApprovalConfig {
     pub cleanup_after_resolve: Option<bool>,
 }
 
+/// Discord voice channel conversation settings (v2026.4.25+).
+///
+/// Voice conversations are text-only by default: the agent returns plain text
+/// and Discord voice synthesizes/plays it (the agent-side `tts` tool is hidden
+/// on voice turns).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscordVoiceConfig {
+    /// Enable Discord voice channel conversations (default: true).
+    pub enabled: Option<bool>,
+    /// Voice conversation mode ("stt-tts" | "agent-proxy" | "bidi"). Default: agent-proxy.
+    pub mode: Option<String>,
+    /// Optional LLM model override for Discord voice channel responses (v2026.4.25).
+    pub model: Option<String>,
+    /// Optional TTS overrides for Discord voice output.
+    pub tts: Option<serde_json::Value>,
+    /// Realtime provider settings for agent-proxy or bidi modes (v2026.7.1).
+    pub realtime: Option<DiscordVoiceRealtimeConfig>,
+    /// Voice channels to auto-join on startup (v2026.7.1).
+    pub auto_join: Option<Vec<DiscordVoiceChannelRef>>,
+    /// Voice channels the bot is allowed to join or remain in. Unset = any (v2026.7.1).
+    pub allowed_channels: Option<Vec<DiscordVoiceChannelRef>>,
+    /// If false, configured followUsers are ignored without removing the list (v2026.7.1).
+    pub follow_users_enabled: Option<bool>,
+    /// Discord user IDs whose current voice channel the bot should follow (v2026.7.1).
+    pub follow_users: Option<Vec<String>>,
+    /// Enable/disable DAVE end-to-end encryption (default: true) (v2026.7.1).
+    pub dave_encryption: Option<bool>,
+    /// Consecutive decrypt failures before DAVE session reinit (default: 24) (v2026.7.1).
+    pub decryption_failure_tolerance: Option<u64>,
+    /// Initial voice Ready wait in ms (default: 30000) (v2026.7.1).
+    pub connect_timeout_ms: Option<u64>,
+    /// Grace period for voice reconnect signalling after a disconnect (default: 15000) (v2026.7.1).
+    pub reconnect_grace_ms: Option<u64>,
+    /// Silence grace after a speaker ends before finalizing STT capture (default: 2000) (v2026.7.1).
+    pub capture_silence_grace_ms: Option<u64>,
+}
+
+/// A guild+channel voice channel reference (v2026.7.1).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscordVoiceChannelRef {
+    pub guild_id: String,
+    pub channel_id: String,
+}
+
+/// Realtime voice provider settings for Discord voice (v2026.7.1).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscordVoiceRealtimeConfig {
+    /// Realtime voice provider id, for example "openai".
+    pub provider: Option<String>,
+    /// Provider realtime session model.
+    pub model: Option<String>,
+    /// Provider realtime output voice name.
+    pub speaker_voice: Option<String>,
+    /// System instructions passed to the realtime provider.
+    pub instructions: Option<String>,
+    /// Tool policy for bidi realtime consult calls ("safe-read-only" | "owner" | "none").
+    pub tool_policy: Option<String>,
+    /// Whether the OpenClaw agent brain is forced for every substantive turn ("auto" | "always").
+    pub consult_policy: Option<String>,
+    /// Require a wake name before agent-proxy realtime voice responds.
+    pub require_wake_name: Option<bool>,
+    /// Wake names allowed to trigger a response. Defaults to routed agent name, then agent id.
+    pub wake_names: Option<Vec<String>>,
+    /// Allow speaker-start events to interrupt active realtime playback.
+    pub barge_in: Option<bool>,
+    /// Minimum assistant playback duration before a barge-in truncates audio. Default: 250ms.
+    pub min_barge_in_audio_end_ms: Option<u64>,
+    /// Debounce window before buffered transcripts are sent to the agent.
+    pub debounce_ms: Option<u64>,
+}
+
+/// Thread binding lifecycle settings (focus/subagent thread sessions) (v2026.7.1).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscordThreadBindingsConfig {
+    /// Enable Discord thread binding features.
+    pub enabled: Option<bool>,
+    /// Inactivity window for thread-bound sessions in hours. 0 disables. Default: 24.
+    pub idle_hours: Option<u64>,
+    /// Optional hard max age for thread-bound sessions in hours. 0 disables. Default: 0.
+    pub max_age_hours: Option<u64>,
+    /// Allow session spawns to auto-create + bind Discord threads. Default: true.
+    pub spawn_sessions: Option<bool>,
+    /// Default context mode for native subagents spawned into a bound thread ("isolated" | "fork").
+    pub default_spawn_context: Option<String>,
+    /// Legacy split toggle superseded by `spawnSessions` (v2026.5.2).
+    /// Read for back-compat only; `openclaw doctor --fix` migrates it
+    /// (doctor migration owned by the CLI cluster).
+    pub subagent_sessions: Option<bool>,
+    /// Legacy split toggle superseded by `spawnSessions` (v2026.5.2).
+    pub acp_sessions: Option<bool>,
+}
+
+impl DiscordThreadBindingsConfig {
+    /// Effective `threadBindings.spawnSessions` value, honoring the legacy
+    /// split `subagentSessions`/`acpSessions` toggles it replaced
+    /// (OpenClaw v2026.5.2). Precedence: explicit `spawnSessions`, else
+    /// `true` unless BOTH legacy toggles are explicitly `false` (either
+    /// legacy toggle enabling spawn keeps spawns on). Default: `true`.
+    pub fn resolve_spawn_sessions(&self) -> bool {
+        if let Some(explicit) = self.spawn_sessions {
+            return explicit;
+        }
+        match (self.subagent_sessions, self.acp_sessions) {
+            (Some(false), Some(false)) => false,
+            (Some(false), None) | (None, Some(false)) => false,
+            _ => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscordAccountConfig {
@@ -1369,6 +1639,21 @@ pub struct DiscordAccountConfig {
     pub response_prefix: Option<String>,
     /// Per-account health monitor override (v2026.4.1).
     pub health_monitor: Option<ChannelHealthMonitorConfig>,
+    /// Startup wait for the gateway READY event before restarting the socket (ms). Default: 15000. (v2026.5.2)
+    pub gateway_ready_timeout_ms: Option<u64>,
+    /// Runtime reconnect wait for the gateway READY event before force-stopping the lifecycle (ms). Default: 30000. (v2026.5.2)
+    pub gateway_runtime_ready_timeout_ms: Option<u64>,
+    /// Deterministic outbound `@handle` rewrites for known Discord users.
+    /// Keys are handles without the leading `@`; values are Discord user IDs. (v2026.5.2)
+    pub mention_aliases: Option<HashMap<String, String>>,
+    /// Voice channel conversation settings (v2026.4.25+).
+    pub voice: Option<DiscordVoiceConfig>,
+    /// Suppress Discord-generated link embeds for outbound messages. Default: true. (v2026.7.1)
+    pub suppress_embeds: Option<bool>,
+    /// Thread binding lifecycle settings (v2026.7.1).
+    pub thread_bindings: Option<DiscordThreadBindingsConfig>,
+    /// Timeout for Discord /gateway/bot metadata lookup (ms). Default: 30000. (v2026.7.1)
+    pub gateway_info_timeout_ms: Option<u64>,
 }
 
 /// Per-channel/account health monitor configuration (v2026.4.1).
@@ -1411,6 +1696,13 @@ impl Default for DiscordAccountConfig {
             pluralkit: None,
             response_prefix: None,
             health_monitor: None,
+            gateway_ready_timeout_ms: None,
+            gateway_runtime_ready_timeout_ms: None,
+            mention_aliases: None,
+            voice: None,
+            suppress_embeds: None,
+            thread_bindings: None,
+            gateway_info_timeout_ms: None,
         }
     }
 }
@@ -1444,6 +1736,21 @@ pub struct SlackDmConfig {
     pub reply_to_mode: Option<ReplyToMode>,
 }
 
+/// `allowBots` accepts `true`/`false` or the string `"mentions"` (v2026.7.1):
+/// `mentions` admits other bots' messages only when this bot is mentioned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SlackAllowBots {
+    Flag(bool),
+    Mode(SlackAllowBotsMode),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SlackAllowBotsMode {
+    Mentions,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SlackChannelConfig {
@@ -1452,10 +1759,24 @@ pub struct SlackChannelConfig {
     pub require_mention: Option<bool>,
     pub tools: Option<serde_json::Value>,
     pub tools_by_sender: Option<HashMap<String, serde_json::Value>>,
-    pub allow_bots: Option<bool>,
+    pub allow_bots: Option<SlackAllowBots>,
+    /// Drop unmentioned channel messages that mention someone else (v2026.7.1).
+    pub ignore_other_mentions: Option<bool>,
+    /// Per-channel reply-to mode override (v2026.7.1).
+    pub reply_to_mode: Option<ReplyToMode>,
     pub users: Option<Vec<String>>,
     pub skills: Option<Vec<String>>,
     pub system_prompt: Option<String>,
+}
+
+/// Router relay mode: a central router forwards Slack events to the owning
+/// gateway over a WebSocket relay (v2026.7.1, `extensions/slack/src/monitor/relay-source.ts`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SlackRelayConfig {
+    pub url: Option<String>,
+    pub auth_token: Option<String>,
+    pub gateway_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1503,12 +1824,23 @@ pub struct SlackAccountConfig {
     pub app_token: Option<String>,
     pub user_token: Option<String>,
     pub user_token_read_only: Option<bool>,
-    pub allow_bots: Option<bool>,
+    pub allow_bots: Option<SlackAllowBots>,
     pub require_mention: Option<bool>,
     pub group_policy: Option<GroupPolicy>,
     pub history_limit: Option<u32>,
     pub dm_history_limit: Option<u32>,
     pub dms: Option<SlackDmConfig>,
+    /// Expand inline link previews on outbound messages (default: false) (v2026.7.1).
+    pub unfurl_links: Option<bool>,
+    /// Expand inline media previews on outbound messages (default: off) (v2026.7.1).
+    pub unfurl_media: Option<bool>,
+    /// Broadcast thread replies back to the channel (default: false) (v2026.7.1).
+    pub reply_broadcast: Option<bool>,
+    /// Allow `channels` config keys to match by channel name (with warning)
+    /// instead of channel ID only (v2026.7.1).
+    pub allow_name_matching: Option<bool>,
+    /// Router relay mode settings; active when `mode == "relay"` (v2026.7.1).
+    pub relay: Option<SlackRelayConfig>,
     #[serde(default = "default_slack_text_chunk_limit")]
     pub text_chunk_limit: u32,
     pub chunk_mode: Option<String>,
@@ -1550,6 +1882,11 @@ impl Default for SlackAccountConfig {
             history_limit: None,
             dm_history_limit: None,
             dms: None,
+            unfurl_links: None,
+            unfurl_media: None,
+            reply_broadcast: None,
+            allow_name_matching: None,
+            relay: None,
             text_chunk_limit: 4000,
             chunk_mode: None,
             block_streaming: None,
@@ -1619,6 +1956,54 @@ pub struct WhatsAppAckReaction {
     pub group: Option<String>,
 }
 
+/// WhatsApp socket timing overrides (v2026.7.1, `socket-timing.ts`).
+/// Non-positive values fall back to defaults (25s keep-alive, 60s connect,
+/// 60s default query timeout).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WhatsAppSocketTimingConfig {
+    pub keep_alive_interval_ms: Option<u64>,
+    pub connect_timeout_ms: Option<u64>,
+    pub default_query_timeout_ms: Option<u64>,
+}
+
+/// WhatsApp reconnect backoff overrides (v2026.7.1, `reconnect.ts`).
+/// Values are clamped at resolve time (initial >= 250ms, factor 1.1–10,
+/// jitter 0–1).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WhatsAppReconnectConfig {
+    pub initial_ms: Option<u64>,
+    pub max_ms: Option<u64>,
+    pub factor: Option<f64>,
+    pub jitter: Option<f64>,
+    pub max_attempts: Option<u32>,
+}
+
+/// WhatsApp status-reaction lifecycle emojis (v2026.7.1,
+/// `status-reaction.ts`): queued → thinking → tool → done/error. Empty
+/// `done`/`error` values clear the reaction on terminal transition.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WhatsAppStatusReactionsConfig {
+    pub enabled: Option<bool>,
+    pub queued: Option<String>,
+    pub thinking: Option<String>,
+    pub tool: Option<String>,
+    pub done: Option<String>,
+    pub error: Option<String>,
+    pub min_update_interval_ms: Option<u64>,
+}
+
+/// Group visible-reply policy (v2026.7.1): groups default to
+/// `messageToolOnly` — only explicit message-tool sends are visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WhatsAppGroupVisibleReplyMode {
+    MessageToolOnly,
+    Always,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WhatsAppAccountConfig {
@@ -1652,6 +2037,18 @@ pub struct WhatsAppAccountConfig {
     pub actions: Option<WhatsAppActionConfig>,
     /// Reaction level guidance for agent reactions (v2026.4.1).
     pub reaction_level: Option<WhatsAppReactionLevel>,
+    /// Socket timing overrides (v2026.7.1).
+    pub socket_timing: Option<WhatsAppSocketTimingConfig>,
+    /// Reconnect backoff overrides (v2026.7.1).
+    pub reconnect: Option<WhatsAppReconnectConfig>,
+    /// Status-reaction lifecycle configuration (v2026.7.1).
+    pub status_reactions: Option<WhatsAppStatusReactionsConfig>,
+    /// Group visible-reply policy; groups default to message-tool-only
+    /// (v2026.7.1).
+    pub group_visible_reply_mode: Option<WhatsAppGroupVisibleReplyMode>,
+    /// Send outbound media as a document with the original bytes — no image
+    /// re-encode (v2026.7.1 `forceDocument`).
+    pub force_document: Option<bool>,
 }
 
 impl Default for WhatsAppAccountConfig {
@@ -1685,6 +2082,11 @@ impl Default for WhatsAppAccountConfig {
             heartbeat: None,
             actions: None,
             reaction_level: None,
+            socket_timing: None,
+            reconnect: None,
+            status_reactions: None,
+            group_visible_reply_mode: None,
+            force_document: None,
         }
     }
 }
@@ -1708,8 +2110,22 @@ pub struct SignalConfig {
     pub api_url: Option<String>,
     pub phone_number: Option<String>,
     pub allow_from: Option<Vec<String>>,
+    /// Group allowlist. Entries match inbound group ids (`group:<id>` or bare
+    /// id) AND sender ids (E.164 / `uuid:<id>`); `*` allows all
+    /// (v2026.7.1, `extensions/signal/src/monitor/access-policy.ts`).
+    pub group_allow_from: Option<Vec<String>>,
     pub group_policy: Option<GroupPolicy>,
     pub dm_policy: Option<DmPolicy>,
+    /// Max inbound attachment size in MB (default 8). The `getAttachment` RPC
+    /// response cap is derived with base64 headroom (~4/3 expansion + 64KiB).
+    pub media_max_mb: Option<f64>,
+    /// Target aliases: alias name -> E.164 / `uuid:<id>` / `username:<name>` /
+    /// `group:<id>` (chains allowed, recursion rejected).
+    pub aliases: Option<HashMap<String, String>>,
+    /// Inbound reaction notification mode: `off` | `own` (default) | `all`.
+    pub reaction_notifications: Option<String>,
+    /// Agent reaction level: `off` | `ack` | `minimal` (default) | `extensive`.
+    pub reaction_level: Option<String>,
 }
 
 // ============================================================================
@@ -1720,12 +2136,41 @@ pub struct SignalConfig {
 #[serde(rename_all = "camelCase")]
 pub struct IMessageConfig {
     pub enabled: Option<bool>,
+    /// Backend provider: `imsg` (default, local imsg CLI) or `bluebubbles`
+    /// (legacy REST bridge; the upstream BlueBubbles channel was removed in
+    /// v2026.7.1 in favor of `channels.imessage` with the imsg backend).
     pub provider: Option<String>,
     pub api_url: Option<String>,
     pub api_password: Option<String>,
     pub allow_from: Option<Vec<String>>,
+    /// Group allowlist (falls back to `allow_from` when empty).
+    pub group_allow_from: Option<Vec<String>>,
     pub group_policy: Option<GroupPolicy>,
     pub dm_policy: Option<DmPolicy>,
+    /// Path to the `imsg` CLI binary (default `imsg`).
+    pub cli_path: Option<String>,
+    /// Path to the Messages `chat.db` (default `~/Library/Messages/chat.db`).
+    pub db_path: Option<String>,
+    /// Remote host fronting `chat.db` (SSH bridge deployments).
+    pub remote_host: Option<String>,
+    /// Max inbound attachment size in MB (default 8).
+    pub media_max_mb: Option<f64>,
+    /// Inbound tapback notification mode: `off` | `own` (default) | `all`.
+    pub reaction_notifications: Option<String>,
+    /// Per-group config keyed by `chat_id` (or `*` wildcard).
+    pub groups: Option<HashMap<String, IMessageGroupConfig>>,
+}
+
+/// Per-group iMessage configuration (v2026.7.1,
+/// `extensions/imessage/src/monitor/inbound-processing.ts`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct IMessageGroupConfig {
+    /// Per-group system prompt. A present-but-empty value suppresses the `*`
+    /// wildcard prompt for this group instead of inheriting it.
+    pub system_prompt: Option<String>,
+    pub allow_from: Option<Vec<String>>,
+    pub require_mention: Option<bool>,
 }
 
 // ============================================================================
@@ -1862,6 +2307,81 @@ pub struct WebSearchConfig {
     /// Brave-specific overrides (v2026.5.2): base_url for compatible proxies
     /// and opt-in HTTP diagnostics flag.
     pub brave: Option<BraveSearchConfig>,
+    /// Exa web search provider (v2026.7.1): base URL override with
+    /// endpoint-partitioned caches.
+    pub exa: Option<ExaSearchConfig>,
+    /// MiniMax Coding Plan search provider (v2026.7.1).
+    pub minimax: Option<MinimaxSearchConfig>,
+    /// Gemini grounding-based web search provider (v2026.7.1). Falls back to
+    /// the Google model-provider API key / base URL when unset.
+    pub gemini: Option<GeminiSearchConfig>,
+    /// Parallel bundled search provider (v2026.7.1).
+    pub parallel: Option<ParallelSearchConfig>,
+    /// DuckDuckGo key-free provider (v2026.7.1, explicit opt-in only).
+    pub duckduckgo: Option<DuckDuckGoSearchConfig>,
+}
+
+/// Exa web-search provider configuration (v2026.7.1).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ExaSearchConfig {
+    pub api_key: Option<String>,
+    /// Override for the Exa search endpoint base URL. `/search` is appended
+    /// when missing. Caches are partitioned per resolved endpoint.
+    pub base_url: Option<String>,
+}
+
+/// MiniMax Coding Plan web-search provider configuration (v2026.7.1).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MinimaxSearchConfig {
+    pub api_key: Option<String>,
+    /// Explicit region: "cn" or "global". When unset the region is inferred
+    /// from `MINIMAX_API_HOST` or the configured MiniMax provider base URL.
+    pub region: Option<String>,
+}
+
+/// Gemini grounding web-search provider configuration (v2026.7.1).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiSearchConfig {
+    pub api_key: Option<String>,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+}
+
+/// Parallel web-search provider configuration (v2026.7.1).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ParallelSearchConfig {
+    pub api_key: Option<String>,
+    /// Base URL override; `/v1/search` is appended when missing. Caches are
+    /// partitioned per resolved endpoint.
+    pub base_url: Option<String>,
+}
+
+/// DuckDuckGo key-free web-search provider configuration (v2026.7.1).
+/// Never auto-selected — explicit `provider: "duckduckgo"` opt-in only.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DuckDuckGoSearchConfig {
+    /// DDG region code (e.g. `us-en`).
+    pub region: Option<String>,
+    /// Safe-search level: "strict" | "moderate" (default) | "off".
+    pub safe_search: Option<String>,
+}
+
+/// Managed outbound proxy configuration (v2026.7.1, upstream `proxy` section).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyConfig {
+    pub enabled: Option<bool>,
+    /// http:// or https:// proxy URL.
+    pub proxy_url: Option<String>,
+    /// Loopback-target routing: "gateway-only" (default; only the gateway may
+    /// reach loopback directly), "proxy" (loopback goes through the proxy
+    /// too), or "block" (loopback targets are refused).
+    pub loopback_mode: Option<String>,
 }
 
 /// Brave web-search provider configuration (v2026.5.2).
@@ -1881,6 +2401,12 @@ pub struct BraveSearchConfig {
     /// Opt-in `brave.http` diagnostics. Logs request URL, status, timing,
     /// and cache events without ever logging the API key or response body.
     pub http: Option<bool>,
+    /// Brave API mode: "web" (default) or "llm-context" (v2026.7.1).
+    pub mode: Option<String>,
+    /// Brave-scoped API key (v2026.7.1). Preferred over the legacy top-level
+    /// `tools.web.search.apiKey`, mirroring upstream's move of the Brave key
+    /// into the provider-scoped plugin entry.
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1914,6 +2440,9 @@ pub struct SearxngSearchConfig {
     pub engines: Option<Vec<String>>,
     pub language: Option<String>,
     pub timeout_seconds: Option<u64>,
+    /// Default comma-joined search categories (v2026.7.1). Empty non-general
+    /// category results retry once with "general".
+    pub categories: Option<Vec<String>>,
 }
 
 /// X (Twitter) search configuration via xAI Grok (v2026.4.1).
@@ -1939,6 +2468,26 @@ pub struct WebFetchConfig {
     pub firecrawl: Option<FirecrawlConfig>,
     /// Maximum response bytes for truncation (v2026.4.1).
     pub max_response_bytes: Option<u64>,
+    /// Explicit external web_fetch provider id (v2026.7.1), e.g. "firecrawl".
+    /// Only honored for non-sandboxed fetches; sandboxed fetches stay bundled.
+    pub provider: Option<String>,
+    /// Route web_fetch through a trusted HTTP(S) env proxy (v2026.7.1).
+    pub use_trusted_env_proxy: Option<bool>,
+    /// SSRF policy overrides for trusted proxy stacks (v2026.7.1).
+    pub ssrf_policy: Option<WebFetchSsrfPolicyConfig>,
+}
+
+/// SSRF policy overrides for `web_fetch` (v2026.7.1).
+///
+/// Both flags are opt-in escapes for fake-IP proxy stacks (sing-box, Clash,
+/// Surge) that resolve foreign domains into reserved ranges.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WebFetchSsrfPolicyConfig {
+    /// Allow RFC 2544 benchmark range (198.18.0.0/15) targets.
+    pub allow_rfc2544_benchmark_range: Option<bool>,
+    /// Allow IPv6 Unique Local Addresses (fc00::/7) targets.
+    pub allow_ipv6_unique_local_range: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2138,6 +2687,11 @@ pub enum EmbeddingProvider {
     Local,
     Voyage,
     Ollama,
+    /// DeepInfra OpenAI-compatible embeddings (v2026.4.27).
+    Deepinfra,
+    /// Disable embeddings entirely: FTS-only search, skips embedding
+    /// capability discovery (v2026.6.x `memorySearch.provider=none`).
+    None,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2150,6 +2704,10 @@ pub struct MemorySearchConfig {
     pub extra_paths: Vec<String>,
     pub experimental: Option<bool>,
     pub provider: Option<EmbeddingProvider>,
+    /// Asymmetric embedding input type (v2026.4.26 `memorySearch.inputType`):
+    /// "query" or "document". When set, providers that support asymmetric
+    /// endpoints embed retrieval queries and documents differently.
+    pub input_type: Option<String>,
     pub remote: Option<MemorySearchRemoteConfig>,
     pub fallback: Option<String>,
     pub model: Option<String>,
@@ -2428,6 +2986,55 @@ pub struct MessagesConfig {
     /// `message(action=send)` tool calls; bare LLM text is suppressed.
     /// Defaults to None (off). (OpenClaw v2026.4.29)
     pub visible_replies: Option<bool>,
+    /// Lifecycle status reactions configuration (v2026.7.1).
+    pub status_reactions: Option<StatusReactionsConfig>,
+}
+
+/// Lifecycle status reactions (queued→thinking→tool→done/error) (v2026.7.1).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusReactionsConfig {
+    /// Enable lifecycle status reactions (default: false).
+    pub enabled: Option<bool>,
+    /// Override default emojis.
+    pub emojis: Option<StatusReactionsEmojiConfig>,
+    /// Override default timing.
+    pub timing: Option<StatusReactionsTimingConfig>,
+}
+
+/// Emoji overrides for each status reaction state (v2026.7.1).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusReactionsEmojiConfig {
+    pub queued: Option<String>,
+    pub thinking: Option<String>,
+    pub tool: Option<String>,
+    pub coding: Option<String>,
+    pub web: Option<String>,
+    pub deploy: Option<String>,
+    pub build: Option<String>,
+    pub concierge: Option<String>,
+    pub done: Option<String>,
+    pub error: Option<String>,
+    pub stall_soft: Option<String>,
+    pub stall_hard: Option<String>,
+    pub compacting: Option<String>,
+}
+
+/// Timing controls for debounced status reactions and stall warnings (v2026.7.1).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusReactionsTimingConfig {
+    /// Debounce interval for intermediate states (ms). Default: 700.
+    pub debounce_ms: Option<u64>,
+    /// Soft stall warning timeout (ms). Default: 10000.
+    pub stall_soft_ms: Option<u64>,
+    /// Hard stall warning timeout (ms). Default: 30000.
+    pub stall_hard_ms: Option<u64>,
+    /// How long to hold done emoji before cleanup (ms). Default: 1500.
+    pub done_hold_ms: Option<u64>,
+    /// How long to hold error emoji before cleanup (ms). Default: 2500.
+    pub error_hold_ms: Option<u64>,
 }
 
 // ============================================================================
@@ -2527,6 +3134,22 @@ pub struct SessionMaintenanceConfig {
     pub prune_days: Option<u32>,
     pub max_entries: Option<u64>,
     pub rotate_bytes: Option<String>,
+    /// Disk budget for stored transcripts; oldest non-durable sessions are
+    /// evicted when total transcript bytes exceed this (v2026.5.2).
+    pub max_disk_bytes: Option<u64>,
+}
+
+/// Transcript write-lock tuning (v2026.5.2 `session.writeLock`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionWriteLockConfig {
+    /// Max time to wait for a transcript write lock before failing the
+    /// acquisition (milliseconds). Default 60_000 (v2026.5.2).
+    pub acquire_timeout_ms: Option<u64>,
+    /// Max time a holder may keep the lock before it can be reclaimed at
+    /// acquisition time as stale (milliseconds). Default 300_000 (v2026.7.1
+    /// max-hold reclaim).
+    pub max_hold_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2548,6 +3171,8 @@ pub struct SessionConfig {
     pub send_policy: Option<SessionSendPolicyConfig>,
     pub agent_to_agent: Option<SessionAgentToAgentConfig>,
     pub maintenance: Option<SessionMaintenanceConfig>,
+    /// Transcript write-lock tuning (v2026.5.2).
+    pub write_lock: Option<SessionWriteLockConfig>,
 }
 
 // ============================================================================
@@ -2611,6 +3236,10 @@ pub struct DiagnosticsConfig {
     pub flags: Option<Vec<String>>,
     pub otel: Option<DiagnosticsOtelConfig>,
     pub cache_trace: Option<DiagnosticsCacheTraceConfig>,
+    /// Abort threshold for outcome-driven stuck-session recovery in ms
+    /// (v2026.7.1: `diagnostics.stuckSessionAbortMs`). Default 10 minutes;
+    /// values below 10s are clamped up.
+    pub stuck_session_abort_ms: Option<u64>,
 }
 
 // ============================================================================

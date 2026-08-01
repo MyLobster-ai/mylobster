@@ -1,5 +1,14 @@
 pub mod acp;
+pub mod codex;
+pub mod commitments;
+pub mod compaction;
+pub mod failover;
+pub mod heartbeat;
 pub mod model_fallback;
+pub mod reply_policy;
+pub mod reply_sanitize;
+pub mod subagents;
+pub mod tool_loop;
 pub mod tools;
 
 use crate::config::Config;
@@ -154,6 +163,37 @@ pub fn normalize_tool_result(result: tools::ToolResult) -> tools::ToolResult {
     }
 }
 
+// ============================================================================
+// Per-agent config resolution (v2026.4.26 / v2026.5.2)
+// ============================================================================
+
+/// Find the `agents.list[]` entry for an agent id.
+pub fn find_agent_entry<'a>(
+    config: &'a Config,
+    agent_id: &str,
+) -> Option<&'a crate::config::types::AgentEntry> {
+    config.agents.list.iter().find(|a| a.id == agent_id)
+}
+
+/// Resolve the effective TTS config for an agent (v2026.4.26
+/// `agents.list[].tts`): the per-agent override wins; otherwise the global
+/// `tts` config applies. The TTS pipeline consumes the returned config.
+pub fn resolve_agent_tts<'a>(
+    config: &'a Config,
+    agent_id: &str,
+) -> &'a crate::config::types::TtsConfig {
+    find_agent_entry(config, agent_id)
+        .and_then(|entry| entry.tts.as_ref())
+        .unwrap_or(&config.tts)
+}
+
+/// Whether optional workspace bootstrap files (TOOLS.md and friends) should
+/// be skipped when building agent bootstrap context (v2026.5.2
+/// `agents.defaults.skipOptionalBootstrapFiles`).
+pub fn skip_optional_bootstrap_files(config: &Config) -> bool {
+    config.agent.skip_optional_bootstrap_files.unwrap_or(false)
+}
+
 /// Handle an OpenResponses API request.
 pub async fn handle_responses_api(
     config: &Config,
@@ -227,4 +267,69 @@ pub async fn handle_responses_api(
             "output_tokens": response.usage.output_tokens.unwrap_or(0),
         }
     }))
+}
+
+#[cfg(test)]
+mod agent_config_tests {
+    use super::*;
+    use crate::config::types::{AgentEntry, TtsConfig};
+
+    #[test]
+    fn resolve_agent_tts_prefers_per_agent_override() {
+        let mut config = Config::default();
+        config.tts.provider = None;
+        config.agents.list.push(AgentEntry {
+            id: "fany".into(),
+            tts: Some(TtsConfig {
+                enabled: Some(true),
+                mode: Some("voice".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let tts = resolve_agent_tts(&config, "fany");
+        assert_eq!(tts.mode.as_deref(), Some("voice"));
+        assert_eq!(tts.enabled, Some(true));
+    }
+
+    #[test]
+    fn resolve_agent_tts_falls_back_to_global() {
+        let mut config = Config::default();
+        config.tts.mode = Some("global-mode".into());
+        config.agents.list.push(AgentEntry {
+            id: "no-override".into(),
+            ..Default::default()
+        });
+
+        // Agent without override → global config.
+        assert_eq!(
+            resolve_agent_tts(&config, "no-override").mode.as_deref(),
+            Some("global-mode")
+        );
+        // Unknown agent → global config.
+        assert_eq!(
+            resolve_agent_tts(&config, "missing").mode.as_deref(),
+            Some("global-mode")
+        );
+    }
+
+    #[test]
+    fn skip_optional_bootstrap_files_defaults_off() {
+        let mut config = Config::default();
+        assert!(!skip_optional_bootstrap_files(&config));
+        config.agent.skip_optional_bootstrap_files = Some(true);
+        assert!(skip_optional_bootstrap_files(&config));
+    }
+
+    #[test]
+    fn find_agent_entry_by_id() {
+        let mut config = Config::default();
+        config.agents.list.push(AgentEntry {
+            id: "a".into(),
+            ..Default::default()
+        });
+        assert!(find_agent_entry(&config, "a").is_some());
+        assert!(find_agent_entry(&config, "b").is_none());
+    }
 }

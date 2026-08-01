@@ -68,6 +68,7 @@ pub async fn run_diagnostics() -> Result<Vec<DiagnosticResult>> {
     results.push(check_ffmpeg().await);
     results.push(check_disk_space().await);
     results.push(check_network_anthropic().await);
+    results.push(check_startup_timeline());
 
     let ok = results.iter().filter(|r| r.status == DiagnosticStatus::Ok).count();
     let warn = results.iter().filter(|r| r.status == DiagnosticStatus::Warning).count();
@@ -89,6 +90,45 @@ pub async fn run_diagnostics() -> Result<Vec<DiagnosticResult>> {
 // ---------------------------------------------------------------------------
 // Individual checks
 // ---------------------------------------------------------------------------
+
+/// Startup diagnostics timeline (v2026.4.29) — reports recorded startup
+/// phases from `gateway::startup`, flagging slow hosts.
+fn check_startup_timeline() -> DiagnosticResult {
+    let timeline = crate::gateway::startup::startup_timeline();
+    let phases = timeline.snapshot();
+    if phases.is_empty() {
+        return DiagnosticResult {
+            check_name: "startup.timeline".to_string(),
+            status: DiagnosticStatus::Skipped,
+            message: "no startup phases recorded in this process".to_string(),
+            details: None,
+        };
+    }
+    let details = serde_json::to_string(&crate::gateway::startup::startup_timeline_snapshot()).ok();
+    if timeline.is_slow_host() {
+        DiagnosticResult {
+            check_name: "startup.timeline".to_string(),
+            status: DiagnosticStatus::Warning,
+            message: format!(
+                "slow-host startup: {} ms total across {} phase(s)",
+                timeline.total_ms(),
+                phases.len()
+            ),
+            details,
+        }
+    } else {
+        DiagnosticResult {
+            check_name: "startup.timeline".to_string(),
+            status: DiagnosticStatus::Ok,
+            message: format!(
+                "startup completed in {} ms across {} phase(s)",
+                timeline.total_ms(),
+                phases.len()
+            ),
+            details,
+        }
+    }
+}
 
 /// Check that a JSON/YAML/TOML config file is present.
 async fn check_config_file() -> DiagnosticResult {

@@ -430,6 +430,10 @@ pub fn list_available_tools(config: &Config) -> Vec<ToolInfo> {
         }),
     });
 
+    // Heartbeat structured response tool (v2026.5.2) — hidden by default;
+    // the heartbeat runner surfaces it for tool-capable heartbeat runs.
+    tools.push(crate::agents::heartbeat::HeartbeatRespondTool::tool_info());
+
     // PDF tool
     tools.push(pdf_tool::PdfTool.info());
 

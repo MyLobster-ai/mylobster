@@ -7,6 +7,11 @@
 //!
 //! Ported from OpenClaw `src/routing/`.
 
+pub mod access_groups;
+pub mod dock;
+pub mod policy;
+pub mod target;
+
 use crate::config::{AgentBinding, AgentBindingMatch};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -216,6 +221,124 @@ impl Default for RouteManager {
 }
 
 // ============================================================================
+// DM main-session route pinning (v2026.5.2)
+// ============================================================================
+
+/// Decision for a DM-driven main-session route update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DmRoutePin {
+    /// Peer the main-session route should point at after the update.
+    pub peer: String,
+    /// True when the proposed peer was overridden to stay on the DM owner.
+    pub pinned: bool,
+}
+
+/// Keep DM main-session route updates pinned to the configured DM owner.
+///
+/// Ported behavior (OpenClaw v2026.5.2, Discord/Mattermost/Matrix channels):
+/// when a DM updates the shared main session's reply route, the route must
+/// not drift to an arbitrary DM peer — if the channel has configured DM
+/// owner(s) (`allowFrom`/owner list), the route stays pinned to the owner
+/// peer (the proposing peer is used only when it IS an owner).
+///
+/// `owner_ids` are matched case-insensitively. With no configured owners the
+/// proposed peer is accepted unchanged.
+///
+/// HANDOFF: applied in this cluster's channels (Mattermost/Matrix); the
+/// Discord channel cluster should call this from its DM route mutator too.
+pub fn pin_dm_main_session_route(
+    owner_ids: &[String],
+    proposed_peer: &str,
+    current_route_peer: Option<&str>,
+) -> DmRoutePin {
+    let proposed = proposed_peer.trim();
+    let owners: Vec<&str> = owner_ids
+        .iter()
+        .map(|o| o.trim())
+        .filter(|o| !o.is_empty() && *o != "*")
+        .collect();
+    if owners.is_empty() {
+        return DmRoutePin {
+            peer: proposed.to_string(),
+            pinned: false,
+        };
+    }
+    let proposed_lower = proposed.to_lowercase();
+    if owners.iter().any(|o| o.to_lowercase() == proposed_lower) {
+        return DmRoutePin {
+            peer: proposed.to_string(),
+            pinned: false,
+        };
+    }
+    // Non-owner DM peer: keep the current route if it already points at an
+    // owner, else pin to the first configured owner.
+    if let Some(current) = current_route_peer {
+        let current_lower = current.trim().to_lowercase();
+        if owners.iter().any(|o| o.to_lowercase() == current_lower) {
+            return DmRoutePin {
+                peer: current.trim().to_string(),
+                pinned: true,
+            };
+        }
+    }
+    DmRoutePin {
+        peer: owners[0].to_string(),
+        pinned: true,
+    }
+}
+
+// ============================================================================
+// Cross-channel session delivery identity (v2026.7.1)
+// ============================================================================
+
+/// Identity a session turn should use for status/reactions/threads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionDeliveryIdentity {
+    pub channel: String,
+    pub account_id: String,
+    pub peer: String,
+    /// True when the session previously belonged to a different channel and
+    /// the stale identity was discarded.
+    pub switched_channel: bool,
+}
+
+/// Resolve the delivery identity for the current turn of a shared DM session.
+///
+/// v2026.7.1 Channels row "Cross-channel session identity": a shared DM
+/// session must not carry the previous channel's identity after a channel
+/// switch — status reactions, typing, and thread targeting always use the
+/// *current* inbound channel/account/peer, never the session's stored last
+/// route.
+pub fn resolve_session_delivery_identity(
+    session_last_channel: Option<&str>,
+    current_channel: &str,
+    current_account_id: &str,
+    current_peer: &str,
+) -> SessionDeliveryIdentity {
+    let switched = session_last_channel
+        .map(|prev| !prev.trim().is_empty() && !prev.trim().eq_ignore_ascii_case(current_channel))
+        .unwrap_or(false);
+    SessionDeliveryIdentity {
+        channel: current_channel.trim().to_lowercase(),
+        account_id: current_account_id.trim().to_string(),
+        peer: current_peer.trim().to_string(),
+        switched_channel: switched,
+    }
+}
+
+/// Per-channel-peer session isolation key (v2026.7.1 "per-channel-peer
+/// session isolation"): the same human on two channels gets distinct DM
+/// session keys unless identity-linked elsewhere.
+pub fn channel_peer_session_key(channel: &str, account_id: &str, peer: &str) -> String {
+    format!(
+        "{}:{}:{}",
+        channel.trim().to_lowercase(),
+        account_id.trim().to_lowercase(),
+        peer.trim().to_lowercase()
+    )
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -398,6 +521,69 @@ mod tests {
         let removed = mgr.unbind("agent-1", Some("acct-1")).await;
         assert!(removed);
         assert!(mgr.list(None).await.is_empty());
+    }
+
+    // ====================================================================
+    // DM route pinning + session delivery identity
+    // ====================================================================
+
+    #[test]
+    fn dm_route_pin_no_owners_accepts_proposed() {
+        let pin = pin_dm_main_session_route(&[], "peer9", None);
+        assert_eq!(pin.peer, "peer9");
+        assert!(!pin.pinned);
+        // Wildcard-only owner lists behave like no owners.
+        let pin = pin_dm_main_session_route(&["*".into()], "peer9", None);
+        assert_eq!(pin.peer, "peer9");
+        assert!(!pin.pinned);
+    }
+
+    #[test]
+    fn dm_route_pin_owner_peer_passes() {
+        let owners = vec!["Owner1".to_string(), "owner2".to_string()];
+        let pin = pin_dm_main_session_route(&owners, "OWNER2", None);
+        assert_eq!(pin.peer, "OWNER2");
+        assert!(!pin.pinned);
+    }
+
+    #[test]
+    fn dm_route_pin_non_owner_stays_on_owner() {
+        let owners = vec!["owner1".to_string()];
+        // Current route already on an owner: keep it.
+        let pin = pin_dm_main_session_route(&owners, "intruder", Some("owner1"));
+        assert_eq!(pin.peer, "owner1");
+        assert!(pin.pinned);
+        // No current route: pin to first configured owner.
+        let pin = pin_dm_main_session_route(&owners, "intruder", None);
+        assert_eq!(pin.peer, "owner1");
+        assert!(pin.pinned);
+        // Current route drifted off-owner previously: re-pin to owner.
+        let pin = pin_dm_main_session_route(&owners, "intruder", Some("other"));
+        assert_eq!(pin.peer, "owner1");
+        assert!(pin.pinned);
+    }
+
+    #[test]
+    fn session_delivery_identity_uses_current_channel() {
+        let id = resolve_session_delivery_identity(Some("telegram"), "Discord", "acct", "peer1");
+        assert_eq!(id.channel, "discord");
+        assert!(id.switched_channel);
+        let id = resolve_session_delivery_identity(Some("discord"), "discord", "acct", "peer1");
+        assert!(!id.switched_channel);
+        let id = resolve_session_delivery_identity(None, "slack", "a", "p");
+        assert!(!id.switched_channel);
+    }
+
+    #[test]
+    fn channel_peer_key_isolates_channels() {
+        assert_ne!(
+            channel_peer_session_key("telegram", "default", "111"),
+            channel_peer_session_key("discord", "default", "111")
+        );
+        assert_eq!(
+            channel_peer_session_key(" Telegram ", "Default", "AbC"),
+            "telegram:default:abc"
+        );
     }
 
     #[tokio::test]

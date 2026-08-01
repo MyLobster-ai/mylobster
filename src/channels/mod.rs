@@ -1,27 +1,49 @@
-mod bluebubbles;
-mod discord;
-mod feishu;
-mod googlechat;
-mod imessage;
-mod irc;
-mod line;
-mod matrix;
-mod mattermost;
-mod nextcloud;
-mod normalize;
-mod nostr;
+pub mod bluebubbles;
+pub mod control_commands;
+pub mod discord;
+pub mod discord_chunk;
+pub mod discord_routing;
+pub mod discord_status;
+pub mod discord_transport;
+pub mod discord_voice;
+pub mod feishu;
+pub mod google_meet;
+pub mod googlechat;
+pub mod imessage;
+pub mod irc;
+pub mod line;
+pub mod loop_guard;
+pub mod matrix;
+pub mod mattermost;
+pub mod nextcloud;
+pub mod normalize;
+pub mod nostr;
 mod plugin;
-mod signal;
-mod slack;
-mod synology_chat;
-mod teams;
-mod telegram;
+pub mod progress_draft;
+pub mod qqbot;
+pub mod signal;
+pub mod slack;
+pub mod sms;
+pub mod status_reactions;
+pub mod synology_chat;
+pub mod teams;
+pub mod telegram;
+pub mod telegram_commands;
+pub mod telegram_dispatcher;
+pub mod telegram_format;
+pub mod telegram_net;
+pub mod telegram_pairing;
+pub mod telegram_progress;
+pub mod telegram_spool;
+pub mod telegram_targets;
 mod tlon;
-mod twitch;
+pub mod twitch;
+pub mod voice_call;
 mod webchat;
-mod whatsapp;
-mod zalo;
-mod zalouser;
+pub mod whatsapp;
+pub mod yuanbao;
+pub mod zalo;
+pub mod zalouser;
 
 pub use plugin::{ChannelCapability, ChannelMeta, ChannelPlugin};
 
@@ -176,6 +198,129 @@ pub fn resolve_active_run_queue_action(
     }
 }
 
+// ============================================================================
+// Channel config hygiene (v2026.6.x, PARITY_v2026.7.1 Channels row 95)
+// ============================================================================
+
+/// Whether a raw channel config entry counts as *configured*.
+///
+/// Mirror of upstream `isConfiguredChannel` (v2026.6.x): an object entry is
+/// configured unless `enabled === false` — so an `{"enabled": true}`-only
+/// entry IS configured. Non-object entries are not.
+pub fn is_configured_channel_entry(entry: Option<&serde_json::Value>) -> bool {
+    match entry {
+        Some(serde_json::Value::Object(map)) => {
+            !matches!(map.get("enabled"), Some(serde_json::Value::Bool(false)))
+        }
+        _ => false,
+    }
+}
+
+/// Error for malformed `channel[:account]` specs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelSpecError {
+    Empty,
+    EmptySegment,
+    TooManySegments,
+}
+
+impl std::fmt::Display for ChannelSpecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChannelSpecError::Empty => write!(f, "channel spec is empty"),
+            ChannelSpecError::EmptySegment => write!(f, "channel spec has an empty segment"),
+            ChannelSpecError::TooManySegments => {
+                write!(f, "channel spec has too many segments (expected channel[:account])")
+            }
+        }
+    }
+}
+
+/// Parse a `channel[:account]` spec, rejecting malformed forms like
+/// `matrix:work:extra` (v2026.6.x "malformed account specs rejected").
+pub fn parse_channel_account_spec(
+    spec: &str,
+) -> Result<(String, Option<String>), ChannelSpecError> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return Err(ChannelSpecError::Empty);
+    }
+    let segments: Vec<&str> = trimmed.split(':').collect();
+    if segments.len() > 2 {
+        return Err(ChannelSpecError::TooManySegments);
+    }
+    if segments.iter().any(|s| s.trim().is_empty()) {
+        return Err(ChannelSpecError::EmptySegment);
+    }
+    let channel = segments[0].trim().to_lowercase();
+    let account = segments.get(1).map(|s| s.trim().to_string());
+    Ok((channel, account))
+}
+
+/// Clear timeout message for channel capability checks (v2026.6.x "channel
+/// capability checks return clear timeout").
+pub fn capability_check_timeout_message(channel: &str, timeout_ms: u64) -> String {
+    format!(
+        "Channel capability check for {channel} timed out after {timeout_ms} ms; \
+         the channel may still be starting. Retry, or check `channels status --json`."
+    )
+}
+
+// ============================================================================
+// Channel-message lifecycle adapter (v2026.5.x, row 91)
+// ============================================================================
+
+/// Durable receipt for one delivered channel message.
+///
+/// Mirror of upstream `defineChannelMessageAdapter` receipts: adapters return
+/// the platform message id so replies/edits/reactions can target it and
+/// delivery recovery can prove the send happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageReceipt {
+    /// Platform-assigned message id (empty when the platform returns none).
+    pub message_id: String,
+    /// Chat/conversation the message landed in.
+    pub chat_id: String,
+}
+
+/// Channel-message lifecycle adapter: uniform prepare→send→receipt surface.
+///
+/// `prepare_send_payload` turns outbound text + attachments into an ordered
+/// [`normalize::SendPlan`] honoring the channel's caption support and text
+/// limits; `deliver_prepared` executes the plan through the channel's native
+/// APIs and returns receipts. Rollout across the bundled channels mirrors
+/// upstream's ~15-channel adoption wave (per-channel wiring tracked in the
+/// parity files).
+#[async_trait::async_trait]
+pub trait ChannelMessageAdapter: Send + Sync {
+    /// Whether the channel supports captions on media sends.
+    fn supports_captions(&self) -> bool {
+        false
+    }
+
+    /// Caption character limit (only meaningful when captions supported).
+    fn caption_limit(&self) -> usize {
+        1024
+    }
+
+    /// Build the ordered send plan for outbound content.
+    fn prepare_send_payload(&self, out: &normalize::NormalizedOutbound) -> normalize::SendPlan {
+        normalize::build_send_plan(
+            &out.text,
+            &out.attachments,
+            self.supports_captions(),
+            self.caption_limit(),
+        )
+    }
+
+    /// Execute a prepared plan, returning receipts for delivered messages.
+    async fn deliver_prepared(
+        &self,
+        chat_id: &str,
+        plan: normalize::SendPlan,
+    ) -> Result<Vec<MessageReceipt>>;
+}
+
 // Re-export the send_message convenience function.
 pub use self::send::send_message;
 
@@ -219,6 +364,10 @@ impl ChannelManager {
     ///
     /// Channel plugins are registered but not started until [`start_all`] is called.
     pub fn new(config: &Config) -> Self {
+        // Install reusable `accessGroups` allowlist groups so channel ingress
+        // can expand `accessGroup:<name>` entries (v2026.5.x).
+        crate::routing::access_groups::install_access_groups(config);
+
         let mut plugins: HashMap<String, Arc<dyn ChannelPlugin>> = HashMap::new();
 
         // Register built-in channel plugins.
@@ -310,6 +459,25 @@ impl ChannelManager {
             Arc::new(webchat::WebChatChannel::new()),
         );
 
+        // New channel plugins (v2026.7.1 parity pass).
+        plugins.insert(
+            "qqbot".to_string(),
+            Arc::new(qqbot::QqBotChannel::new(config)),
+        );
+        plugins.insert(
+            "yuanbao".to_string(),
+            Arc::new(yuanbao::YuanbaoChannel::new(config)),
+        );
+        plugins.insert(
+            "voicecall".to_string(),
+            Arc::new(voice_call::VoiceCallChannel::new(config)),
+        );
+        plugins.insert(
+            "googlemeet".to_string(),
+            Arc::new(google_meet::GoogleMeetChannel::new(config)),
+        );
+        plugins.insert("sms".to_string(), Arc::new(sms::SmsChannel::new(config)));
+
         Self {
             plugins: RwLock::new(plugins),
             config: config.clone(),
@@ -377,5 +545,63 @@ impl ChannelManager {
     /// Look up a channel plugin by id.
     pub async fn get_plugin(&self, id: &str) -> Option<Arc<dyn ChannelPlugin>> {
         self.plugins.read().await.get(id).cloned()
+    }
+}
+
+// ============================================================================
+// Tests (channel kernel)
+// ============================================================================
+
+#[cfg(test)]
+mod kernel_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn enabled_true_only_entry_is_configured() {
+        assert!(is_configured_channel_entry(Some(&json!({"enabled": true}))));
+        assert!(is_configured_channel_entry(Some(&json!({}))));
+        assert!(is_configured_channel_entry(Some(
+            &json!({"botToken": "x", "enabled": true})
+        )));
+        assert!(!is_configured_channel_entry(Some(
+            &json!({"enabled": false})
+        )));
+        assert!(!is_configured_channel_entry(Some(&json!("string"))));
+        assert!(!is_configured_channel_entry(Some(&json!(null))));
+        assert!(!is_configured_channel_entry(None));
+    }
+
+    #[test]
+    fn channel_account_spec_parsing() {
+        assert_eq!(
+            parse_channel_account_spec("matrix"),
+            Ok(("matrix".to_string(), None))
+        );
+        assert_eq!(
+            parse_channel_account_spec("Matrix:Work"),
+            Ok(("matrix".to_string(), Some("Work".to_string())))
+        );
+        assert_eq!(
+            parse_channel_account_spec("matrix:work:extra"),
+            Err(ChannelSpecError::TooManySegments)
+        );
+        assert_eq!(
+            parse_channel_account_spec("matrix:"),
+            Err(ChannelSpecError::EmptySegment)
+        );
+        assert_eq!(
+            parse_channel_account_spec(" : "),
+            Err(ChannelSpecError::EmptySegment)
+        );
+        assert_eq!(parse_channel_account_spec(""), Err(ChannelSpecError::Empty));
+    }
+
+    #[test]
+    fn capability_timeout_message_is_clear() {
+        let msg = capability_check_timeout_message("slack", 5000);
+        assert!(msg.contains("slack"));
+        assert!(msg.contains("5000"));
+        assert!(msg.contains("timed out"));
     }
 }

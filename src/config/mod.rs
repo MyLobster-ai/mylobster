@@ -1,6 +1,6 @@
 mod defaults;
 mod io;
-mod types;
+pub mod types;
 pub mod validation;
 
 pub use defaults::*;
@@ -55,6 +55,14 @@ pub struct Config {
     pub cron: CronConfig,
     #[serde(default)]
     pub web: WebConfig,
+    /// Managed outbound proxy configuration (v2026.7.1).
+    #[serde(default)]
+    pub proxy: ProxyConfig,
+
+    /// Reusable message-channel access groups referenced by
+    /// `accessGroup:<name>` allowFrom entries (v2026.5.x).
+    #[serde(default)]
+    pub access_groups: Option<std::collections::HashMap<String, AccessGroupConfig>>,
 
     /// State directory for persistent data.
     #[serde(skip)]
@@ -164,6 +172,8 @@ impl Default for Config {
             tts: TtsConfig::default(),
             cron: CronConfig::default(),
             web: WebConfig::default(),
+            proxy: ProxyConfig::default(),
+            access_groups: None,
             state_dir: resolve_state_dir(),
         }
     }

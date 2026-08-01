@@ -117,6 +117,8 @@ async fn start_chat_gateway(mock_url: &str) -> (String, broadcast::Sender<()>) {
             headers: None,
             auth_header: None,
             models: vec![],
+            params: None,
+            local_service: None,
         },
     );
 
@@ -139,6 +141,14 @@ async fn start_chat_gateway(mock_url: &str) -> (String, broadcast::Sender<()>) {
         version: "test".to_string(),
         connected_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
+
+    // This harness wires GatewayState by hand instead of going through
+    // `GatewayServer::start()`, so it must also perform the readiness
+    // transition that `start()` does once channel monitors are up. Without it
+    // the v2026.5.2 startup gate rejects every `chat.send` with the retryable
+    // "gateway is still starting (sidecars not ready)" error. There are no
+    // sidecars in these tests, so readiness is immediate.
+    state.rpc.startup_gate.mark_sidecars_ready();
 
     let app = mylobster::gateway::routes::build_routes(state);
 

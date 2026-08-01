@@ -86,6 +86,19 @@ pub fn create_provider(config: &Config) -> Option<EmbeddingProviderBox> {
             Some(Box::new(OllamaEmbeddingProvider::new(base_url, None)))
         }
         EmbeddingProviderKind::Local => Some(Box::new(LocalEmbeddingProvider::new(None))),
+        EmbeddingProviderKind::Deepinfra => {
+            let api_key = config
+                .models
+                .providers
+                .get("deepinfra")
+                .and_then(|p| p.api_key.clone())
+                .or_else(|| std::env::var("DEEPINFRA_API_KEY").ok())?;
+            Some(Box::new(deepinfra_embedding_provider(api_key, None)))
+        }
+        // `memorySearch.provider = "none"` disables embeddings entirely: search
+        // stays FTS-only and capability discovery is skipped rather than
+        // falling back to another provider (v2026.6.x).
+        EmbeddingProviderKind::None => None,
     }
 }
 
@@ -93,20 +106,51 @@ pub fn create_provider(config: &Config) -> Option<EmbeddingProviderBox> {
 // OpenAI
 // ---------------------------------------------------------------------------
 
-/// Calls the OpenAI `/v1/embeddings` endpoint.
+/// Calls an OpenAI-compatible `/embeddings` endpoint.
+///
+/// The base URL is configurable so the same transport serves OpenAI itself and
+/// any OpenAI-compatible embedding host (DeepInfra, vLLM, LM Studio, …). This is
+/// the Rust analog of upstream's `createRemoteEmbeddingProvider` /
+/// `resolveRemoteEmbeddingClient` pair (v2026.6.2 "core OpenAI-compatible
+/// embedding provider").
 pub struct OpenAiEmbeddingProvider {
     api_key: String,
     model: String,
+    base_url: String,
+    dimensions: usize,
     client: reqwest::Client,
 }
 
+/// Default OpenAI embeddings root (no trailing slash).
+pub const OPENAI_EMBEDDINGS_BASE_URL: &str = "https://api.openai.com/v1";
+
 impl OpenAiEmbeddingProvider {
     pub fn new(api_key: String, model: Option<String>) -> Self {
+        Self::with_base_url(api_key, model, OPENAI_EMBEDDINGS_BASE_URL, 1536)
+    }
+
+    /// Build a provider against an arbitrary OpenAI-compatible root.
+    ///
+    /// `base_url` is the API root (e.g. `https://api.deepinfra.com/v1/openai`);
+    /// `/embeddings` is appended. A trailing slash on `base_url` is tolerated.
+    pub fn with_base_url(
+        api_key: String,
+        model: Option<String>,
+        base_url: impl Into<String>,
+        dimensions: usize,
+    ) -> Self {
+        let base_url = base_url.into();
         Self {
             api_key,
             model: model.unwrap_or_else(|| "text-embedding-3-small".to_string()),
+            base_url: base_url.trim_end_matches('/').to_string(),
+            dimensions,
             client: reqwest::Client::new(),
         }
+    }
+
+    fn endpoint(&self) -> String {
+        format!("{}/embeddings", self.base_url)
     }
 }
 
@@ -140,7 +184,7 @@ impl EmbeddingProvider for OpenAiEmbeddingProvider {
 
         let resp = self
             .client
-            .post("https://api.openai.com/v1/embeddings")
+            .post(self.endpoint())
             .bearer_auth(&self.api_key)
             .json(&body)
             .send()
@@ -157,8 +201,51 @@ impl EmbeddingProvider for OpenAiEmbeddingProvider {
     }
 
     fn dimensions(&self) -> usize {
-        1536
+        self.dimensions
     }
+}
+
+// ---------------------------------------------------------------------------
+// DeepInfra (OpenAI-compatible)
+// ---------------------------------------------------------------------------
+
+/// DeepInfra's OpenAI-compatible API root.
+pub const DEEPINFRA_BASE_URL: &str = "https://api.deepinfra.com/v1/openai";
+
+/// First entry of upstream's `DEEPINFRA_EMBED_FALLBACK_MODELS`.
+pub const DEFAULT_DEEPINFRA_EMBEDDING_MODEL: &str = "BAAI/bge-m3";
+
+/// `BAAI/bge-m3` emits 1024-dimensional vectors.
+const DEEPINFRA_EMBEDDING_DIMENSIONS: usize = 1024;
+
+/// Strip a redundant `deepinfra/` provider prefix from a model reference.
+///
+/// Mirrors upstream `normalizeDeepInfraModelRef`: an empty/blank value falls
+/// back to `fallback`, and a `deepinfra/`-qualified id is reduced to its bare
+/// model id before it reaches the API.
+pub fn normalize_deepinfra_model_ref(model: Option<&str>, fallback: &str) -> String {
+    let value = model
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(fallback);
+    value
+        .strip_prefix("deepinfra/")
+        .unwrap_or(value)
+        .to_string()
+}
+
+/// Build a DeepInfra embedding provider over the shared OpenAI-compatible transport.
+pub fn deepinfra_embedding_provider(
+    api_key: String,
+    model: Option<String>,
+) -> OpenAiEmbeddingProvider {
+    let model = normalize_deepinfra_model_ref(model.as_deref(), DEFAULT_DEEPINFRA_EMBEDDING_MODEL);
+    OpenAiEmbeddingProvider::with_base_url(
+        api_key,
+        Some(model),
+        DEEPINFRA_BASE_URL,
+        DEEPINFRA_EMBEDDING_DIMENSIONS,
+    )
 }
 
 // ---------------------------------------------------------------------------

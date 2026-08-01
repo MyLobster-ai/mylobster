@@ -20,15 +20,15 @@
 |------|---------|--------|-------|
 | Cerebras OpenAI-compatible | v2026.4.26 | ✅ | `OPENAI_COMPAT_PROVIDERS` (mod.rs) |
 | DeepInfra OpenAI-compatible (chat only) | v2026.4.27 | ✅ | `OPENAI_COMPAT_PROVIDERS` (mod.rs) |
-| DeepInfra image generation/editing | v2026.4.27 | ❌ | Multi-modal extension; new path under `media/` |
-| DeepInfra audio understanding | v2026.4.27 | ❌ | Multi-modal extension |
-| DeepInfra TTS + text embeddings | v2026.4.27 | ❌ | Multi-modal extension |
-| NVIDIA bundled provider w/ static catalog | v2026.4.29 | 🚧 | Already routes via OAI-compat; needs catalog metadata + literal model-ref picker |
-| Bedrock Opus 4.7 thinking parity | v2026.4.29 | ❌ | `bedrock.rs` |
-| Codex / OpenAI-compat replay/streaming safety | v2026.4.29 | ❌ | `openai_compat.rs`, `openai_codex.rs` |
-| Manifest-backed provider catalog (Qianfan, Xiaomi, NVIDIA, Cerebras, Mistral, Moonshot, DeepSeek, StepFun) | v2026.4.27 | ❌ | New catalog layer; not currently in mylobster |
-| Model suppression (prevent stale inline Codex bypassing manifest) | v2026.4.29 | ❌ | `mod.rs` resolution path |
-| `modelCatalog.aliases` / `.suppressions` | v2026.4.27 | ❌ | Plugin manifest wiring |
+| DeepInfra image generation/editing | v2026.4.27 | ✅ | `media/deepinfra.rs::deepinfra_image_generate`/`deepinfra_image_edit` (OAI-compat `/images/generations`+`/images/edits`, b64_json); model metadata in `providers/deepinfra.rs` |
+| DeepInfra audio understanding | v2026.4.27 | ✅ | `media/deepinfra.rs::deepinfra_transcribe` (Whisper via `/audio/transcriptions`) |
+| DeepInfra TTS + text embeddings | v2026.4.27 | ✅ | `media/deepinfra.rs::deepinfra_speech` (`/audio/speech`, extraBody passthrough) + `providers/deepinfra.rs::deepinfra_embed` (`/embeddings`; provider-side entry point for `memory/`) |
+| NVIDIA bundled provider w/ static catalog | v2026.4.29 | ✅ | `providers/manifest.rs::NVIDIA_MANIFEST_MODELS` (v2026.7.1 rows) + `catalog.rs::pick_literal_model_ref` (literal model-ref picker, vendor-namespace-preserving) |
+| Bedrock Opus 4.7 thinking parity | v2026.4.29 | ✅ | `bedrock.rs::bedrock_thinking_profile` + Converse `additionalModelRequestFields.thinking` |
+| Codex / OpenAI-compat replay/streaming safety | v2026.4.29 | ✅ | `openai_compat.rs` (lenient SSE bare-JSON chunks) + `openai_codex.rs` (native-backend payload sanitize, wrapped-stream preservation) |
+| Manifest-backed provider catalog (Qianfan, Xiaomi, NVIDIA, Cerebras, Mistral, Moonshot, DeepSeek, StepFun) | v2026.4.27 | ✅ | `providers/manifest.rs` (bundled manifests + `manifest_for`/`manifest_models`/`manifest_auth_env_vars`) |
+| Model suppression (prevent stale inline Codex bypassing manifest) | v2026.4.29 | ✅ | `providers/manifest.rs::resolve_model_suppression` (#74451 semantics: unconditional not bypassable, conditional user-bypassable); enforced in `mod.rs::resolve_provider` |
+| `modelCatalog.aliases` / `.suppressions` | v2026.4.27 | ✅ | `providers/manifest.rs::MODEL_CATALOG_ALIASES`/`resolve_catalog_alias` + `bundled_suppressions` |
 
 ### TTS / Speech (new bundled providers, all v2026.4.25)
 | Provider | Status | Notes |
@@ -43,8 +43,8 @@
 ### Image / Video providers
 | Provider | Version | Status |
 |----------|---------|--------|
-| LiteLLM image generation | v2026.4.25 | ❌ |
-| Seedance 2.0 reference-to-video | v2026.4.25 | ❌ |
+| LiteLLM image generation | v2026.4.25 | ✅ `media/image_gen.rs::litellm_image_generate` (loopback auto-allow via `is_auto_allowed_litellm_hostname`; b64/url rows) |
+| Seedance 2.0 reference-to-video | v2026.4.25 | ✅ `media/video_gen.rs::build_seedance_request_body` (first_frame image_url, t2v→i2v substitution, lowercase resolution, seed/draft/camera_fixed; current upstream model list) |
 
 ---
 
@@ -55,9 +55,9 @@
 | QQBot group chat (history, @-mention gating, FIFO queue) | v2026.4.27 | ❌ | New file `channels/qqbot.rs` + ChannelsConfig field |
 | QQBot C2C streaming | v2026.4.27 | ❌ | Same file |
 | Yuanbao plugin | v2026.4.29 | ❌ | New file `channels/yuanbao.rs` |
-| Telegram super group support (admin-only commands) | v2026.4.9 | ❌ | `telegram.rs` + admin check |
-| Discord text command parsing (interactive dialogs) | v2026.4.8 | ❌ | `discord.rs` |
-| Discord voice channel LLM override (`channels.discord.voice.model`) | v2026.4.25 | ❌ | `discord.rs` + `DiscordConfig` |
+| Telegram super group support (admin-only commands) | v2026.4.9 | ✅ | `channels/telegram_commands.rs`: supergroup treated as group; commands admin-gated via `getChatMember` status (`adminOnlyCommands` config, allowlist bypass) |
+| Discord text command parsing (interactive dialogs) | v2026.4.8 | ✅ | `parse_discord_text_command` + `build_command_arg_menu`/`cmdarg:` custom-id round trip in `discord.rs` |
+| Discord voice channel LLM override (`channels.discord.voice.model`) | v2026.4.25 | ✅ | `DiscordVoiceConfig.model` + `resolve_voice_model_override` in `discord.rs` |
 | WhatsApp `/tts latest` read-aloud | v2026.4.25 | ❌ | `whatsapp.rs` + `tts_tool.rs` integration |
 | Matrix live approval (exec metadata, chunked fallback, thread targeting) | v2026.4.27 | ❌ | `matrix.rs` |
 | Matrix streaming tool-progress updates | v2026.4.27 | ❌ | `matrix.rs` + agent loop hooks |

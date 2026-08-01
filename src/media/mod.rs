@@ -1,3 +1,10 @@
+pub mod attach;
+pub mod deepinfra;
+pub mod fal;
+pub mod image_gen;
+pub mod music;
+pub mod video_gen;
+
 /// Default maximum image dimension in pixels (reduced from 2048 in v2026.2.17).
 pub const DEFAULT_IMAGE_MAX_DIMENSION_PX: u32 = 1200;
 

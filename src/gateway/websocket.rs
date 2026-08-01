@@ -124,7 +124,9 @@ pub async fn handle_websocket(
     let connect_request = match connect_result {
         Ok(Some(req)) => req,
         Ok(None) => {
-            warn!("Client {} disconnected during handshake", client_id);
+            // v2026.7.1: transient pre-hello closes (port probes, LB health
+            // checks) are tolerated quietly — debug, not warning.
+            debug!("Client {} closed before completing handshake", client_id);
             return;
         }
         Err(_) => {
@@ -261,11 +263,30 @@ pub async fn handle_websocket(
 
     conn_state.handshake_complete = true;
 
-    // Step 4: Send success response
+    // v2026.7.1: protocol-range negotiation + mismatch diagnostics.
+    let negotiated = match crate::gateway::stream_frames::negotiate_protocol(
+        connect_params.min_protocol,
+        connect_params.max_protocol,
+    ) {
+        Ok(v) => v,
+        Err(diagnostic) => {
+            warn!("Protocol mismatch for {}: {}", client_id, diagnostic);
+            let err =
+                OcResponseFrame::error(connect_request.id.clone(), diagnostic, Some(1002));
+            let json = serde_json::to_string(&err).unwrap();
+            let _ = ws_tx.send(Message::Text(json.into())).await;
+            let _ = ws_tx.close().await;
+            return;
+        }
+    };
+
+    // Step 4: Send success response (with compatibility-range advertisement)
     let hello_ok = OcResponseFrame::success(
         connect_request.id.clone(),
         serde_json::json!({
-            "protocol": PROTOCOL_VERSION,
+            "protocol": negotiated,
+            "minProtocol": crate::gateway::stream_frames::MIN_PROTOCOL_VERSION,
+            "maxProtocol": PROTOCOL_VERSION,
             "server": "mylobster",
             "version": state.version,
             "sessionId": conn_state.session_id,
@@ -389,6 +410,17 @@ async fn handle_request(
 
     let request_id = request.id.clone();
 
+    // v2026.5.2: early control-plane RPCs return one shared retryable error
+    // until startup sidecars are ready.
+    if let Some(err) = state
+        .rpc
+        .startup_gate
+        .gate_check(&request.method, &request_id)
+    {
+        send_oc_response(tx, err).await;
+        return;
+    }
+
     match request.method.as_str() {
         "chat.send" => {
             handle_chat_send(state, conn, tx, seq, active_runs, &request).await;
@@ -412,7 +444,9 @@ async fn handle_request(
             send_oc_response(tx, response).await;
         }
         "sessions.list" => {
-            let response = handle_sessions_list(state, &request);
+            // v2026.5.2/7.1: bounded, cached list with truncation metadata.
+            let response =
+                crate::gateway::sessions_rpc::handle_sessions_list_bounded(state, &request);
             send_oc_response(tx, response).await;
         }
         "sessions.get" => {
@@ -425,6 +459,16 @@ async fn handle_request(
         }
         "sessions.delete" => {
             let response = handle_sessions_delete(state, &request);
+            // Purge org state + invalidate list cache for deleted sessions.
+            if let Some(key) = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("sessionKey"))
+                .and_then(|v| v.as_str())
+            {
+                state.rpc.session_org.purge_session(key);
+            }
+            state.rpc.sessions_list_cache.invalidate();
             send_oc_response(tx, response).await;
         }
         "tools.list" => {
@@ -483,26 +527,30 @@ async fn handle_request(
             send_oc_response(tx, response).await;
         }
         "config.schema" => {
+            let mut schema = serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "agents": { "type": "object" },
+                    "models": { "type": "object" },
+                    "channels": { "type": "object" },
+                    "gateway": { "type": "object" },
+                    "memory": { "type": "object" },
+                    "tools": { "type": "object" },
+                    "browser": { "type": "object" },
+                    "cron": { "type": "object" },
+                    "plugins": { "type": "object", "properties": {} },
+                }
+            });
+            // v2026.5.2: cap oversized plugin-owned schemas in the response.
+            let capped = crate::gateway::config_rpc::cap_plugin_schemas(
+                &mut schema,
+                crate::gateway::config_rpc::MAX_PLUGIN_SCHEMA_BYTES,
+            );
             send_oc_response(
                 tx,
                 OcResponseFrame::success(
                     request_id,
-                    serde_json::json!({
-                        "schema": {
-                            "type": "object",
-                            "properties": {
-                                "agents": { "type": "object" },
-                                "models": { "type": "object" },
-                                "channels": { "type": "object" },
-                                "gateway": { "type": "object" },
-                                "memory": { "type": "object" },
-                                "tools": { "type": "object" },
-                                "browser": { "type": "object" },
-                                "cron": { "type": "object" },
-                                "plugins": { "type": "object" },
-                            }
-                        }
-                    }),
+                    serde_json::json!({ "schema": schema, "cappedPluginSchemas": capped }),
                 ),
             )
             .await;
@@ -544,7 +592,42 @@ async fn handle_request(
             send_oc_response(tx, response).await;
         }
         "sessions.usage" => {
-            let response = handle_sessions_usage(state, &request);
+            // v2026.7.1: aggregate totals + transcript-estimated context
+            // budget when provider usage is missing.
+            let response =
+                crate::gateway::sessions_rpc::handle_sessions_usage_aggregate(state, &request);
+            send_oc_response(tx, response).await;
+        }
+        // v2026.5.2 new session RPCs + v2026.7.1 session organization
+        "sessions.describe" => {
+            let response =
+                crate::gateway::sessions_rpc::handle_sessions_describe(state, &request);
+            send_oc_response(tx, response).await;
+        }
+        "sessions.cleanup" => {
+            let response =
+                crate::gateway::sessions_rpc::handle_sessions_cleanup(state, &request);
+            send_oc_response(tx, response).await;
+        }
+        "sessions.rename" => {
+            let response = crate::gateway::sessions_rpc::handle_sessions_rename(state, &request);
+            send_oc_response(tx, response).await;
+        }
+        "sessions.fork" => {
+            let response =
+                crate::gateway::sessions_rpc::handle_sessions_fork(state, &request).await;
+            send_oc_response(tx, response).await;
+        }
+        "sessions.archive" => {
+            let response = crate::gateway::sessions_rpc::handle_sessions_archive(state, &request);
+            send_oc_response(tx, response).await;
+        }
+        "sessions.groups" => {
+            let response = crate::gateway::sessions_rpc::handle_sessions_groups(state, &request);
+            send_oc_response(tx, response).await;
+        }
+        "sessions.unread" => {
+            let response = crate::gateway::sessions_rpc::handle_sessions_unread(state, &request);
             send_oc_response(tx, response).await;
         }
         "sessions.resolve" => {
@@ -644,6 +727,341 @@ async fn handle_request(
         "tools.catalog" => {
             let response = handle_tools_list(state, &request).await;
             send_oc_response(tx, response).await;
+        }
+        // v2026.5.2: SDK-facing tool invocation with typed approval/refusal.
+        "tools.invoke" => {
+            if !conn.scopes.contains(&GatewayScope::OperatorWrite) {
+                send_oc_response(
+                    tx,
+                    OcResponseFrame::error(
+                        request_id,
+                        "missing scope: operator.write".to_string(),
+                        Some(-32600),
+                    ),
+                )
+                .await;
+                return;
+            }
+            let response =
+                crate::gateway::tools_invoke::handle_tools_invoke(state, &request).await;
+            send_oc_response(tx, response).await;
+        }
+        // Effective tool surface (same catalog annotated with descriptor hash).
+        "tools.effective" => {
+            let config = state.config.read().await;
+            let tools = crate::agents::tools::list_available_tools(&config);
+            drop(config);
+            // v2026.5.2: descriptor hash memoized per config generation —
+            // no repeated hashing of large descriptor sets per reply.
+            let generation = state.rpc.config_generation.current();
+            let descriptor_json = serde_json::to_value(&tools).unwrap_or_default();
+            let hash = state
+                .rpc
+                .descriptor_hash_cache
+                .get_or_compute(generation, || {
+                    crate::gateway::dispatch::compute_descriptor_hash(&descriptor_json)
+                });
+            send_oc_response(
+                tx,
+                OcResponseFrame::success(
+                    request_id,
+                    serde_json::json!({ "tools": tools, "descriptorHash": hash }),
+                ),
+            )
+            .await;
+        }
+        // v2026.5.2: channels.stop
+        "channels.stop" => {
+            let response =
+                crate::gateway::channels_rpc::handle_channels_stop(state, &request).await;
+            send_oc_response(tx, response).await;
+        }
+        // v2026.5.2: artifacts RPCs
+        "artifacts.list" => {
+            let response = crate::gateway::artifacts::handle_artifacts_list(&request);
+            send_oc_response(tx, response).await;
+        }
+        "artifacts.get" => {
+            let response = crate::gateway::artifacts::handle_artifacts_get(&request);
+            send_oc_response(tx, response).await;
+        }
+        "artifacts.download" => {
+            let response = crate::gateway::artifacts::handle_artifacts_download(&request);
+            send_oc_response(tx, response).await;
+        }
+        // v2026.5.2: gateway-side restart support for `gateway restart
+        // --force/--wait` (CLI side owned by the CLI cluster).
+        "gateway.restart" => {
+            if !conn.scopes.contains(&GatewayScope::OperatorAdmin) {
+                send_oc_response(
+                    tx,
+                    OcResponseFrame::error(
+                        request_id,
+                        "missing scope: operator.admin".to_string(),
+                        Some(-32600),
+                    ),
+                )
+                .await;
+                return;
+            }
+            let p = request.params.clone().unwrap_or(serde_json::json!({}));
+            let force = p.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+            let wait_ms = p.get("waitMs").and_then(|v| v.as_u64());
+            let run_ids: Vec<String> = {
+                let runs = active_runs.read().await;
+                runs.keys().cloned().collect()
+            };
+            let decision = state.rpc.restart.request(
+                &run_ids,
+                force,
+                wait_ms.map(std::time::Duration::from_millis),
+            );
+            use crate::gateway::restart::RestartDecision;
+            let (restart_now, payload) = match decision {
+                RestartDecision::Now { forced } => (
+                    true,
+                    serde_json::json!({ "restarting": true, "forced": forced }),
+                ),
+                RestartDecision::WaitExpired { blockers } => (
+                    true,
+                    serde_json::json!({ "restarting": true, "waitExpired": true, "blockers": blockers }),
+                ),
+                RestartDecision::Deferred { blockers, run_ids } => (
+                    false,
+                    serde_json::json!({ "restarting": false, "deferred": true, "blockers": blockers, "activeRunIds": run_ids }),
+                ),
+            };
+            send_oc_response(tx, OcResponseFrame::success(request_id, payload)).await;
+            if restart_now {
+                // Abort active chat runs before socket close (v2026.7.1
+                // drain semantics), then trigger graceful shutdown.
+                let runs = active_runs.read().await;
+                for token in runs.values() {
+                    token.cancel();
+                }
+                drop(runs);
+                let _ = state.shutdown_tx.send(());
+            }
+        }
+        // v2026.7.1: system.info
+        "system.info" => {
+            let payload = crate::gateway::system_rpc::system_info_payload(
+                &state.version,
+                state.start_time.elapsed().as_secs(),
+            );
+            send_oc_response(tx, OcResponseFrame::success(request_id, payload)).await;
+        }
+        // v2026.7.1: tts.speak (operator-scoped inline audio)
+        "tts.speak" => {
+            if !conn.scopes.contains(&GatewayScope::OperatorWrite) {
+                send_oc_response(
+                    tx,
+                    OcResponseFrame::error(
+                        request_id,
+                        "missing scope: operator.write".to_string(),
+                        Some(-32600),
+                    ),
+                )
+                .await;
+                return;
+            }
+            let response = crate::gateway::system_rpc::handle_tts_speak(&request).await;
+            send_oc_response(tx, response).await;
+        }
+        // v2026.7.1: terminal detach/reattach + list/text
+        "terminal.list" => {
+            send_oc_response(
+                tx,
+                OcResponseFrame::success(
+                    request_id,
+                    serde_json::json!({ "terminals": state.rpc.terminals.list() }),
+                ),
+            )
+            .await;
+        }
+        "terminal.text" => {
+            let p = request.params.clone().unwrap_or(serde_json::Value::Null);
+            let id = p.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let max_chars = p
+                .get("maxChars")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(16_384);
+            let response = match state.rpc.terminals.text(id, max_chars) {
+                Some(text) => OcResponseFrame::success(
+                    request_id,
+                    serde_json::json!({ "id": id, "text": text }),
+                ),
+                None => OcResponseFrame::error(
+                    request_id,
+                    format!("terminal not found: {id}"),
+                    Some(-32600),
+                ),
+            };
+            send_oc_response(tx, response).await;
+        }
+        "terminal.detach" | "terminal.reattach" => {
+            let attach = request.method == "terminal.reattach";
+            let id = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let response = if state.rpc.terminals.set_attached(id, attach) {
+                OcResponseFrame::success(
+                    request_id,
+                    serde_json::json!({ "ok": true, "id": id, "attached": attach }),
+                )
+            } else {
+                OcResponseFrame::error(
+                    request_id,
+                    format!("terminal not found: {id}"),
+                    Some(-32600),
+                )
+            };
+            send_oc_response(tx, response).await;
+        }
+        // v2026.7.1: read-only agents.workspace
+        "agents.workspace.list" => {
+            let response = crate::gateway::system_rpc::handle_workspace_list(&request);
+            send_oc_response(tx, response).await;
+        }
+        "agents.workspace.get" => {
+            let response = crate::gateway::system_rpc::handle_workspace_get(&request);
+            send_oc_response(tx, response).await;
+        }
+        // v2026.7.1: unified Talk session controller RPCs
+        "talk.session.start" => {
+            let p = request.params.clone().unwrap_or(serde_json::json!({}));
+            let id = p
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
+            let mode = p.get("mode").and_then(|v| v.as_str()).unwrap_or("realtime");
+            let session = state.rpc.talk_sessions.start(&id, mode);
+            send_oc_response(tx, OcResponseFrame::success(request_id, session)).await;
+        }
+        "talk.session.stop" => {
+            let id = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let stopped = state.rpc.talk_sessions.stop(id);
+            send_oc_response(
+                tx,
+                OcResponseFrame::success(
+                    request_id,
+                    serde_json::json!({ "ok": stopped, "id": id }),
+                ),
+            )
+            .await;
+        }
+        "talk.session.status" => {
+            send_oc_response(
+                tx,
+                OcResponseFrame::success(
+                    request_id,
+                    serde_json::json!({ "sessions": state.rpc.talk_sessions.status() }),
+                ),
+            )
+            .await;
+        }
+        // v2026.5.x: cron.get
+        "cron.get" => {
+            let id = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let job = state.rpc.cron_jobs.read().get(id).cloned();
+            let response = match job {
+                Some(job) => OcResponseFrame::success(request_id, job),
+                None => OcResponseFrame::error(
+                    request_id,
+                    format!("cron job not found: {id}"),
+                    Some(-32600),
+                ),
+            };
+            send_oc_response(tx, response).await;
+        }
+        // v2026.4.29: read-only REM harness preview RPC. The REM dreaming
+        // harness does not exist in src/memory yet — stubbed with an
+        // explicit unavailable marker (handoff: memory cluster).
+        "doctor.memory.remHarness" => {
+            send_oc_response(
+                tx,
+                OcResponseFrame::success(
+                    request_id,
+                    serde_json::json!({
+                        "available": false,
+                        "reason": "REM dreaming harness not implemented in src/memory",
+                        "preview": [],
+                    }),
+                ),
+            )
+            .await;
+        }
+        // v2026.4.29: authenticated node.presence.alive protocol event.
+        // Requires a completed handshake with at least read scope; the
+        // acknowledged presence is rebroadcast to this connection.
+        "node.presence.alive" => {
+            if conn.scopes.is_empty() {
+                send_oc_response(
+                    tx,
+                    OcResponseFrame::error(
+                        request_id,
+                        "node.presence.alive requires an authenticated scoped connection"
+                            .to_string(),
+                        Some(-32600),
+                    ),
+                )
+                .await;
+                return;
+            }
+            let node_id = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("nodeId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            // Refresh node last-seen when known.
+            if let Some(node) = state.rpc.nodes.write().get_mut(&node_id) {
+                if let Some(obj) = node.as_object_mut() {
+                    obj.insert("lastSeenAtMs".to_string(), serde_json::json!(ts));
+                }
+            }
+            let payload = crate::gateway::stream_frames::node_presence_alive_payload(
+                &node_id,
+                &conn.client_id,
+                ts,
+            );
+            send_oc_event(tx, OcEventFrame::new("node.presence.alive", payload)).await;
+            send_oc_response(
+                tx,
+                OcResponseFrame::success(request_id, serde_json::json!({ "ok": true })),
+            )
+            .await;
+        }
+        // Startup diagnostics timeline snapshot (v2026.4.29).
+        "startup.timeline" => {
+            send_oc_response(
+                tx,
+                OcResponseFrame::success(
+                    request_id,
+                    crate::gateway::startup::startup_timeline_snapshot(),
+                ),
+            )
+            .await;
         }
 
         // ================================================================
@@ -745,6 +1163,19 @@ async fn handle_request(
         // Node pairing
         // ================================================================
         "node.pair.request" => {
+            // v2026.7.1: pairing flood guard (per-connection sliding window).
+            if !state.rpc.pairing_limiter.check_and_record(&conn.client_id) {
+                send_oc_response(
+                    tx,
+                    OcResponseFrame::error(
+                        request_id,
+                        "pairing requests rate-limited; retry later".to_string(),
+                        Some(-32029),
+                    ),
+                )
+                .await;
+                return;
+            }
             let response = handle_node_pair_request(state, &request);
             send_oc_response(tx, response).await;
         }
@@ -796,6 +1227,27 @@ async fn handle_request(
             send_oc_response(tx, response).await;
         }
         "node.invoke" => {
+            // v2026.7.1: browser.proxy nodes require operator.admin.
+            let command = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("command").or_else(|| p.get("kind")))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if crate::gateway::trust::node_invoke_requires_admin(command)
+                && !conn.scopes.contains(&GatewayScope::OperatorAdmin)
+            {
+                send_oc_response(
+                    tx,
+                    OcResponseFrame::error(
+                        request_id,
+                        "browser.proxy node invocation requires operator.admin".to_string(),
+                        Some(-32600),
+                    ),
+                )
+                .await;
+                return;
+            }
             let response = handle_node_invoke(state, &request);
             send_oc_response(tx, response).await;
         }
@@ -909,19 +1361,30 @@ async fn handle_request(
         // Health & Status
         // ================================================================
         "health" => {
-            let uptime = state.start_time.elapsed().as_secs();
-            send_oc_response(
-                tx,
-                OcResponseFrame::success(
-                    request_id,
-                    serde_json::json!({
+            // v2026.5.2: cached health snapshot, refreshed whenever channel
+            // runtime state diverges (fingerprint mismatch) or TTL expires.
+            let channels_status = state.channels.get_status().await;
+            let fingerprint =
+                crate::gateway::health::channel_state_fingerprint(&channels_status);
+            let payload = match state.rpc.health_cache.get_if_fresh(fingerprint) {
+                Some(cached) => cached,
+                None => {
+                    let uptime = state.start_time.elapsed().as_secs();
+                    let snapshot = serde_json::json!({
                         "status": "ok",
                         "version": state.version,
                         "uptime": uptime,
-                    }),
-                ),
-            )
-            .await;
+                        "channels": channels_status,
+                        "safeMode": state
+                            .rpc
+                            .safe_mode
+                            .load(std::sync::atomic::Ordering::Acquire),
+                    });
+                    state.rpc.health_cache.store(fingerprint, snapshot.clone());
+                    snapshot
+                }
+            };
+            send_oc_response(tx, OcResponseFrame::success(request_id, payload)).await;
         }
         "status" => {
             let response = handle_status(state, &request).await;
@@ -1449,6 +1912,26 @@ async fn handle_request(
         // Device status & info (v2026.2.26)
         // ================================================================
         "device.status" => {
+            // v2026.7.1: refresh paired-device last-seen on status polls.
+            if let Some(device_id) = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("deviceId"))
+                .and_then(|v| v.as_str())
+            {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let mut pairs = state.rpc.device_pairs.write();
+                for pair in pairs.iter_mut() {
+                    if pair.get("deviceId").and_then(|v| v.as_str()) == Some(device_id) {
+                        if let Some(obj) = pair.as_object_mut() {
+                            obj.insert("lastSeenAtMs".to_string(), serde_json::json!(ts));
+                        }
+                    }
+                }
+            }
             let uptime = state.start_time.elapsed().as_secs();
             send_oc_response(
                 tx,
@@ -1545,18 +2028,56 @@ async fn handle_request(
         }
 
         // ================================================================
-        // Unknown method
+        // Unknown method — descriptor-backed plugin registry (v2026.7.1)
         // ================================================================
         _ => {
-            send_oc_response(
-                tx,
-                OcResponseFrame::error(
+            let response = match state.rpc.method_registry.resolve(&request.method) {
+                Some(descriptor) => {
+                    let scope_strings: Vec<String> = conn
+                        .scopes
+                        .iter()
+                        .map(|s| match s {
+                            GatewayScope::OperatorAdmin => "operator.admin".to_string(),
+                            GatewayScope::OperatorWrite => "operator.write".to_string(),
+                            GatewayScope::OperatorRead => "operator.read".to_string(),
+                            GatewayScope::OperatorPairing => "operator.pairing".to_string(),
+                        })
+                        .collect();
+                    if !crate::gateway::method_registry::scopes_satisfy(
+                        &descriptor,
+                        &scope_strings,
+                    ) {
+                        OcResponseFrame::error(
+                            request_id,
+                            format!(
+                                "missing scope {} for plugin method {}",
+                                descriptor.required_scope.as_deref().unwrap_or("?"),
+                                request.method
+                            ),
+                            Some(-32600),
+                        )
+                    } else {
+                        // Plugin-owned methods dispatch through the plugin
+                        // sessionAction pathway once the plugin host lands
+                        // (handoff: plugins cluster). Acknowledge with the
+                        // descriptor so SDK callers can detect registration.
+                        OcResponseFrame::success(
+                            request_id,
+                            serde_json::json!({
+                                "ok": false,
+                                "plugin": descriptor.plugin_id,
+                                "error": "plugin method registered but plugin dispatch host is not available",
+                            }),
+                        )
+                    }
+                }
+                None => OcResponseFrame::error(
                     request_id,
                     format!("Method not found: {}", request.method),
                     Some(-32601),
                 ),
-            )
-            .await;
+            };
+            send_oc_response(tx, response).await;
         }
     }
 }
@@ -1624,6 +2145,25 @@ async fn handle_chat_send(
         }
     };
 
+    // v2026.7.1: systemic timeout hardening — clamp zero/negative/huge
+    // client-requested timeouts (Some(0) would previously disable nothing).
+    let params = ChatSendParams {
+        timeout_ms: crate::infra::timeouts::clamp_timeout_ms(
+            params.timeout_ms.map(|t| t as i64),
+            600_000,
+            crate::infra::timeouts::MAX_TIMEOUT_MS,
+        ),
+        ..params
+    };
+
+    // v2026.4.29: spawnedBy routing metadata on subagent chat broadcasts.
+    let spawned_by: Option<String> = request
+        .params
+        .as_ref()
+        .and_then(|p| p.get("spawnedBy"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     let run_id = params
         .idempotency_key
         .clone()
@@ -1667,12 +2207,19 @@ async fn handle_chat_send(
             chat::process_chat(&chat_config, &chat_sessions, &params, event_tx, chat_cancel).await
         });
 
-        // Forward chat events as OC events
+        // Forward chat events as OC events.
+        // v2026.7.1: protocol v4 stream frames — delta events additionally
+        // carry `deltaText` (incremental suffix) and finals carry
+        // `replace: true`; v2026.4.29: `spawnedBy` propagated on broadcasts.
+        let mut delta_tracker = crate::gateway::stream_frames::ChatDeltaTracker::new();
         while let Some(event) = event_rx.recv().await {
-            let oc_event = OcEventFrame::new(
-                "chat",
-                serde_json::to_value(&event).unwrap(),
+            let mut payload = serde_json::to_value(&event).unwrap();
+            delta_tracker.annotate(&mut payload);
+            crate::gateway::stream_frames::attach_spawned_by(
+                &mut payload,
+                spawned_by.as_deref(),
             );
+            let oc_event = OcEventFrame::new("chat", payload);
             let json = serde_json::to_string(&oc_event).unwrap();
             if tx.send(json).await.is_err() {
                 break;
@@ -2027,22 +2574,47 @@ fn handle_chat_history(state: &GatewayState, request: &RequestFrame) -> OcRespon
         .and_then(|p| p.get("sessionKey"))
         .and_then(|v| v.as_str());
 
+    // v2026.5.2: bound transcript reads to the requested display window.
+    let limit = crate::gateway::transcript_api::bound_display_window(
+        request
+            .params
+            .as_ref()
+            .and_then(|p| p.get("limit"))
+            .and_then(|v| v.as_u64()),
+        crate::gateway::transcript_api::MAX_DISPLAY_WINDOW,
+    );
+    let offset = request
+        .params
+        .as_ref()
+        .and_then(|p| p.get("offset"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+
     match session_key {
         Some(key) => {
             if let Some(handle) = state.sessions.get_session_handle(key) {
                 let history = handle.get_history();
-                let messages: Vec<serde_json::Value> = history
+                let total = history.len();
+                let (start, end) = crate::gateway::transcript_api::tail_window_bounds(
+                    total,
+                    crate::gateway::transcript_api::TranscriptWindow { offset, limit },
+                );
+                let messages: Vec<serde_json::Value> = history[start..end]
                     .iter()
                     .map(|m| serde_json::to_value(m).unwrap_or(serde_json::json!({})))
                     .collect();
                 OcResponseFrame::success(
                     request.id.clone(),
-                    serde_json::json!({ "messages": messages }),
+                    serde_json::json!({
+                        "messages": messages,
+                        "total": total,
+                        "truncated": start > 0 || end < total,
+                    }),
                 )
             } else {
                 OcResponseFrame::success(
                     request.id.clone(),
-                    serde_json::json!({ "messages": [] }),
+                    serde_json::json!({ "messages": [], "total": 0, "truncated": false }),
                 )
             }
         }
@@ -2222,15 +2794,42 @@ async fn handle_config_reload(
         new_config_value
     };
 
+    // v2026.7.1 hot-path perf: no-op reloads commit the existing snapshot
+    // instead of forcing a new hash/generation (downstream caches keep
+    // their memoized descriptor hashes).
+    let is_noop = {
+        let config = state.config.read().await;
+        let current_value = serde_json::to_value(&*config).unwrap_or_default();
+        crate::config::resolve_config_snapshot_hash(&current_value)
+            == crate::config::resolve_config_snapshot_hash(&final_config_value)
+    };
+
+    if is_noop {
+        let hash = config_hash.read().await.clone();
+        return OcResponseFrame::success(
+            request.id.clone(),
+            serde_json::json!({
+                "ok": true,
+                "hash": hash,
+                "noop": true,
+                "secretsResolved": resolve_secrets,
+            }),
+        );
+    }
+
     // Phase 2: Activate — apply the new config
     {
         let mut config = state.config.write().await;
         apply_config_patch(&mut config, &final_config_value);
     }
 
-    // Phase 3: Apply — update hash
+    // Phase 3: Apply — update hash + bump config generation so
+    // descriptor-hash caches recompute (v2026.5.2).
     let new_hash = Uuid::new_v4().to_string();
     *config_hash.write().await = new_hash.clone();
+    state.rpc.config_generation.bump();
+    state.rpc.health_cache.invalidate();
+    state.rpc.sessions_list_cache.invalidate();
 
     OcResponseFrame::success(
         request.id.clone(),
@@ -3356,6 +3955,12 @@ async fn handle_secrets_reload(
         })
         .unwrap_or_default();
 
+    // v2026.5.2: skip plugin-backed auth-profile overlays during the
+    // startup/reload secrets preflight — they resolve lazily on first use.
+    let required_paths =
+        crate::gateway::startup::preflight_required_secret_paths(&required_paths);
+    let required_paths: Vec<&str> = required_paths.iter().map(|s| s.as_str()).collect();
+
     let (_resolved_config, result) = crate::infra::secrets::reload::reload_secrets(
         &config_value,
         base_dir,
@@ -3363,6 +3968,17 @@ async fn handle_secrets_reload(
         fail_on_missing,
     )
     .await;
+
+    // v2026.5.2: include the caught error detail in the warning log while the
+    // RPC payload stays generic.
+    if let Ok(result_json) = serde_json::to_value(&result) {
+        if let Some(errors) = result_json.get("errors").and_then(|v| v.as_array()) {
+            for e in errors {
+                warn!("secrets.reload error detail: {e}");
+            }
+        }
+        return OcResponseFrame::success(request.id.clone(), result_json);
+    }
 
     OcResponseFrame::success(
         request.id.clone(),
@@ -3393,7 +4009,17 @@ async fn handle_secrets_resolve(
     // Resolve the secret using environment variables as the primary source.
     // This matches OpenClaw's `secrets.resolve` which interpolates ${SECRET_NAME}
     // patterns in configuration values.
-    let resolved = std::env::var(key).ok();
+    // v2026.5.2: caught resolution errors are logged in detail; the RPC
+    // response stays generic (never leaks resolver internals to clients).
+    let resolved = match std::env::var(key) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            if !matches!(e, std::env::VarError::NotPresent) {
+                warn!("secrets.resolve '{key}' env lookup failed: {e}");
+            }
+            None
+        }
+    };
 
     let config = state.config.read().await;
     let config_value = serde_json::to_value(&*config).unwrap_or_default();

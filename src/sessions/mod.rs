@@ -1,3 +1,13 @@
+pub mod lifecycle;
+pub mod lock;
+pub mod maintenance;
+pub mod recovery;
+pub mod sandbox;
+pub mod send;
+pub mod store;
+pub mod transcript;
+pub mod writer;
+
 use crate::config::Config;
 use crate::gateway::{SessionInfo, SessionPatchParams};
 use crate::providers::ProviderMessage;
@@ -321,6 +331,52 @@ impl SessionStore {
 }
 
 // ============================================================================
+// Session Titles (v2026.7.1)
+// ============================================================================
+
+/// Max length of a generated session title.
+pub const GENERATED_TITLE_MAX_CHARS: usize = 60;
+
+/// Derive a session title from the first user message (v2026.7.1).
+///
+/// This is the deterministic half of upstream's generated-titles feature:
+/// whitespace-collapsed, code-fence/markdown-marker stripped, truncated on a
+/// word boundary with an ellipsis. The `utilityModel`-routed LLM title pass
+/// (when configured) may overwrite this later; this derivation is the
+/// zero-cost default and the fallback when no utility model is available.
+pub fn derive_title_from_first_message(text: &str) -> Option<String> {
+    let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed
+        .trim_start_matches(['#', '>', '-', '*', '`'])
+        .trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.chars().count() <= GENERATED_TITLE_MAX_CHARS {
+        return Some(trimmed.to_string());
+    }
+    let hard: String = trimmed.chars().take(GENERATED_TITLE_MAX_CHARS).collect();
+    let cut = hard.rfind(' ').filter(|&i| i > 0).unwrap_or(hard.len());
+    Some(format!("{}…", hard[..cut].trim_end()))
+}
+
+/// Session-label fallback chain (v2026.7.1): explicit title → generated from
+/// first message → the session key itself.
+pub fn resolve_session_label(
+    explicit_title: Option<&str>,
+    first_message: Option<&str>,
+    session_key: &str,
+) -> String {
+    if let Some(title) = explicit_title.map(str::trim).filter(|t| !t.is_empty()) {
+        return title.to_string();
+    }
+    if let Some(derived) = first_message.and_then(derive_title_from_first_message) {
+        return derived;
+    }
+    session_key.to_string()
+}
+
+// ============================================================================
 // Session Alias Canonicalization (v2026.3.11)
 // ============================================================================
 
@@ -470,5 +526,53 @@ mod tests {
         let config = Config::default();
         store.get_or_create_session("my-key", &config);
         assert_eq!(store.resolve_session("my-key"), Some("my-key".to_string()));
+    }
+
+    // ====================================================================
+    // Session titles (v2026.7.1)
+    // ====================================================================
+
+    #[test]
+    fn title_derived_from_short_first_message() {
+        assert_eq!(
+            derive_title_from_first_message("Fix the deploy script"),
+            Some("Fix the deploy script".to_string())
+        );
+    }
+
+    #[test]
+    fn title_collapses_whitespace_and_strips_markers() {
+        assert_eq!(
+            derive_title_from_first_message("  ##   Hello\n\n   world  "),
+            Some("Hello world".to_string())
+        );
+    }
+
+    #[test]
+    fn title_truncates_long_messages_on_word_boundary() {
+        let long = "word ".repeat(50);
+        let title = derive_title_from_first_message(&long).unwrap();
+        assert!(title.chars().count() <= GENERATED_TITLE_MAX_CHARS + 1);
+        assert!(title.ends_with('…'));
+        assert!(!title.contains("  "));
+    }
+
+    #[test]
+    fn title_empty_or_marker_only_yields_none() {
+        assert_eq!(derive_title_from_first_message("   "), None);
+        assert_eq!(derive_title_from_first_message("###"), None);
+    }
+
+    #[test]
+    fn label_fallback_chain_explicit_then_derived_then_key() {
+        assert_eq!(
+            resolve_session_label(Some("My Title"), Some("hello"), "key-1"),
+            "My Title"
+        );
+        assert_eq!(
+            resolve_session_label(None, Some("hello there"), "key-1"),
+            "hello there"
+        );
+        assert_eq!(resolve_session_label(Some("  "), None, "key-1"), "key-1");
     }
 }

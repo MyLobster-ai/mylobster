@@ -1,18 +1,169 @@
+use crate::agents::tool_loop::{blocked_tool_result, ToolLoopDecision, ToolLoopGuard};
 use crate::config::Config;
 use crate::gateway::protocol::*;
 use crate::hooks::{HookEvent, HookResult, SharedHookRegistry};
 use crate::providers::{ProviderMessage, ProviderRequest, StreamEvent, ThinkingConfig};
-use crate::sessions::SessionStore;
+use crate::sessions::{SessionHandle, SessionStore};
 
 use anyhow::Result;
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// Maximum number of tool loop iterations before stopping.
 const MAX_TOOL_ITERATIONS: usize = 25;
+
+// ============================================================================
+// Active-run queueing — steer mode (OpenClaw v2026.4.29)
+// ============================================================================
+
+/// Default followup debounce for steer mode (v2026.4.29: 500ms).
+pub const STEER_FOLLOWUP_DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// Followups queued behind an active run for one session.
+///
+/// Steer semantics: messages arriving while a run is active are held; once
+/// the newest entry is older than the debounce window, the whole batch is
+/// folded into the active run as additional user turns.
+#[derive(Debug)]
+pub struct SteerQueue {
+    pending: Vec<(String, Instant)>,
+    debounce: Duration,
+}
+
+impl SteerQueue {
+    pub fn new(debounce: Duration) -> Self {
+        Self {
+            pending: Vec::new(),
+            debounce,
+        }
+    }
+
+    pub fn enqueue(&mut self, message: impl Into<String>, now: Instant) {
+        self.pending.push((message.into(), now));
+    }
+
+    /// Drain the batch once the debounce window has elapsed since the last
+    /// enqueue; returns empty while messages are still arriving.
+    pub fn drain_ready(&mut self, now: Instant) -> Vec<String> {
+        match self.pending.last() {
+            Some((_, last)) if now.duration_since(*last) >= self.debounce => {
+                self.pending.drain(..).map(|(m, _)| m).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
+static STEER_QUEUES: Lazy<DashMap<String, SteerQueue>> = Lazy::new(DashMap::new);
+
+/// Whether active-run queueing uses steer mode. `messages.queue.mode`
+/// defaults to `"steer"` (v2026.4.29).
+fn steer_mode_enabled(config: &Config) -> bool {
+    config
+        .messages
+        .queue
+        .as_ref()
+        .and_then(|q| q.mode.as_deref())
+        .map(|m| m.trim().eq_ignore_ascii_case("steer"))
+        .unwrap_or(true)
+}
+
+fn steer_debounce(config: &Config) -> Duration {
+    config
+        .messages
+        .queue
+        .as_ref()
+        .and_then(|q| q.debounce_ms)
+        .map(Duration::from_millis)
+        .unwrap_or(STEER_FOLLOWUP_DEBOUNCE)
+}
+
+fn steer_enqueue(config: &Config, session_key: &str, message: &str) {
+    let debounce = steer_debounce(config);
+    STEER_QUEUES
+        .entry(session_key.to_string())
+        .or_insert_with(|| SteerQueue::new(debounce))
+        .enqueue(message, Instant::now());
+}
+
+fn steer_drain_ready(session_key: &str) -> Vec<String> {
+    match STEER_QUEUES.get_mut(session_key) {
+        Some(mut q) => q.drain_ready(Instant::now()),
+        None => Vec::new(),
+    }
+}
+
+/// RAII busy flag for the session while a run is active.
+struct BusyGuard {
+    handle: SessionHandle,
+}
+
+impl BusyGuard {
+    fn new(handle: SessionHandle) -> Self {
+        handle.set_busy(true);
+        Self { handle }
+    }
+}
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.handle.set_busy(false);
+    }
+}
+
+// ============================================================================
+// Blank visible user prompts (OpenClaw v2026.5.2)
+// ============================================================================
+
+/// Skip blank visible user prompts at the embedded-runner boundary.
+/// Internal runtime-event markers and media-only turns still run.
+fn should_skip_visible_user_prompt(message: &str, attachments: Option<&[serde_json::Value]>) -> bool {
+    if !message.trim().is_empty() {
+        return false;
+    }
+    // Media-only turns are allowed.
+    if attachments.map(|a| !a.is_empty()).unwrap_or(false) {
+        return false;
+    }
+    true
+}
+
+/// Run a compaction pass for a session (hook-bracketed).
+async fn run_compaction_pass(
+    sessions: &SessionStore,
+    session_key: &str,
+    hooks: &Option<Arc<SharedHookRegistry>>,
+) {
+    if let Some(h) = hooks {
+        h.emit(HookEvent::BeforeCompaction {
+            session_key: session_key.to_string(),
+        })
+        .await;
+    }
+    let compacted = sessions.compact_session(session_key);
+    if let Some(h) = hooks {
+        h.emit(HookEvent::AfterCompaction {
+            session_key: session_key.to_string(),
+        })
+        .await;
+    }
+    debug!(session_key, compacted, "compaction pass completed");
+}
 
 /// Handle a chat request and stream events back.
 ///
@@ -57,6 +208,37 @@ pub async fn process_chat_with_hooks(
 
     // Get or create session
     let session = sessions.get_or_create_session(session_key, config);
+
+    // v2026.5.2: skip blank visible user prompts at the embedded-runner
+    // boundary (media-only and runtime-event turns still run).
+    if should_skip_visible_user_prompt(&params.message, params.attachments.as_deref()) {
+        debug!(session_key, "skipping blank visible user prompt");
+        let final_event = ChatEvent {
+            run_id: run_id.clone(),
+            session_key: session_key.clone(),
+            seq: 0,
+            state: ChatEventState::Final,
+            message: Some(serde_json::json!({
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "" }]
+            })),
+            error_message: None,
+            usage: None,
+            stop_reason: Some("skipped_blank_prompt".to_string()),
+        };
+        let _ = event_tx.send(final_event).await;
+        return Ok(());
+    }
+
+    // v2026.4.29: active-run queueing — default steer mode. Followups
+    // hitting a busy session are debounced (500ms) and folded into the
+    // active run instead of spawning a competing run.
+    if session.is_busy() && steer_mode_enabled(config) {
+        debug!(session_key, "session busy — steering followup into active run");
+        steer_enqueue(config, session_key, &params.message);
+        return Ok(());
+    }
+    let _busy = BusyGuard::new(session.clone());
 
     // Fire MessageReceived hook
     if let Some(ref h) = hooks {
@@ -114,11 +296,56 @@ pub async fn process_chat_with_hooks(
     // Build tool definitions for the provider
     let tools = build_tool_definitions(config);
 
+    // v2026.4.26: maxActiveTranscriptBytes preflight compaction trigger.
+    {
+        let transcript_bytes =
+            crate::agents::compaction::estimate_transcript_bytes(&messages);
+        if crate::agents::compaction::should_preflight_compact(
+            &config.agent.compaction,
+            transcript_bytes,
+        ) {
+            info!(session_key, transcript_bytes, "preflight compaction triggered");
+            run_compaction_pass(sessions, session_key, &hooks).await;
+        }
+    }
+
+    // v2026.5.2: tool-loop circuit breaker — critical stops surface as
+    // blocked tool results, not thrown failures.
+    let mut loop_guard = ToolLoopGuard::new();
+
     // Agentic loop: call provider, execute tools, repeat
     let mut iteration = 0;
     let mut seq = 0u64;
 
     loop {
+        // v2026.4.29 steer mode: fold debounced followups into this run.
+        for followup in steer_drain_ready(session_key) {
+            debug!(session_key, "steering queued followup into active run");
+            messages.push(ProviderMessage {
+                role: "user".to_string(),
+                content: serde_json::Value::String(followup),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            });
+        }
+
+        // v2026.5.2: mid-turn compaction precheck between iterations.
+        if iteration > 0 {
+            let transcript_bytes =
+                crate::agents::compaction::estimate_transcript_bytes(&messages);
+            let estimated_tokens = transcript_bytes / 4;
+            if crate::agents::compaction::should_compact_mid_turn(
+                &config.agent.compaction,
+                config.agent.context_tokens,
+                estimated_tokens,
+                transcript_bytes,
+            ) {
+                info!(session_key, transcript_bytes, "mid-turn compaction precheck triggered");
+                run_compaction_pass(sessions, session_key, &hooks).await;
+            }
+        }
+
         if cancel.is_cancelled() {
             let abort_event = ChatEvent {
                 run_id: run_id.clone(),
@@ -330,6 +557,7 @@ pub async fn process_chat_with_hooks(
             });
 
             // Execute each tool call
+            let mut critical_stop: Option<String> = None;
             for tool_call in &tool_calls {
                 let tool_name = tool_call
                     .get("name")
@@ -343,6 +571,42 @@ pub async fn process_chat_with_hooks(
                     .get("input")
                     .cloned()
                     .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+
+                // v2026.5.2: tool-loop circuit breaker. Blocked calls feed
+                // the model a blocked tool result instead of executing;
+                // critical stops end the run without a thrown failure.
+                match loop_guard.check(tool_name, &tool_input) {
+                    ToolLoopDecision::Proceed => {}
+                    ToolLoopDecision::Blocked { reason } => {
+                        warn!(tool = tool_name, "tool loop detected — blocking call");
+                        let blocked = blocked_tool_result(&reason);
+                        messages.push(ProviderMessage {
+                            role: "tool".to_string(),
+                            content: serde_json::Value::String(
+                                blocked.text.unwrap_or_default(),
+                            ),
+                            name: Some(tool_name.to_string()),
+                            tool_call_id: Some(tool_call_id.to_string()),
+                            tool_calls: None,
+                        });
+                        continue;
+                    }
+                    ToolLoopDecision::CriticalStop { reason } => {
+                        warn!(tool = tool_name, "tool loop critical stop");
+                        let blocked = blocked_tool_result(&reason);
+                        messages.push(ProviderMessage {
+                            role: "tool".to_string(),
+                            content: serde_json::Value::String(
+                                blocked.text.unwrap_or_default(),
+                            ),
+                            name: Some(tool_name.to_string()),
+                            tool_call_id: Some(tool_call_id.to_string()),
+                            tool_calls: None,
+                        });
+                        critical_stop = Some(reason);
+                        break;
+                    }
+                }
 
                 debug!("Executing tool: {} (id={})", tool_name, tool_call_id);
 
@@ -405,6 +669,27 @@ pub async fn process_chat_with_hooks(
                 });
             }
 
+            // v2026.5.2: a critical tool-loop stop ends the run as a normal
+            // final (the blocked tool result is already in the transcript).
+            if let Some(reason) = critical_stop {
+                let text = crate::agents::reply_sanitize::sanitize_user_facing_reply(&reason);
+                let final_event = ChatEvent {
+                    run_id: run_id.clone(),
+                    session_key: session_key.clone(),
+                    seq,
+                    state: ChatEventState::Final,
+                    message: Some(serde_json::json!({
+                        "role": "assistant",
+                        "content": [{ "type": "text", "text": text }]
+                    })),
+                    error_message: None,
+                    usage: None,
+                    stop_reason: Some("tool_loop".to_string()),
+                };
+                let _ = event_tx.send(final_event).await;
+                break;
+            }
+
             // Clear tool_calls for next iteration
             tool_calls.clear();
             continue;
@@ -431,6 +716,12 @@ pub async fn process_chat_with_hooks(
             tool_calls: None,
         });
 
+        // v2026.5.2 / v2026.7.1: shared user-facing reply sanitization —
+        // strip legacy [TOOL_CALL]/[TOOL_RESULT] blocks, MiniMax/XML tool
+        // scaffolding, and runtime sentinels before the text reaches a user.
+        let visible_content =
+            crate::agents::reply_sanitize::sanitize_user_facing_reply(&full_content);
+
         // Emit final event with content as array of content blocks
         // Extract token counts before moving final_usage
         let hook_input_tokens = final_usage.as_ref().and_then(|u| u.input_tokens);
@@ -445,7 +736,7 @@ pub async fn process_chat_with_hooks(
                 "role": "assistant",
                 "content": [{
                     "type": "text",
-                    "text": full_content
+                    "text": visible_content
                 }]
             })),
             error_message: None,
@@ -584,6 +875,9 @@ async fn execute_tool(
 
         // A2A sessions
         "sessions_a2a" => Box::new(sessions_a2a::SessionsA2aTool),
+
+        // Heartbeat structured response (v2026.5.2)
+        "heartbeat_respond" => Box::new(crate::agents::heartbeat::HeartbeatRespondTool),
 
         _ => {
             // For tools that don't have full implementations yet,
@@ -761,5 +1055,114 @@ mod tests {
         // Bumping this changes user-visible behavior (longer agent runs);
         // pin it so the change requires a deliberate test edit.
         assert_eq!(MAX_TOOL_ITERATIONS, 25);
+    }
+
+    // ------------------------------------------------------------------
+    // Steer mode (v2026.4.29) — 500ms followup debounce
+    // ------------------------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn steer_queue_holds_batch_until_debounce_elapses() {
+        let mut q = SteerQueue::new(STEER_FOLLOWUP_DEBOUNCE);
+        q.enqueue("first", Instant::now());
+        tokio::time::advance(Duration::from_millis(200)).await;
+        // 200ms after last enqueue — still inside the debounce window.
+        assert!(q.drain_ready(Instant::now()).is_empty());
+        assert_eq!(q.len(), 1);
+
+        tokio::time::advance(Duration::from_millis(300)).await;
+        // 500ms elapsed → batch is released.
+        assert_eq!(q.drain_ready(Instant::now()), vec!["first".to_string()]);
+        assert!(q.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn steer_queue_debounce_resets_on_new_followup() {
+        let mut q = SteerQueue::new(STEER_FOLLOWUP_DEBOUNCE);
+        q.enqueue("a", Instant::now());
+        tokio::time::advance(Duration::from_millis(400)).await;
+        // New followup 400ms in resets the debounce clock.
+        q.enqueue("b", Instant::now());
+        tokio::time::advance(Duration::from_millis(400)).await;
+        assert!(
+            q.drain_ready(Instant::now()).is_empty(),
+            "batch must wait for quiet period after the newest followup"
+        );
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert_eq!(
+            q.drain_ready(Instant::now()),
+            vec!["a".to_string(), "b".to_string()],
+            "batch released in arrival order"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn steer_queue_empty_drain_is_empty() {
+        let mut q = SteerQueue::new(STEER_FOLLOWUP_DEBOUNCE);
+        assert!(q.drain_ready(Instant::now()).is_empty());
+    }
+
+    #[test]
+    fn steer_mode_is_default_queue_mode() {
+        let config = Config::default();
+        assert!(steer_mode_enabled(&config), "steer is the v2026.4.29 default");
+    }
+
+    #[test]
+    fn steer_mode_disabled_by_explicit_other_mode() {
+        let mut config = Config::default();
+        config.messages.queue = Some(crate::config::types::QueueConfig {
+            mode: Some("queue".into()),
+            ..Default::default()
+        });
+        assert!(!steer_mode_enabled(&config));
+
+        config.messages.queue = Some(crate::config::types::QueueConfig {
+            mode: Some("Steer".into()),
+            ..Default::default()
+        });
+        assert!(steer_mode_enabled(&config));
+    }
+
+    #[test]
+    fn steer_debounce_configurable_with_500ms_default() {
+        let config = Config::default();
+        assert_eq!(steer_debounce(&config), Duration::from_millis(500));
+
+        let mut custom = Config::default();
+        custom.messages.queue = Some(crate::config::types::QueueConfig {
+            debounce_ms: Some(1200),
+            ..Default::default()
+        });
+        assert_eq!(steer_debounce(&custom), Duration::from_millis(1200));
+    }
+
+    // ------------------------------------------------------------------
+    // Blank visible user prompts (v2026.5.2)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn blank_prompt_without_attachments_skipped() {
+        assert!(should_skip_visible_user_prompt("", None));
+        assert!(should_skip_visible_user_prompt("   \n\t", None));
+        assert!(should_skip_visible_user_prompt("", Some(&[])));
+    }
+
+    #[test]
+    fn media_only_prompt_not_skipped() {
+        let attachments = vec![serde_json::json!({"type": "image", "url": "x"})];
+        assert!(!should_skip_visible_user_prompt("", Some(&attachments)));
+    }
+
+    #[test]
+    fn normal_prompt_not_skipped() {
+        assert!(!should_skip_visible_user_prompt("hello", None));
+    }
+
+    #[test]
+    fn runtime_event_marker_not_skipped() {
+        // Internal runtime-only turns (compaction memory flush) must run.
+        let marker = crate::agents::compaction::memory_flush_turn_marker();
+        assert!(!should_skip_visible_user_prompt(&marker, None));
     }
 }

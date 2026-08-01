@@ -65,6 +65,10 @@ struct OllamaChatMessage {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct OllamaToolCall {
+    /// v2026.6.x: Ollama's native tool-call id is preserved when present
+    /// instead of being resynthesized per index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
     function: OllamaToolFunction,
 }
 
@@ -123,14 +127,76 @@ fn parse_tool_calls(msg: &OllamaChatMessage) -> Vec<ContentBlock> {
     let mut blocks = Vec::new();
     if let Some(tool_calls) = &msg.tool_calls {
         for (i, tc) in tool_calls.iter().enumerate() {
+            // v2026.6.x: preserve Ollama's native tool-call id when present.
+            let id = tc
+                .id
+                .clone()
+                .filter(|id| !id.is_empty())
+                .unwrap_or_else(|| format!("call_{}", i));
             blocks.push(ContentBlock::ToolUse {
-                id: format!("call_{}", i),
+                id,
                 name: tc.function.name.clone(),
                 input: tc.function.arguments.clone(),
             });
         }
     }
     blocks
+}
+
+// ============================================================================
+// v2026.5.x–7.1 behavior helpers
+// ============================================================================
+
+/// Clamp `top_p` into the valid (0, 1] range (v2026.6.x normalization —
+/// out-of-range values from proxies/config are normalized instead of being
+/// rejected by the server).
+pub fn normalize_top_p(top_p: f64) -> Option<f64> {
+    if !top_p.is_finite() || top_p <= 0.0 {
+        return None;
+    }
+    Some(top_p.min(1.0))
+}
+
+/// Hosts treated as local Ollama endpoints, including Docker/OrbStack
+/// aliases (v2026.6.x): local hosts skip API-key requirements and are exempt
+/// from remote-endpoint policies.
+pub fn is_local_ollama_host(host: &str) -> bool {
+    let lowered = host.trim().to_ascii_lowercase();
+    let bare = lowered
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(&lowered);
+    bare == "localhost"
+        || bare == "host.docker.internal"
+        || bare == "host.orb.internal"
+        || bare.ends_with(".orb.local")
+        || bare.ends_with(".localhost")
+        || bare == "::1"
+        || bare == "0:0:0:0:0:0:0:1"
+        || bare.starts_with("127.")
+        || bare == "0.0.0.0"
+}
+
+/// Model-capability defaulting (v2026.6.x): discovery entries whose
+/// `capabilities` list is missing/unknown default to tool-capable instead of
+/// being filtered out of tool-using agents.
+pub fn model_supports_tools(capabilities: Option<&[String]>) -> bool {
+    match capabilities {
+        None => true,
+        Some(caps) if caps.is_empty() => true,
+        Some(caps) => caps.iter().any(|c| c.eq_ignore_ascii_case("tools")),
+    }
+}
+
+/// Incomplete-stream classification (v2026.7.1): a stream that ends without
+/// a `done: true` frame is a retryable transport fallback, not a provider
+/// refusal.
+pub fn classify_incomplete_stream(saw_done: bool) -> Option<&'static str> {
+    if saw_done {
+        None
+    } else {
+        Some("incomplete-stream: no done frame received; retry/fallback eligible")
+    }
 }
 
 #[async_trait]
@@ -815,5 +881,85 @@ mod tests {
     fn name_is_ollama() {
         let p = OllamaProvider::new("http://x".into(), "m".into(), None);
         assert_eq!(p.name(), "ollama");
+    }
+
+    // ------------------------------------------------------------------
+    // v2026.7.1 behavior helpers
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn top_p_normalization_clamps_range() {
+        assert_eq!(normalize_top_p(0.9), Some(0.9));
+        assert_eq!(normalize_top_p(1.7), Some(1.0));
+        assert_eq!(normalize_top_p(0.0), None);
+        assert_eq!(normalize_top_p(-0.3), None);
+        assert_eq!(normalize_top_p(f64::NAN), None);
+    }
+
+    #[test]
+    fn docker_and_orbstack_aliases_are_local() {
+        for host in [
+            "localhost",
+            "127.0.0.1",
+            "127.1.2.3",
+            "host.docker.internal",
+            "host.orb.internal",
+            "ollama.orb.local",
+            "[::1]",
+        ] {
+            assert!(is_local_ollama_host(host), "{} should be local", host);
+        }
+        assert!(!is_local_ollama_host("ollama.example.com"));
+        assert!(!is_local_ollama_host("192.168.1.4"));
+    }
+
+    #[test]
+    fn unknown_capabilities_default_tool_capable() {
+        assert!(model_supports_tools(None));
+        assert!(model_supports_tools(Some(&[][..])));
+        assert!(model_supports_tools(Some(&["tools".to_string()][..])));
+        assert!(!model_supports_tools(Some(&["vision".to_string()][..])));
+    }
+
+    #[test]
+    fn native_tool_call_ids_preserved() {
+        let msg = OllamaChatMessage {
+            role: "assistant".to_string(),
+            content: String::new(),
+            tool_calls: Some(vec![
+                OllamaToolCall {
+                    id: Some("native-1".to_string()),
+                    function: OllamaToolFunction {
+                        name: "f".to_string(),
+                        arguments: serde_json::json!({}),
+                    },
+                },
+                OllamaToolCall {
+                    id: None,
+                    function: OllamaToolFunction {
+                        name: "g".to_string(),
+                        arguments: serde_json::json!({}),
+                    },
+                },
+            ]),
+        };
+        let blocks = parse_tool_calls(&msg);
+        match (&blocks[0], &blocks[1]) {
+            (
+                ContentBlock::ToolUse { id: id0, .. },
+                ContentBlock::ToolUse { id: id1, .. },
+            ) => {
+                assert_eq!(id0, "native-1");
+                assert_eq!(id1, "call_1");
+            }
+            _ => panic!("expected tool use blocks"),
+        }
+    }
+
+    #[test]
+    fn incomplete_stream_classified_retryable() {
+        assert!(classify_incomplete_stream(true).is_none());
+        let reason = classify_incomplete_stream(false).unwrap();
+        assert!(reason.contains("incomplete-stream"));
     }
 }

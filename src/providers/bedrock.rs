@@ -25,6 +25,9 @@ struct ConverseRequest {
     tool_config: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     guardrail_config: Option<GuardrailConfig>,
+    /// Anthropic extended-thinking passthrough (v2026.4.29 Opus 4.7 parity).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    additional_model_request_fields: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -125,6 +128,133 @@ enum StreamDeltaContent {
 #[derive(Debug, Deserialize)]
 struct StreamMetadata {
     usage: Option<ConverseUsage>,
+}
+
+// ============================================================================
+// Thinking profiles (v2026.4.29 — Bedrock Opus 4.7 thinking parity)
+// ============================================================================
+
+/// Thinking levels + default for a Bedrock model ref.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BedrockThinkingProfile {
+    pub levels: Vec<&'static str>,
+    pub default_level: &'static str,
+}
+
+const BASE_CLAUDE_THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high"];
+
+/// Normalize a Bedrock model ref to its Claude family id:
+/// strips `bedrock/` / `aws/` prefixes, geo prefixes (`us.` / `eu.` /
+/// `apac.` / `global.`), the `anthropic.` vendor namespace, and `:N`
+/// version suffixes; converts dots in the version to dashes.
+pub fn normalize_bedrock_claude_model_id(model_ref: &str) -> String {
+    let mut s = model_ref.trim().to_ascii_lowercase();
+    for prefix in ["bedrock/", "aws/"] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest.to_string();
+        }
+    }
+    for geo in ["us.", "eu.", "apac.", "global."] {
+        if let Some(rest) = s.strip_prefix(geo) {
+            s = rest.to_string();
+            break;
+        }
+    }
+    if let Some(rest) = s.strip_prefix("anthropic.") {
+        s = rest.to_string();
+    }
+    if let Some(colon) = s.find(':') {
+        s.truncate(colon);
+    }
+    s.replace('.', "-")
+}
+
+/// Resolve the thinking profile for a Bedrock model ref (v2026.4.29 #74701):
+///
+/// * Claude Opus 4.7 (and 4.8) expose the full Anthropic-transport profile —
+///   `xhigh`, `adaptive`, and `max` — matching `/think` menus and validation
+///   on the direct Anthropic transport. Default stays `off`.
+/// * Claude Opus/Sonnet 4.6 keep adaptive-by-default (base + `adaptive` +
+///   `max`).
+/// * Other Claude models get the base profile, default `off`.
+/// * Non-Claude Bedrock models are off-only.
+pub fn bedrock_thinking_profile(model_ref: &str) -> BedrockThinkingProfile {
+    let id = normalize_bedrock_claude_model_id(model_ref);
+    if !id.starts_with("claude") {
+        return BedrockThinkingProfile {
+            levels: vec!["off"],
+            default_level: "off",
+        };
+    }
+    if id.starts_with("claude-opus-4-7") || id.starts_with("claude-opus-4-8") {
+        let mut levels = BASE_CLAUDE_THINKING_LEVELS.to_vec();
+        levels.extend(["xhigh", "adaptive", "max"]);
+        return BedrockThinkingProfile {
+            levels,
+            default_level: "off",
+        };
+    }
+    if id.starts_with("claude-opus-4-6") || id.starts_with("claude-sonnet-4-6") {
+        let mut levels = BASE_CLAUDE_THINKING_LEVELS.to_vec();
+        levels.extend(["adaptive", "max"]);
+        return BedrockThinkingProfile {
+            levels,
+            default_level: "adaptive",
+        };
+    }
+    BedrockThinkingProfile {
+        levels: BASE_CLAUDE_THINKING_LEVELS.to_vec(),
+        default_level: "off",
+    }
+}
+
+/// Build the `additionalModelRequestFields` thinking payload for a Converse
+/// call, mirroring the Anthropic-transport wire shape.
+fn build_thinking_fields(
+    model_ref: &str,
+    thinking: Option<&super::ThinkingConfig>,
+) -> Option<serde_json::Value> {
+    let thinking = thinking?;
+    // Only Claude models accept the thinking field.
+    if !normalize_bedrock_claude_model_id(model_ref).starts_with("claude") {
+        return None;
+    }
+    Some(serde_json::json!({
+        "thinking": {
+            "type": "enabled",
+            "budget_tokens": thinking.budget_tokens,
+        }
+    }))
+}
+
+// ============================================================================
+// Service tier + inference-profile helpers (v2026.5.x–7.1)
+// ============================================================================
+
+/// Valid Bedrock `serviceTier` values (v2026.6.x param).
+pub const BEDROCK_SERVICE_TIERS: &[&str] = &["default", "flex", "priority", "reserved"];
+
+/// Normalize a configured Bedrock service tier; invalid values are rejected
+/// so misconfigured tiers fail fast instead of at the API.
+pub fn normalize_bedrock_service_tier(tier: &str) -> Option<&'static str> {
+    let normalized = tier.trim().to_ascii_lowercase();
+    BEDROCK_SERVICE_TIERS
+        .iter()
+        .find(|t| **t == normalized)
+        .copied()
+}
+
+/// Strip a geo inference-profile prefix (`us.` / `eu.` / `apac.` /
+/// `global.`) from a model id — embedding calls address the bare model id
+/// (v2026.6.x fix).
+pub fn strip_inference_profile_prefix(model_id: &str) -> &str {
+    let trimmed = model_id.trim();
+    for prefix in ["us.", "eu.", "apac.", "global."] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return rest;
+        }
+    }
+    trimmed
 }
 
 // ============================================================================
@@ -340,6 +470,7 @@ impl ModelProvider for BedrockProvider {
         }
 
         let url = self.endpoint_url(false);
+        let thinking_fields = build_thinking_fields(&request.model, request.thinking.as_ref());
         let messages = self.convert_messages(request.messages);
 
         let body = ConverseRequest {
@@ -351,6 +482,7 @@ impl ModelProvider for BedrockProvider {
             }),
             tool_config: None,
             guardrail_config: self.build_guardrail_config(),
+            additional_model_request_fields: thinking_fields,
         };
 
         let body_bytes = serde_json::to_vec(&body)?;
@@ -430,6 +562,7 @@ impl ModelProvider for BedrockProvider {
         let (tx, rx) = mpsc::channel(256);
 
         let url = self.endpoint_url(true);
+        let thinking_fields = build_thinking_fields(&request.model, request.thinking.as_ref());
         let messages = self.convert_messages(request.messages);
 
         let body = ConverseRequest {
@@ -441,6 +574,7 @@ impl ModelProvider for BedrockProvider {
             }),
             tool_config: None,
             guardrail_config: self.build_guardrail_config(),
+            additional_model_request_fields: thinking_fields,
         };
 
         let body_bytes = serde_json::to_vec(&body)?;
@@ -548,5 +682,156 @@ impl ModelProvider for BedrockProvider {
 
     fn name(&self) -> &str {
         "bedrock"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ------------------------------------------------------------------
+    // Model ref normalization
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn normalizes_geo_and_vendor_prefixes() {
+        assert_eq!(
+            normalize_bedrock_claude_model_id("us.anthropic.claude-opus-4-7-20260115-v1:0"),
+            "claude-opus-4-7-20260115-v1"
+        );
+        assert_eq!(
+            normalize_bedrock_claude_model_id("bedrock/anthropic.claude-sonnet-4-6-v1:0"),
+            "claude-sonnet-4-6-v1"
+        );
+        assert_eq!(
+            normalize_bedrock_claude_model_id("eu.anthropic.claude-opus-4.7"),
+            "claude-opus-4-7"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Thinking profiles (v2026.4.29 Opus 4.7 parity, #74701)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn opus_4_7_exposes_full_thinking_profile() {
+        let profile =
+            bedrock_thinking_profile("us.anthropic.claude-opus-4-7-20260115-v1:0");
+        assert!(profile.levels.contains(&"xhigh"));
+        assert!(profile.levels.contains(&"adaptive"));
+        assert!(profile.levels.contains(&"max"));
+        assert_eq!(profile.default_level, "off");
+    }
+
+    #[test]
+    fn opus_and_sonnet_4_6_stay_adaptive_by_default() {
+        for model in [
+            "anthropic.claude-opus-4-6-v1:0",
+            "us.anthropic.claude-sonnet-4-6-20251101-v1:0",
+        ] {
+            let profile = bedrock_thinking_profile(model);
+            assert!(profile.levels.contains(&"adaptive"), "{}", model);
+            assert!(!profile.levels.contains(&"xhigh"), "{}", model);
+            assert_eq!(profile.default_level, "adaptive", "{}", model);
+        }
+    }
+
+    #[test]
+    fn older_claude_gets_base_profile() {
+        let profile = bedrock_thinking_profile("anthropic.claude-3-5-sonnet-20241022-v2:0");
+        assert_eq!(profile.levels, BASE_CLAUDE_THINKING_LEVELS.to_vec());
+        assert_eq!(profile.default_level, "off");
+    }
+
+    #[test]
+    fn non_claude_models_are_off_only() {
+        let profile = bedrock_thinking_profile("amazon.titan-text-express-v1");
+        assert_eq!(profile.levels, vec!["off"]);
+    }
+
+    // ------------------------------------------------------------------
+    // Thinking wire fields
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn thinking_fields_built_for_claude_models() {
+        let thinking = crate::providers::ThinkingConfig { budget_tokens: 2048 };
+        let fields = build_thinking_fields(
+            "us.anthropic.claude-opus-4-7-20260115-v1:0",
+            Some(&thinking),
+        )
+        .unwrap();
+        assert_eq!(fields["thinking"]["type"], "enabled");
+        assert_eq!(fields["thinking"]["budget_tokens"], 2048);
+    }
+
+    #[test]
+    fn thinking_fields_skipped_without_config_or_for_non_claude() {
+        assert!(build_thinking_fields("anthropic.claude-opus-4-7", None).is_none());
+        let thinking = crate::providers::ThinkingConfig { budget_tokens: 1024 };
+        assert!(build_thinking_fields("amazon.titan-text-express-v1", Some(&thinking)).is_none());
+    }
+
+    #[test]
+    fn converse_request_serializes_thinking_passthrough() {
+        let body = ConverseRequest {
+            model_id: "us.anthropic.claude-opus-4-7-v1:0".to_string(),
+            messages: vec![],
+            inference_config: None,
+            tool_config: None,
+            guardrail_config: None,
+            additional_model_request_fields: build_thinking_fields(
+                "us.anthropic.claude-opus-4-7-v1:0",
+                Some(&crate::providers::ThinkingConfig { budget_tokens: 512 }),
+            ),
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            json["additionalModelRequestFields"]["thinking"]["budget_tokens"],
+            512
+        );
+    }
+
+    #[test]
+    fn converse_request_omits_thinking_when_absent() {
+        let body = ConverseRequest {
+            model_id: "m".to_string(),
+            messages: vec![],
+            inference_config: None,
+            tool_config: None,
+            guardrail_config: None,
+            additional_model_request_fields: None,
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert!(json.get("additionalModelRequestFields").is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // v2026.5.x–7.1: service tier + inference profile prefix
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn service_tier_normalization() {
+        assert_eq!(normalize_bedrock_service_tier("default"), Some("default"));
+        assert_eq!(normalize_bedrock_service_tier(" FLEX "), Some("flex"));
+        assert_eq!(normalize_bedrock_service_tier("priority"), Some("priority"));
+        assert_eq!(normalize_bedrock_service_tier("reserved"), Some("reserved"));
+        assert_eq!(normalize_bedrock_service_tier("turbo"), None);
+    }
+
+    #[test]
+    fn inference_profile_prefix_stripped_for_embeddings() {
+        assert_eq!(
+            strip_inference_profile_prefix("us.amazon.titan-embed-text-v2:0"),
+            "amazon.titan-embed-text-v2:0"
+        );
+        assert_eq!(
+            strip_inference_profile_prefix("global.anthropic.claude-opus-4-8-v1:0"),
+            "anthropic.claude-opus-4-8-v1:0"
+        );
+        assert_eq!(
+            strip_inference_profile_prefix("amazon.titan-embed-text-v2:0"),
+            "amazon.titan-embed-text-v2:0"
+        );
     }
 }

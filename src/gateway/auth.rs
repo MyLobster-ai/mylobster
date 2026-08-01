@@ -516,6 +516,7 @@ mod tests {
             token: Some("config-token".into()),
             password: None,
             allow_tailscale: false,
+            rate_limit: None,
         };
         let resolved = resolve_gateway_auth(Some(&cfg), Some("env-token"));
         assert_eq!(resolved.token.as_deref(), Some("env-token"));
@@ -528,6 +529,7 @@ mod tests {
             token: None,
             password: Some("secret".into()),
             allow_tailscale: false,
+            rate_limit: None,
         };
         let resolved = resolve_gateway_auth(Some(&cfg), None);
         assert!(matches!(resolved.mode, GatewayAuthMode::Password));

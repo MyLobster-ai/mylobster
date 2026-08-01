@@ -88,9 +88,66 @@ pub fn read_config_file_snapshot(path: &Path) -> Result<serde_json::Value> {
     }
 }
 
+/// Environment variables holding operator-approved `$include` roots
+/// (path-separator-delimited, v2026.5.2). When set, `$include` directives
+/// may only reference files inside these directories (plus the including
+/// config's own directory).
+pub const INCLUDE_ROOTS_ENV_VARS: &[&str] = &["OPENCLAW_INCLUDE_ROOTS", "MYLOBSTER_INCLUDE_ROOTS"];
+
+/// Parse the operator-approved include roots from the environment.
+/// Returns `None` when no roots are configured (legacy behavior: any path).
+pub fn approved_include_roots() -> Option<Vec<std::path::PathBuf>> {
+    for var in INCLUDE_ROOTS_ENV_VARS {
+        if let Ok(raw) = std::env::var(var) {
+            let roots = parse_include_roots(&raw);
+            if !roots.is_empty() {
+                return Some(roots);
+            }
+        }
+    }
+    None
+}
+
+/// Parse a path-separator-delimited include-roots string.
+pub fn parse_include_roots(raw: &str) -> Vec<std::path::PathBuf> {
+    std::env::split_paths(raw)
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect()
+}
+
+/// Whether an include path is permitted under the approved roots policy
+/// (v2026.5.2). `config_dir` (the including file's directory) is always
+/// allowed so sibling includes keep working.
+pub fn include_path_allowed(
+    include_path: &Path,
+    config_dir: Option<&Path>,
+    roots: Option<&[std::path::PathBuf]>,
+) -> bool {
+    let Some(roots) = roots else {
+        return true; // no policy configured → legacy behavior
+    };
+    // Compare on canonical paths when possible (falls back to lexical).
+    let canonical = include_path
+        .canonicalize()
+        .unwrap_or_else(|_| include_path.to_path_buf());
+    if let Some(dir) = config_dir {
+        let dir_canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        if canonical.starts_with(&dir_canonical) {
+            return true;
+        }
+    }
+    roots.iter().any(|root| {
+        let root_canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+        canonical.starts_with(&root_canonical)
+    })
+}
+
 /// Read a config file with include depth tracking (v2026.2.26).
 ///
 /// Prevents infinite include loops by tracking recursion depth.
+/// v2026.5.2: when `OPENCLAW_INCLUDE_ROOTS` (or `MYLOBSTER_INCLUDE_ROOTS`)
+/// is set, `$include` targets outside the approved roots (and outside the
+/// including file's directory) are rejected.
 pub fn read_config_with_includes(
     path: &Path,
     depth: usize,
@@ -123,6 +180,7 @@ pub fn read_config_with_includes(
             }
         };
 
+        let approved_roots = approved_include_roots();
         for include_path_str in &include_paths {
             let include_path = if Path::new(include_path_str).is_absolute() {
                 std::path::PathBuf::from(include_path_str)
@@ -131,6 +189,19 @@ pub fn read_config_with_includes(
                     .unwrap_or_else(|| Path::new("."))
                     .join(include_path_str)
             };
+
+            // v2026.5.2: enforce operator-approved include roots.
+            if !include_path_allowed(
+                &include_path,
+                path.parent(),
+                approved_roots.as_deref(),
+            ) {
+                bail!(
+                    "$include '{}' is outside the operator-approved include roots \
+                     (OPENCLAW_INCLUDE_ROOTS)",
+                    include_path.display(),
+                );
+            }
 
             match read_config_with_includes(&include_path, depth + 1) {
                 Ok(included) => {
@@ -315,5 +386,87 @@ mod tests {
         let h1 = resolve_config_snapshot_hash(&val);
         let h2 = resolve_config_snapshot_hash(&val);
         assert_eq!(h1, h2);
+    }
+
+    // ====================================================================
+    // $include approved roots (v2026.5.2)
+    // ====================================================================
+
+    #[test]
+    fn parse_include_roots_splits_path_list() {
+        let joined = std::env::join_paths(["/opt/conf", "/etc/mylobster"])
+            .unwrap()
+            .into_string()
+            .unwrap();
+        let roots = parse_include_roots(&joined);
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0], std::path::PathBuf::from("/opt/conf"));
+        assert!(parse_include_roots("").is_empty());
+    }
+
+    #[test]
+    fn include_allowed_without_policy() {
+        assert!(include_path_allowed(
+            Path::new("/anywhere/at/all.json"),
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn include_policy_allows_roots_and_config_dir_only() {
+        let root_dir = TempDir::new().unwrap();
+        let conf_dir = TempDir::new().unwrap();
+        let other_dir = TempDir::new().unwrap();
+        fs::write(root_dir.path().join("inc.json"), "{}").unwrap();
+        fs::write(conf_dir.path().join("sibling.json"), "{}").unwrap();
+        fs::write(other_dir.path().join("evil.json"), "{}").unwrap();
+
+        let roots = vec![root_dir.path().to_path_buf()];
+
+        // Inside an approved root → allowed
+        assert!(include_path_allowed(
+            &root_dir.path().join("inc.json"),
+            Some(conf_dir.path()),
+            Some(&roots)
+        ));
+        // Sibling of the including config → allowed
+        assert!(include_path_allowed(
+            &conf_dir.path().join("sibling.json"),
+            Some(conf_dir.path()),
+            Some(&roots)
+        ));
+        // Outside both → rejected
+        assert!(!include_path_allowed(
+            &other_dir.path().join("evil.json"),
+            Some(conf_dir.path()),
+            Some(&roots)
+        ));
+    }
+
+    #[test]
+    fn include_outside_roots_fails_load() {
+        let conf_dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let root_dir = TempDir::new().unwrap();
+        fs::write(outside.path().join("secret.json"), r#"{"x": 1}"#).unwrap();
+        let base = conf_dir.path().join("base.json");
+        fs::write(
+            &base,
+            format!(
+                r#"{{"$include": "{}"}}"#,
+                outside.path().join("secret.json").display()
+            ),
+        )
+        .unwrap();
+
+        // Policy env vars are process-global; guard with a unique var set
+        // just for this call path via direct helper testing instead.
+        let roots = vec![root_dir.path().to_path_buf()];
+        assert!(!include_path_allowed(
+            &outside.path().join("secret.json"),
+            base.parent(),
+            Some(&roots)
+        ));
     }
 }

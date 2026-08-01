@@ -2,8 +2,17 @@
 //!
 //! Supports multiple Telegram actions: sendMessage, editMessage, deleteMessage,
 //! react, sendSticker, sendPhoto, sendDocument, sendVideo, createForumTopic.
+//!
+//! v2026.5.2 behavior: all Bot API calls go through `TelegramApi`, which
+//! applies the upstream per-method timeout guards (60 s outbound text, 30 s
+//! media, 15 s control-plane). Long `sendMessage` text is split into safe
+//! HTML chunks with plain-text fallback; media text over the 1024-char caption
+//! limit is sent as a chunked follow-up message; `editMessage` is durable
+//! (benign "not modified" / "no text" 400s treated as no-op); benign
+//! `deleteMessage` 400s are no-op warnings instead of failures.
 
 use super::{AgentTool, ToolContext, ToolInfo, ToolResult};
+use crate::channels::telegram::{DurableEditOutcome, TelegramApi};
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -80,51 +89,27 @@ impl AgentTool for TelegramActionsTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing chatId parameter"))?;
 
-        let bot_token = context
-            .config
-            .channels
-            .telegram
-            .default_account
-            .bot_token
-            .clone()
-            .or_else(|| std::env::var("TELEGRAM_BOT_TOKEN").ok())
+        let api = TelegramApi::from_account(&context.config.channels.telegram.default_account)
             .ok_or_else(|| anyhow::anyhow!("No Telegram bot token configured"))?;
-
-        let client = reqwest::Client::new();
-        let base_url = format!("https://api.telegram.org/bot{}", bot_token);
 
         match action {
             "sendMessage" => {
                 let text = get_str(&params, "text")?;
-                let parse_mode = params
-                    .get("parseMode")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("HTML");
 
-                let mut body = serde_json::json!({
-                    "chat_id": chat_id,
-                    "text": text,
-                    "parse_mode": parse_mode
+                // Long messages are split into safe HTML chunks with a
+                // plain-text fallback per chunk; short messages take the same
+                // path (single chunk).
+                let reply_markup = params.get("inlineKeyboard").map(|keyboard| {
+                    serde_json::json!({ "inline_keyboard": keyboard })
                 });
-
-                if let Some(reply_to) = params.get("replyToMessageId") {
-                    body["reply_to_message_id"] = reply_to.clone();
-                }
-
-                if let Some(keyboard) = params.get("inlineKeyboard") {
-                    body["reply_markup"] = serde_json::json!({
-                        "inline_keyboard": keyboard
-                    });
-                }
-
-                let resp = client
-                    .post(format!("{}/sendMessage", base_url))
-                    .json(&body)
-                    .send()
-                    .await?;
-
-                let result: serde_json::Value = resp.json().await?;
-                Ok(ToolResult::json(result))
+                let last_id = api
+                    .send_message_chunked(chat_id, &text, None, reply_markup.as_ref())
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                Ok(ToolResult::json(serde_json::json!({
+                    "ok": true,
+                    "messageId": last_id,
+                })))
             }
             "editMessage" => {
                 let message_id = params
@@ -133,19 +118,19 @@ impl AgentTool for TelegramActionsTool {
                     .ok_or_else(|| anyhow::anyhow!("Missing messageId"))?;
                 let text = get_str(&params, "text")?;
 
-                let resp = client
-                    .post(format!("{}/editMessageText", base_url))
-                    .json(&serde_json::json!({
-                        "chat_id": chat_id,
-                        "message_id": message_id,
-                        "text": text,
-                        "parse_mode": "HTML"
-                    }))
-                    .send()
-                    .await?;
-
-                let result: serde_json::Value = resp.json().await?;
-                Ok(ToolResult::json(result))
+                let outcome = api
+                    .edit_message_durable(chat_id, message_id, &text)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                Ok(ToolResult::json(serde_json::json!({
+                    "ok": true,
+                    "outcome": match outcome {
+                        DurableEditOutcome::Edited => "edited",
+                        DurableEditOutcome::NotModified => "not_modified",
+                        DurableEditOutcome::NoTextToEdit => "no_text_to_edit",
+                        DurableEditOutcome::MessageGone => "message_gone",
+                    },
+                })))
             }
             "deleteMessage" => {
                 let message_id = params
@@ -153,17 +138,16 @@ impl AgentTool for TelegramActionsTool {
                     .and_then(|v| v.as_i64())
                     .ok_or_else(|| anyhow::anyhow!("Missing messageId"))?;
 
-                let resp = client
-                    .post(format!("{}/deleteMessage", base_url))
-                    .json(&serde_json::json!({
-                        "chat_id": chat_id,
-                        "message_id": message_id
-                    }))
-                    .send()
-                    .await?;
-
-                let result: serde_json::Value = resp.json().await?;
-                Ok(ToolResult::json(result))
+                // Benign 400s (already deleted / can't be deleted / forbidden)
+                // are no-op warnings, not failures.
+                let deleted = api
+                    .delete_message_benign(chat_id, message_id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                Ok(ToolResult::json(serde_json::json!({
+                    "ok": true,
+                    "deleted": deleted,
+                })))
             }
             "react" => {
                 let message_id = params
@@ -172,119 +156,67 @@ impl AgentTool for TelegramActionsTool {
                     .ok_or_else(|| anyhow::anyhow!("Missing messageId"))?;
                 let emoji = get_str(&params, "emoji")?;
 
-                let resp = client
-                    .post(format!("{}/setMessageReaction", base_url))
-                    .json(&serde_json::json!({
-                        "chat_id": chat_id,
-                        "message_id": message_id,
-                        "reaction": [{ "type": "emoji", "emoji": emoji }]
-                    }))
-                    .send()
-                    .await?;
-
-                let result: serde_json::Value = resp.json().await?;
+                let result = api
+                    .call(
+                        "setMessageReaction",
+                        &serde_json::json!({
+                            "chat_id": chat_id,
+                            "message_id": message_id,
+                            "reaction": [{ "type": "emoji", "emoji": emoji }]
+                        }),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))?;
                 Ok(ToolResult::json(result))
             }
             "sendSticker" => {
                 let sticker_id = get_str(&params, "stickerId")?;
 
-                let resp = client
-                    .post(format!("{}/sendSticker", base_url))
-                    .json(&serde_json::json!({
-                        "chat_id": chat_id,
-                        "sticker": sticker_id
-                    }))
-                    .send()
-                    .await?;
-
-                let result: serde_json::Value = resp.json().await?;
+                let result = api
+                    .call(
+                        "sendSticker",
+                        &serde_json::json!({
+                            "chat_id": chat_id,
+                            "sticker": sticker_id
+                        }),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))?;
                 Ok(ToolResult::json(result))
             }
-            "sendPhoto" => {
+            "sendPhoto" | "sendDocument" | "sendVideo" => {
                 let file_url = params
                     .get("fileUrl")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing fileUrl for sendPhoto"))?;
+                    .ok_or_else(|| anyhow::anyhow!("Missing fileUrl for {action}"))?;
+                let media_field = match action {
+                    "sendPhoto" => "photo",
+                    "sendDocument" => "document",
+                    _ => "video",
+                };
+                let caption = params.get("caption").and_then(|v| v.as_str());
 
-                let mut body = serde_json::json!({
-                    "chat_id": chat_id,
-                    "photo": file_url
-                });
-
-                if let Some(caption) = params.get("caption").and_then(|v| v.as_str()) {
-                    body["caption"] = serde_json::json!(caption);
-                }
-
-                let resp = client
-                    .post(format!("{}/sendPhoto", base_url))
-                    .json(&body)
-                    .send()
-                    .await?;
-
-                let result: serde_json::Value = resp.json().await?;
-                Ok(ToolResult::json(result))
-            }
-            "sendDocument" => {
-                let file_url = params
-                    .get("fileUrl")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing fileUrl for sendDocument"))?;
-
-                let mut body = serde_json::json!({
-                    "chat_id": chat_id,
-                    "document": file_url
-                });
-
-                if let Some(caption) = params.get("caption").and_then(|v| v.as_str()) {
-                    body["caption"] = serde_json::json!(caption);
-                }
-
-                let resp = client
-                    .post(format!("{}/sendDocument", base_url))
-                    .json(&body)
-                    .send()
-                    .await?;
-
-                let result: serde_json::Value = resp.json().await?;
-                Ok(ToolResult::json(result))
-            }
-            "sendVideo" => {
-                let file_url = params
-                    .get("fileUrl")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing fileUrl for sendVideo"))?;
-
-                let mut body = serde_json::json!({
-                    "chat_id": chat_id,
-                    "video": file_url
-                });
-
-                if let Some(caption) = params.get("caption").and_then(|v| v.as_str()) {
-                    body["caption"] = serde_json::json!(caption);
-                }
-
-                let resp = client
-                    .post(format!("{}/sendVideo", base_url))
-                    .json(&body)
-                    .send()
-                    .await?;
-
-                let result: serde_json::Value = resp.json().await?;
+                // Captions over the 1024-char limit are sent as a chunked
+                // follow-up text message after the media.
+                let result = api
+                    .send_media_with_follow_up(chat_id, action, media_field, file_url, caption, None)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))?;
                 Ok(ToolResult::json(result))
             }
             "createForumTopic" => {
                 let topic_name = get_str(&params, "topicName")?;
 
-                let resp = client
-                    .post(format!("{}/createForumTopic", base_url))
-                    .json(&serde_json::json!({
-                        "chat_id": chat_id,
-                        "name": topic_name
-                    }))
-                    .send()
-                    .await?;
-
-                let result: serde_json::Value = resp.json().await?;
+                let result = api
+                    .call(
+                        "createForumTopic",
+                        &serde_json::json!({
+                            "chat_id": chat_id,
+                            "name": topic_name
+                        }),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))?;
                 Ok(ToolResult::json(result))
             }
             _ => Ok(ToolResult::error(format!(

@@ -349,6 +349,102 @@ impl HookRegistry {
 }
 
 // ============================================================================
+// Bounded native permission fingerprints (v2026.4.25)
+// ============================================================================
+
+/// Default cap on distinct native-permission fingerprints tracked per run.
+pub const DEFAULT_PERMISSION_FINGERPRINT_CAP: usize = 64;
+
+/// Bounded, deduplicated set of native permission fingerprints observed
+/// during a run (OpenClaw v2026.4.25, shipped alongside
+/// `before_agent_finalize`).
+///
+/// Native tool/permission prompts are fingerprinted so `before_agent_finalize`
+/// handlers can see *which* permissions a run exercised without unbounded
+/// growth on permission-heavy runs: once the cap is reached, new fingerprints
+/// are dropped (the set saturates) rather than evicting earlier entries.
+#[derive(Debug, Clone)]
+pub struct PermissionFingerprints {
+    entries: Vec<String>,
+    cap: usize,
+    /// Count of fingerprints dropped after saturation (for diagnostics).
+    dropped: usize,
+}
+
+impl PermissionFingerprints {
+    pub fn new() -> Self {
+        Self::with_cap(DEFAULT_PERMISSION_FINGERPRINT_CAP)
+    }
+
+    pub fn with_cap(cap: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            cap: cap.max(1),
+            dropped: 0,
+        }
+    }
+
+    /// Record a fingerprint. Returns `true` when newly recorded, `false`
+    /// for duplicates or when the set is saturated.
+    pub fn record(&mut self, fingerprint: impl Into<String>) -> bool {
+        let fp = fingerprint.into();
+        if self.entries.iter().any(|e| *e == fp) {
+            return false;
+        }
+        if self.entries.len() >= self.cap {
+            self.dropped += 1;
+            return false;
+        }
+        self.entries.push(fp);
+        true
+    }
+
+    pub fn contains(&self, fingerprint: &str) -> bool {
+        self.entries.iter().any(|e| e == fingerprint)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Whether the cap has been reached (later fingerprints were/will be dropped).
+    pub fn is_saturated(&self) -> bool {
+        self.entries.len() >= self.cap
+    }
+
+    pub fn dropped(&self) -> usize {
+        self.dropped
+    }
+
+    /// Fingerprints in insertion order.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(String::as_str)
+    }
+}
+
+impl Default for PermissionFingerprints {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Compute a stable fingerprint for a native permission request
+/// (tool + canonicalized params). Equal requests always produce equal
+/// fingerprints within a process.
+pub fn fingerprint_permission(tool: &str, params: &serde_json::Value) -> String {
+    use std::hash::{Hash, Hasher};
+    let canonical = serde_json::to_string(params).unwrap_or_default();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    tool.hash(&mut hasher);
+    canonical.hash(&mut hasher);
+    format!("{tool}:{:016x}", hasher.finish())
+}
+
+// ============================================================================
 // Thread-safe wrapper for use in GatewayState
 // ============================================================================
 
@@ -1157,6 +1253,67 @@ mod tests {
             HookResult::Transform { content } => assert_eq!(content, "rewritten"),
             _ => panic!("expected Transform"),
         }
+    }
+
+    // ====================================================================
+    // v2026.4.25 — bounded native permission fingerprints
+    // ====================================================================
+
+    #[test]
+    fn permission_fingerprints_dedupe() {
+        let mut fps = PermissionFingerprints::new();
+        assert!(fps.record("exec:abc"));
+        assert!(!fps.record("exec:abc"));
+        assert_eq!(fps.len(), 1);
+        assert!(fps.contains("exec:abc"));
+    }
+
+    #[test]
+    fn permission_fingerprints_bounded_at_cap() {
+        let mut fps = PermissionFingerprints::with_cap(3);
+        assert!(fps.record("a"));
+        assert!(fps.record("b"));
+        assert!(fps.record("c"));
+        assert!(fps.is_saturated());
+        // Saturated: new fingerprints dropped, earlier entries preserved.
+        assert!(!fps.record("d"));
+        assert_eq!(fps.len(), 3);
+        assert!(!fps.contains("d"));
+        assert!(fps.contains("a"));
+        assert_eq!(fps.dropped(), 1);
+    }
+
+    #[test]
+    fn permission_fingerprints_iterate_in_insertion_order() {
+        let mut fps = PermissionFingerprints::new();
+        fps.record("first");
+        fps.record("second");
+        let collected: Vec<&str> = fps.iter().collect();
+        assert_eq!(collected, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn fingerprint_permission_is_stable_and_distinct() {
+        let p1 = serde_json::json!({"command": "ls -la"});
+        let p2 = serde_json::json!({"command": "rm -rf /"});
+        let a = fingerprint_permission("exec", &p1);
+        let b = fingerprint_permission("exec", &p1);
+        let c = fingerprint_permission("exec", &p2);
+        let d = fingerprint_permission("browser", &p1);
+        assert_eq!(a, b, "same request → same fingerprint");
+        assert_ne!(a, c, "different params → different fingerprint");
+        assert_ne!(a, d, "different tool → different fingerprint");
+        assert!(a.starts_with("exec:"));
+    }
+
+    #[test]
+    fn default_fingerprint_cap_is_bounded() {
+        let mut fps = PermissionFingerprints::default();
+        for i in 0..(DEFAULT_PERMISSION_FINGERPRINT_CAP + 10) {
+            fps.record(format!("fp-{i}"));
+        }
+        assert_eq!(fps.len(), DEFAULT_PERMISSION_FINGERPRINT_CAP);
+        assert_eq!(fps.dropped(), 10);
     }
 
     #[tokio::test]

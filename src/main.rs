@@ -15,9 +15,33 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Gateway(opts) => {
             info!("Starting MyLobster gateway server");
-            let config = Config::load(opts.config.as_deref())?;
-            let server = GatewayServer::start(config, opts).await?;
-            server.run_until_shutdown().await?;
+            // v2026.5.2/v2026.7.1: classify fatal start errors into sysexits
+            // codes — EX_CONFIG (78) for fatal config errors and for
+            // supervised lock/EADDRINUSE conflicts, so systemd
+            // Restart=always units stop hot-looping.
+            use mylobster::gateway::boot_ledger;
+            let supervised = boot_ledger::is_supervised();
+            let config = match Config::load(opts.config.as_deref()) {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Fatal config error: {e:#}");
+                    let _ = boot_ledger::mark_config_error(&boot_ledger::boot_ledger_path());
+                    std::process::exit(boot_ledger::EX_CONFIG);
+                }
+            };
+            let server = match GatewayServer::start(config, opts).await {
+                Ok(s) => s,
+                Err(e) => {
+                    let chain = format!("{e:#}");
+                    error!("Gateway failed to start: {chain}");
+                    std::process::exit(boot_ledger::classify_fatal_exit(&chain, supervised));
+                }
+            };
+            if let Err(e) = server.run_until_shutdown().await {
+                let chain = format!("{e:#}");
+                error!("Gateway exited with error: {chain}");
+                std::process::exit(boot_ledger::classify_fatal_exit(&chain, supervised));
+            }
         }
         Commands::Agent(opts) => {
             info!("Running agent for single message");

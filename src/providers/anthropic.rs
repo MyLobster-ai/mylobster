@@ -6,8 +6,86 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 /// Check if a model supports the 1M context beta.
+///
+/// v2026.6.x: 1M context reached GA — kept only for capability metadata; the
+/// retired `context-1m-2025-08-07` beta header is no longer sent.
+#[allow(dead_code)]
 fn is_1m_eligible_model(model: &str) -> bool {
     model.starts_with("claude-opus-4") || model.starts_with("claude-sonnet-4")
+}
+
+/// Sanitize thinking blocks in outbound replay (v2026.5.x–6.x):
+///
+/// * thinking disabled → thinking/redacted_thinking blocks are stripped
+///   entirely (Anthropic rejects replayed thinking without the beta).
+/// * thinking enabled → stale/empty `signature` fields are stripped while
+///   seeded (non-empty) signatures are preserved.
+fn sanitize_thinking_blocks(messages: &mut [AnthropicMessage], thinking_enabled: bool) {
+    for message in messages.iter_mut() {
+        let Some(blocks) = message.content.as_array_mut() else {
+            continue;
+        };
+        if thinking_enabled {
+            for block in blocks.iter_mut() {
+                let Some(obj) = block.as_object_mut() else {
+                    continue;
+                };
+                if obj.get("type").and_then(|t| t.as_str()) == Some("thinking") {
+                    let stale = match obj.get("signature") {
+                        Some(serde_json::Value::String(sig)) => sig.is_empty(),
+                        Some(_) => true,
+                        None => false,
+                    };
+                    if stale {
+                        obj.remove("signature");
+                    }
+                }
+            }
+        } else {
+            blocks.retain(|block| {
+                !matches!(
+                    block.get("type").and_then(|t| t.as_str()),
+                    Some("thinking") | Some("redacted_thinking")
+                )
+            });
+        }
+    }
+}
+
+/// Merge consecutive assistant turns into one message (v2026.6.x):
+/// Anthropic rejects transcripts with back-to-back assistant messages after
+/// compaction/steering; adjacent assistant turns collapse into a single
+/// message with concatenated content blocks.
+fn merge_consecutive_assistant_turns(messages: &mut Vec<AnthropicMessage>) {
+    let mut merged: Vec<AnthropicMessage> = Vec::with_capacity(messages.len());
+    for message in messages.drain(..) {
+        let can_merge = message.role == "assistant"
+            && merged.last().map(|m: &AnthropicMessage| m.role == "assistant").unwrap_or(false);
+        if !can_merge {
+            merged.push(message);
+            continue;
+        }
+        let previous = merged.last_mut().expect("checked non-empty");
+        let mut prev_blocks = content_to_blocks(std::mem::take(&mut previous.content));
+        prev_blocks.extend(content_to_blocks(message.content));
+        previous.content = serde_json::Value::Array(prev_blocks);
+    }
+    *messages = merged;
+}
+
+fn content_to_blocks(content: serde_json::Value) -> Vec<serde_json::Value> {
+    match content {
+        serde_json::Value::Array(blocks) => blocks,
+        serde_json::Value::String(text) => {
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![serde_json::json!({"type": "text", "text": text})]
+            }
+        }
+        serde_json::Value::Null => Vec::new(),
+        other => vec![serde_json::json!({"type": "text", "text": other.to_string()})],
+    }
 }
 
 pub struct AnthropicProvider {
@@ -141,7 +219,7 @@ enum AnthropicDelta {
 #[async_trait]
 impl ModelProvider for AnthropicProvider {
     async fn chat(&self, request: ProviderRequest) -> Result<ProviderResponse> {
-        let messages: Vec<AnthropicMessage> = request
+        let mut messages: Vec<AnthropicMessage> = request
             .messages
             .into_iter()
             .map(|m| AnthropicMessage {
@@ -149,6 +227,8 @@ impl ModelProvider for AnthropicProvider {
                 content: m.content,
             })
             .collect();
+        sanitize_thinking_blocks(&mut messages, request.thinking.is_some());
+        merge_consecutive_assistant_turns(&mut messages);
 
         let thinking_enabled = request.thinking.is_some();
         let budget_tokens = request.thinking.as_ref().map(|t| t.budget_tokens).unwrap_or(0);
@@ -187,9 +267,8 @@ impl ModelProvider for AnthropicProvider {
         if thinking_enabled {
             betas.push("interleaved-thinking-2025-05-14");
         }
-        if self.context1m && is_1m_eligible_model(&body.model) {
-            betas.push("context-1m-2025-08-07");
-        }
+        // v2026.6.x: 1M context is GA — the retired `context-1m-2025-08-07`
+        // beta header is no longer sent (eligible models get 1M by default).
         if !betas.is_empty() {
             req_builder = req_builder.header("anthropic-beta", betas.join(","));
         }
@@ -238,7 +317,7 @@ impl ModelProvider for AnthropicProvider {
     async fn stream_chat(&self, request: ProviderRequest) -> Result<mpsc::Receiver<StreamEvent>> {
         let (tx, rx) = mpsc::channel(256);
 
-        let messages: Vec<AnthropicMessage> = request
+        let mut messages: Vec<AnthropicMessage> = request
             .messages
             .into_iter()
             .map(|m| AnthropicMessage {
@@ -246,6 +325,8 @@ impl ModelProvider for AnthropicProvider {
                 content: m.content,
             })
             .collect();
+        sanitize_thinking_blocks(&mut messages, request.thinking.is_some());
+        merge_consecutive_assistant_turns(&mut messages);
 
         let thinking_enabled = request.thinking.is_some();
         let budget_tokens = request.thinking.as_ref().map(|t| t.budget_tokens).unwrap_or(0);
@@ -289,9 +370,8 @@ impl ModelProvider for AnthropicProvider {
             if thinking_enabled {
                 betas.push("interleaved-thinking-2025-05-14");
             }
-            if context1m && is_1m_eligible_model(&body.model) {
-                betas.push("context-1m-2025-08-07");
-            }
+            // v2026.6.x: 1M context is GA — retired beta header not sent.
+            let _ = context1m;
             if !betas.is_empty() {
                 req_builder = req_builder.header("anthropic-beta", betas.join(","));
             }
@@ -670,16 +750,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_sets_1m_beta_when_context1m_and_eligible_model() {
+    async fn chat_no_longer_sends_retired_1m_beta_after_ga() {
+        // v2026.6.x: 1M context reached GA — the retired beta header must not
+        // be sent even when context1m is configured on an eligible model.
         let server = mock_with_body(ok_response_json()).await;
         let p = AnthropicProvider::new("k".into(), server.uri(), "claude-opus-4-20250514".into())
             .with_context1m(true);
         p.chat(req("claude-opus-4-20250514")).await.unwrap();
         let (h, _) = captured(&server).await;
-        assert_eq!(
-            h.get("anthropic-beta").map(String::as_str),
-            Some("context-1m-2025-08-07")
-        );
+        assert!(h.get("anthropic-beta").is_none());
     }
 
     #[tokio::test]
@@ -697,7 +776,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_combines_betas_when_thinking_and_1m() {
+    async fn chat_thinking_beta_stands_alone_after_1m_ga() {
+        // v2026.6.x GA migration: with thinking + context1m only the
+        // interleaved-thinking beta remains on the wire.
         let server = mock_with_body(ok_response_json()).await;
         let p = AnthropicProvider::new("k".into(), server.uri(), "claude-opus-4-20250514".into())
             .with_context1m(true);
@@ -706,9 +787,8 @@ mod tests {
         p.chat(r).await.unwrap();
         let (h, _) = captured(&server).await;
         let beta = h.get("anthropic-beta").map(String::as_str).unwrap_or("");
-        assert!(beta.contains("interleaved-thinking-2025-05-14"));
-        assert!(beta.contains("context-1m-2025-08-07"));
-        assert!(beta.contains(','), "betas should be comma-separated");
+        assert_eq!(beta, "interleaved-thinking-2025-05-14");
+        assert!(!beta.contains("context-1m-2025-08-07"));
     }
 
     // ------------------------------------------------------------------------
@@ -1213,5 +1293,75 @@ mod tests {
             })
             .collect();
         assert_eq!(deltas, vec!["survived"]);
+    }
+
+    // ------------------------------------------------------------------
+    // v2026.7.1 — thinking-block sanitize + assistant-turn merge
+    // ------------------------------------------------------------------
+
+    fn msg(role: &str, content: serde_json::Value) -> AnthropicMessage {
+        AnthropicMessage { role: role.to_string(), content }
+    }
+
+    #[test]
+    fn thinking_blocks_stripped_when_disabled() {
+        let mut messages = vec![msg(
+            "assistant",
+            serde_json::json!([
+                {"type": "thinking", "thinking": "t", "signature": "sig"},
+                {"type": "redacted_thinking", "data": "x"},
+                {"type": "text", "text": "visible"}
+            ]),
+        )];
+        sanitize_thinking_blocks(&mut messages, false);
+        let blocks = messages[0].content.as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "text");
+    }
+
+    #[test]
+    fn stale_signatures_stripped_seeded_preserved_when_enabled() {
+        let mut messages = vec![msg(
+            "assistant",
+            serde_json::json!([
+                {"type": "thinking", "thinking": "a", "signature": ""},
+                {"type": "thinking", "thinking": "b", "signature": {"bad": true}},
+                {"type": "thinking", "thinking": "c", "signature": "seeded-sig"}
+            ]),
+        )];
+        sanitize_thinking_blocks(&mut messages, true);
+        let blocks = messages[0].content.as_array().unwrap();
+        assert!(blocks[0].get("signature").is_none());
+        assert!(blocks[1].get("signature").is_none());
+        assert_eq!(blocks[2]["signature"], "seeded-sig");
+        // Thinking blocks themselves are preserved when enabled.
+        assert_eq!(blocks.len(), 3);
+    }
+
+    #[test]
+    fn consecutive_assistant_turns_merge() {
+        let mut messages = vec![
+            msg("user", serde_json::json!("q")),
+            msg("assistant", serde_json::json!("first")),
+            msg("assistant", serde_json::json!([{"type": "text", "text": "second"}])),
+            msg("user", serde_json::json!("next")),
+        ];
+        merge_consecutive_assistant_turns(&mut messages);
+        assert_eq!(messages.len(), 3);
+        let blocks = messages[1].content.as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["text"], "first");
+        assert_eq!(blocks[1]["text"], "second");
+    }
+
+    #[test]
+    fn non_adjacent_assistant_turns_untouched() {
+        let mut messages = vec![
+            msg("assistant", serde_json::json!("a")),
+            msg("user", serde_json::json!("u")),
+            msg("assistant", serde_json::json!("b")),
+        ];
+        merge_consecutive_assistant_turns(&mut messages);
+        assert_eq!(messages.len(), 3);
     }
 }

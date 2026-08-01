@@ -53,6 +53,34 @@ pub fn validate_config(config: &Config) -> Vec<ConfigValidationError> {
         }
     }
 
+    // v2026.5.2: gateway.controlUi.chatMessageMaxWidth validated range.
+    if let Some(width) = config.gateway.control_ui.chat_message_max_width {
+        if !(240..=4096).contains(&width) {
+            errors.push(ConfigValidationError {
+                path: "gateway.controlUi.chatMessageMaxWidth".to_string(),
+                message: format!("must be between 240 and 4096 px (got {width})"),
+            });
+        }
+    }
+
+    // v2026.7.1: blank TLS cert/key paths are rejected (not treated as unset).
+    if let Some(cert) = &config.gateway.tls.cert_path {
+        if cert.trim().is_empty() {
+            errors.push(ConfigValidationError {
+                path: "gateway.tls.certPath".to_string(),
+                message: "must not be blank; omit the field to disable TLS".to_string(),
+            });
+        }
+    }
+    if let Some(key) = &config.gateway.tls.key_path {
+        if key.trim().is_empty() {
+            errors.push(ConfigValidationError {
+                path: "gateway.tls.keyPath".to_string(),
+                message: "must not be blank; omit the field to disable TLS".to_string(),
+            });
+        }
+    }
+
     errors
 }
 
@@ -226,6 +254,8 @@ mod tests {
                 headers: None,
                 auth_header: None,
                 models: vec![],
+                params: None,
+                local_service: None,
             },
         );
         let errors = validate_config(&config);
@@ -264,5 +294,59 @@ mod tests {
         let mut config = Config::default();
         config.gateway.port = 0;
         assert!(validate_config_object(&config).is_err());
+    }
+
+    // ====================================================================
+    // gateway.controlUi.chatMessageMaxWidth (v2026.5.2)
+    // ====================================================================
+
+    #[test]
+    fn chat_message_max_width_valid_range() {
+        let mut config = Config::default();
+        config.gateway.control_ui.chat_message_max_width = Some(800);
+        assert!(validate_config(&config).is_empty());
+        config.gateway.control_ui.chat_message_max_width = Some(240);
+        assert!(validate_config(&config).is_empty());
+        config.gateway.control_ui.chat_message_max_width = Some(4096);
+        assert!(validate_config(&config).is_empty());
+    }
+
+    #[test]
+    fn chat_message_max_width_out_of_range_rejected() {
+        let mut config = Config::default();
+        for bad in [0u32, 239, 4097, 100_000] {
+            config.gateway.control_ui.chat_message_max_width = Some(bad);
+            let errors = validate_config(&config);
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.path == "gateway.controlUi.chatMessageMaxWidth"),
+                "width {bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn chat_message_max_width_absent_is_valid() {
+        let config = Config::default();
+        assert!(validate_config(&config).is_empty());
+    }
+
+    // ====================================================================
+    // Blank TLS paths (v2026.7.1)
+    // ====================================================================
+
+    #[test]
+    fn blank_tls_paths_rejected() {
+        let mut config = Config::default();
+        config.gateway.tls.cert_path = Some("  ".to_string());
+        config.gateway.tls.key_path = Some("".to_string());
+        let errors = validate_config(&config);
+        assert!(errors.iter().any(|e| e.path == "gateway.tls.certPath"));
+        assert!(errors.iter().any(|e| e.path == "gateway.tls.keyPath"));
+
+        config.gateway.tls.cert_path = Some("/etc/tls/cert.pem".to_string());
+        config.gateway.tls.key_path = Some("/etc/tls/key.pem".to_string());
+        assert!(validate_config(&config).is_empty());
     }
 }

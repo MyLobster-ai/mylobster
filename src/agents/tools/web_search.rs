@@ -3,7 +3,19 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-/// Shared search result type used by SearXNG and X search providers.
+// v2026.7.1 provider submodules (files live under `web_search/`).
+pub mod brave;
+pub mod cache;
+pub mod common;
+pub mod duckduckgo;
+pub mod exa;
+pub mod firecrawl;
+pub mod gemini;
+pub mod minimax_search;
+pub mod parallel;
+pub mod searxng;
+
+/// Shared search result type used by the X search provider.
 #[derive(Debug)]
 struct SearchResult {
     title: String,
@@ -19,31 +31,11 @@ pub struct WebSearchTool;
 /// no-timeout behavior could hang the tool loop when xAI was slow.
 pub const GROK_WEB_SEARCH_DEFAULT_TIMEOUT_SECS: u64 = 60;
 
-/// Default Brave web-search endpoint. v2026.5.2 made this overridable per
-/// deployment (compatible proxies / corporate gateways) via
-/// `tools.web.search.brave.baseUrl` — see [`crate::config::types::BraveSearchConfig`].
+/// Legacy full Brave web-search endpoint URL (pre-v2026.7.1 config default).
+/// The v2026.7.1 Brave provider works from the origin base URL and appends
+/// endpoint paths — see [`brave::resolve_brave_base_url`], which reduces this
+/// legacy form back to the origin.
 pub const BRAVE_DEFAULT_BASE_URL: &str = "https://api.search.brave.com/res/v1/web/search";
-
-// ============================================================================
-// Brave Search Types
-// ============================================================================
-
-#[derive(Debug, Serialize, Deserialize)]
-struct BraveSearchResponse {
-    web: Option<BraveWebResults>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct BraveWebResults {
-    results: Vec<BraveWebResult>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct BraveWebResult {
-    title: String,
-    url: String,
-    description: String,
-}
 
 // ============================================================================
 // Perplexity Types
@@ -103,36 +95,6 @@ struct GrokTool {
     tool_type: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct GrokResponse {
-    #[serde(default)]
-    output: Vec<GrokOutput>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GrokOutput {
-    #[serde(rename = "type")]
-    output_type: String,
-    #[serde(default)]
-    content: Vec<GrokContent>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GrokContent {
-    #[serde(rename = "type")]
-    content_type: String,
-    #[serde(default)]
-    text: Option<String>,
-    #[serde(default)]
-    annotations: Option<Vec<GrokAnnotation>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GrokAnnotation {
-    url: Option<String>,
-    title: Option<String>,
-}
-
 // ============================================================================
 // Tool Implementation
 // ============================================================================
@@ -153,6 +115,14 @@ impl AgentTool for WebSearchTool {
                     "freshness": {
                         "type": "string",
                         "description": "Filter results by recency. Shortcuts: pd (past day), pw (past week), pm (past month), py (past year). Also accepts date ranges: YYYY-MM-DDtoYYYY-MM-DD"
+                    },
+                    "date_after": {
+                        "type": "string",
+                        "description": "Only include results published after this date (YYYY-MM-DD). Cannot be combined with freshness."
+                    },
+                    "date_before": {
+                        "type": "string",
+                        "description": "Only include results published before this date (YYYY-MM-DD). Cannot be combined with freshness."
                     }
                 },
                 "required": ["query"]
@@ -179,54 +149,55 @@ impl AgentTool for WebSearchTool {
             .get("freshness")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        let date_after = params
+            .get("date_after")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let date_before = params
+            .get("date_before")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
-        let provider = context
-            .config
-            .tools
-            .web
-            .search
-            .as_ref()
+        let search_cfg = context.config.tools.web.search.as_ref();
+        let provider = search_cfg
             .and_then(|s| s.provider.as_deref())
             .unwrap_or("brave");
+
+        let timeout_seconds =
+            common::resolve_search_timeout_seconds(search_cfg.and_then(|s| s.timeout_seconds));
+        let cache_ttl_ms =
+            common::resolve_search_cache_ttl_ms(search_cfg.and_then(|s| s.cache_ttl_minutes));
 
         match provider {
             "brave" => {
                 let env_api_key = std::env::var("BRAVE_API_KEY").ok();
-                let api_key = context
-                    .config
-                    .tools
-                    .web
-                    .search
-                    .as_ref()
-                    .and_then(|s| s.api_key.as_deref())
+                let brave_cfg = search_cfg.and_then(|s| s.brave.as_ref());
+                // v2026.7.1: the Brave-scoped key wins over the legacy
+                // top-level `tools.web.search.apiKey` (upstream migrated the
+                // Brave key into the provider-scoped plugin entry).
+                let api_key = brave_cfg
+                    .and_then(|b| b.api_key.as_deref())
+                    .or_else(|| search_cfg.and_then(|s| s.api_key.as_deref()))
                     .or_else(|| env_api_key.as_deref())
                     .unwrap_or("");
-
-                if api_key.is_empty() {
-                    return Ok(ToolResult::error("No Brave search API key configured"));
-                }
-
-                let brave_cfg = context
-                    .config
-                    .tools
-                    .web
-                    .search
-                    .as_ref()
-                    .and_then(|s| s.brave.as_ref());
-                let base_url = brave_cfg
-                    .and_then(|b| b.base_url.as_deref())
-                    .unwrap_or(BRAVE_DEFAULT_BASE_URL);
-                let http_diag = brave_cfg.and_then(|b| b.http).unwrap_or(false);
-
-                search_brave(
+                let payload = brave::execute_brave_search(brave::BraveSearchRequest {
                     query,
-                    max_results,
+                    count: Some(max_results as u64),
                     api_key,
-                    freshness.as_deref(),
-                    base_url,
-                    http_diag,
-                )
-                .await
+                    base_url: brave_cfg.and_then(|b| b.base_url.as_deref()),
+                    mode: brave_cfg.and_then(|b| b.mode.as_deref()),
+                    freshness: freshness.as_deref(),
+                    date_after: date_after.as_deref(),
+                    date_before: date_before.as_deref(),
+                    country: params.get("country").and_then(|v| v.as_str()),
+                    search_lang: params.get("search_lang").and_then(|v| v.as_str()),
+                    ui_lang: params.get("ui_lang").and_then(|v| v.as_str()),
+                    timeout_seconds,
+                    cache_ttl_ms,
+                    http_diag: brave_cfg.and_then(|b| b.http).unwrap_or(false),
+                })
+                .await?;
+                Ok(ToolResult::json(payload))
             }
             "perplexity" => {
                 search_perplexity(query, context, freshness.as_deref()).await
@@ -236,7 +207,193 @@ impl AgentTool for WebSearchTool {
             }
             // v2026.4.1: SearXNG bundled web search provider
             "searxng" => {
-                searxng_search(query, &context.config).await
+                let searxng_cfg = search_cfg.and_then(|s| s.searxng.as_ref());
+                let env_base = std::env::var("SEARXNG_BASE_URL").ok();
+                let base_url = searxng_cfg
+                    .and_then(|c| c.host.as_deref())
+                    .or(env_base.as_deref())
+                    .unwrap_or("http://localhost:8888");
+                let categories = params
+                    .get("categories")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| searxng_cfg.and_then(|c| c.categories.as_ref()).map(|c| c.join(",")));
+                let engines = searxng_cfg
+                    .and_then(|c| c.engines.as_ref())
+                    .map(|e| e.join(","));
+                let payload = searxng::run_searxng_search(searxng::SearxngSearchRequest {
+                    query,
+                    count: Some(
+                        searxng_cfg
+                            .and_then(|c| c.max_results)
+                            .map(|m| m as u64)
+                            .unwrap_or(max_results as u64),
+                    ),
+                    base_url,
+                    categories: categories.as_deref(),
+                    language: searxng_cfg.and_then(|c| c.language.as_deref()),
+                    engines: engines.as_deref(),
+                    timeout_seconds: searxng_cfg
+                        .and_then(|c| c.timeout_seconds)
+                        .unwrap_or(searxng::SEARXNG_DEFAULT_TIMEOUT_SECONDS),
+                    cache_ttl_ms,
+                })
+                .await?;
+                Ok(ToolResult::json(payload))
+            }
+            // v2026.7.1: Exa search with baseUrl override
+            "exa" => {
+                let exa_cfg = search_cfg.and_then(|s| s.exa.as_ref());
+                let env_key = std::env::var("EXA_API_KEY").ok();
+                let api_key = exa_cfg
+                    .and_then(|c| c.api_key.as_deref())
+                    .or(env_key.as_deref())
+                    .unwrap_or("");
+                let payload = exa::execute_exa_search(exa::ExaSearchRequest {
+                    query,
+                    count: Some(max_results as u64),
+                    search_type: params.get("type").and_then(|v| v.as_str()),
+                    freshness: freshness.as_deref(),
+                    date_after: date_after.as_deref(),
+                    date_before: date_before.as_deref(),
+                    contents: params.get("contents"),
+                    api_key,
+                    base_url: exa_cfg.and_then(|c| c.base_url.as_deref()),
+                    timeout_seconds,
+                    cache_ttl_ms,
+                })
+                .await?;
+                Ok(ToolResult::json(payload))
+            }
+            // v2026.7.1: MiniMax Coding Plan search
+            "minimax" => {
+                let minimax_cfg = search_cfg.and_then(|s| s.minimax.as_ref());
+                let api_key = minimax_search::resolve_minimax_api_key(
+                    minimax_cfg
+                        .and_then(|c| c.api_key.as_deref())
+                        .or(search_cfg.and_then(|s| s.api_key.as_deref())),
+                    |var| std::env::var(var).ok(),
+                )
+                .unwrap_or_default();
+                let providers = &context.config.models.providers;
+                let region = minimax_search::resolve_minimax_region(
+                    minimax_cfg.and_then(|c| c.region.as_deref()),
+                    std::env::var("MINIMAX_API_HOST").ok().as_deref(),
+                    providers.get("minimax").map(|p| p.base_url.as_str()),
+                    providers.get("minimax-portal").map(|p| p.base_url.as_str()),
+                );
+                let payload = minimax_search::execute_minimax_search(
+                    minimax_search::MiniMaxSearchRequest {
+                        query,
+                        count: Some(max_results as u64),
+                        api_key: &api_key,
+                        endpoint: minimax_search::resolve_minimax_endpoint(region),
+                        timeout_seconds,
+                        cache_ttl_ms,
+                    },
+                )
+                .await?;
+                Ok(ToolResult::json(payload))
+            }
+            // v2026.7.1: Firecrawl search (base URL restricted to hosted or
+            // explicitly self-hosted private endpoints)
+            "firecrawl" => {
+                let firecrawl_cfg = context
+                    .config
+                    .tools
+                    .web
+                    .fetch
+                    .as_ref()
+                    .and_then(|f| f.firecrawl.as_ref());
+                let env_key = std::env::var("FIRECRAWL_API_KEY").ok();
+                let api_key = firecrawl_cfg
+                    .and_then(|c| c.api_key.as_deref())
+                    .or(env_key.as_deref())
+                    .unwrap_or("");
+                let payload = firecrawl::run_firecrawl_search(firecrawl::FirecrawlSearchRequest {
+                    query,
+                    count: Some(max_results as u64),
+                    api_key,
+                    base_url: firecrawl_cfg.and_then(|c| c.base_url.as_deref()),
+                    timeout_seconds,
+                    cache_ttl_ms,
+                })
+                .await?;
+                Ok(ToolResult::json(payload))
+            }
+            // v2026.7.1: Gemini grounding search with Google-provider fallback
+            "gemini" | "google" => {
+                let gemini_cfg = search_cfg.and_then(|s| s.gemini.as_ref());
+                let google_provider = context.config.models.providers.get("google");
+                let env_key = std::env::var("GEMINI_API_KEY").ok();
+                let api_key = gemini::resolve_gemini_search_api_key(
+                    gemini_cfg.and_then(|c| c.api_key.as_deref()),
+                    env_key.as_deref(),
+                    google_provider.and_then(|p| p.api_key.as_deref()),
+                )
+                .unwrap_or_default();
+                let base_url = gemini::resolve_gemini_search_base_url(
+                    gemini_cfg.and_then(|c| c.base_url.as_deref()),
+                    google_provider.map(|p| p.base_url.as_str()),
+                );
+                let payload = gemini::execute_gemini_search(gemini::GeminiSearchRequest {
+                    query,
+                    count: Some(max_results as u64),
+                    freshness: freshness.as_deref(),
+                    date_after: date_after.as_deref(),
+                    date_before: date_before.as_deref(),
+                    api_key: &api_key,
+                    base_url: &base_url,
+                    model: gemini_cfg
+                        .and_then(|c| c.model.as_deref())
+                        .unwrap_or(gemini::DEFAULT_GEMINI_WEB_SEARCH_MODEL),
+                    timeout_seconds,
+                    cache_ttl_ms,
+                })
+                .await?;
+                Ok(ToolResult::json(payload))
+            }
+            // v2026.7.1: bundled Parallel provider (api.parallel.ai/v1/search)
+            "parallel" => {
+                let parallel_cfg = search_cfg.and_then(|s| s.parallel.as_ref());
+                let env_key = std::env::var("PARALLEL_API_KEY").ok();
+                let api_key = parallel_cfg
+                    .and_then(|c| c.api_key.as_deref())
+                    .or(env_key.as_deref())
+                    .unwrap_or("");
+                let payload = parallel::execute_parallel_search(parallel::ParallelSearchRequest {
+                    query: Some(query),
+                    objective: params.get("objective").and_then(|v| v.as_str()),
+                    search_queries: params.get("search_queries"),
+                    count: Some(max_results as u64),
+                    session_id: params.get("session_id").and_then(|v| v.as_str()),
+                    client_model: params.get("client_model").and_then(|v| v.as_str()),
+                    api_key,
+                    base_url: parallel_cfg.and_then(|c| c.base_url.as_deref()),
+                    timeout_seconds,
+                    cache_ttl_ms,
+                })
+                .await?;
+                Ok(ToolResult::json(payload))
+            }
+            // v2026.7.1: DuckDuckGo key-free provider — explicit opt-in only
+            // (never auto-selected; the default provider stays Brave).
+            "duckduckgo" | "ddg" => {
+                let ddg_cfg = search_cfg.and_then(|s| s.duckduckgo.as_ref());
+                let payload = duckduckgo::run_duckduckgo_search(
+                    duckduckgo::DuckDuckGoSearchRequest {
+                        query,
+                        count: Some(max_results as u64),
+                        region: ddg_cfg.and_then(|c| c.region.as_deref()),
+                        safe_search: ddg_cfg.and_then(|c| c.safe_search.as_deref()),
+                        timeout_seconds: duckduckgo::DDG_DEFAULT_TIMEOUT_SECONDS
+                            .min(timeout_seconds),
+                        cache_ttl_ms,
+                        endpoint: None,
+                    },
+                )
+                .await?;
+                Ok(ToolResult::json(payload))
             }
             // v2026.4.1: X (Twitter) search via xAI Grok
             "x" | "x_search" | "twitter" => {
@@ -248,94 +405,6 @@ impl AgentTool for WebSearchTool {
             ))),
         }
     }
-}
-
-// ============================================================================
-// Brave Search
-// ============================================================================
-
-async fn search_brave(
-    query: &str,
-    max_results: usize,
-    api_key: &str,
-    freshness: Option<&str>,
-    base_url: &str,
-    http_diag: bool,
-) -> Result<ToolResult> {
-    let client = reqwest::Client::new();
-
-    let mut query_params = vec![
-        ("q".to_string(), query.to_string()),
-        ("count".to_string(), max_results.to_string()),
-    ];
-
-    if let Some(f) = freshness {
-        query_params.push(("freshness".to_string(), f.to_string()));
-    }
-
-    if http_diag {
-        // v2026.5.2 brave.http diagnostics: log endpoint + non-secret query
-        // params, never the API key or response body.
-        debug!(
-            target: "brave.http",
-            base_url = base_url,
-            query = query,
-            count = max_results,
-            freshness = ?freshness,
-            "brave.http: outbound request"
-        );
-    }
-
-    let send_started = std::time::Instant::now();
-    let response = client
-        .get(base_url)
-        .header("Accept", "application/json")
-        .header("Accept-Encoding", "gzip")
-        .header("X-Subscription-Token", api_key)
-        .query(&query_params)
-        .send()
-        .await?;
-
-    if http_diag {
-        debug!(
-            target: "brave.http",
-            base_url = base_url,
-            status = %response.status(),
-            duration_ms = send_started.elapsed().as_millis() as u64,
-            "brave.http: response"
-        );
-    }
-
-    if !response.status().is_success() {
-        return Ok(ToolResult::error(format!(
-            "Search API returned status {}",
-            response.status()
-        )));
-    }
-
-    let body: BraveSearchResponse = response.json().await?;
-
-    let results: Vec<serde_json::Value> = body
-        .web
-        .map(|w| {
-            w.results
-                .into_iter()
-                .take(max_results)
-                .map(|r| {
-                    serde_json::json!({
-                        "title": r.title,
-                        "url": r.url,
-                        "description": r.description
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    Ok(ToolResult::json(serde_json::json!({
-        "results": results,
-        "query": query
-    })))
 }
 
 // ============================================================================
@@ -519,119 +588,132 @@ async fn search_grok(query: &str, context: &ToolContext) -> Result<ToolResult> {
         )));
     }
 
-    let resp: GrokResponse = response.json().await?;
-
-    let mut text_parts = Vec::new();
-    let mut citations = Vec::new();
-
-    for output in &resp.output {
-        if output.output_type == "message" {
-            for content in &output.content {
-                if content.content_type == "output_text" {
-                    if let Some(ref text) = content.text {
-                        text_parts.push(text.clone());
-                    }
-                }
-                if let Some(ref annotations) = content.annotations {
-                    for ann in annotations {
-                        if let Some(ref url) = ann.url {
-                            citations.push(serde_json::json!({
-                                "url": url,
-                                "title": ann.title
-                            }));
-                        }
-                    }
-                }
-            }
+    // v2026.7.1: malformed-Responses parse hardening. Parse the body as an
+    // untyped JSON value and extract text/citations defensively — null
+    // entries, missing fields, and wrong-typed arrays must degrade to the
+    // structured "malformed JSON response" error instead of a serde failure.
+    let resp: serde_json::Value = match response.json().await {
+        Ok(v) => v,
+        Err(_) => {
+            return Ok(ToolResult::error(
+                "xAI Grok web_search: malformed JSON response",
+            ))
         }
-    }
+    };
+
+    let (content, citations) = match extract_xai_web_search_content(&resp) {
+        Some(extracted) => extracted,
+        None => {
+            return Ok(ToolResult::error(
+                "xAI Grok web_search: malformed JSON response",
+            ))
+        }
+    };
 
     Ok(ToolResult::json(serde_json::json!({
-        "content": text_parts.join("\n"),
+        "content": content,
         "citations": citations,
         "query": query,
         "provider": "grok"
     })))
 }
 
-// ============================================================================
-// SearXNG Search (v2026.4.1)
-// ============================================================================
-
-/// SearXNG web search provider (v2026.4.1).
-async fn searxng_search(query: &str, config: &crate::config::Config) -> Result<ToolResult> {
-    let searxng_config = config.tools.web.search.as_ref()
-        .and_then(|s| s.searxng.as_ref());
-
-    let host = searxng_config
-        .and_then(|c| c.host.as_deref())
-        .unwrap_or("http://localhost:8888");
-
-    let max_results = searxng_config
-        .and_then(|c| c.max_results)
-        .unwrap_or(10);
-
-    let timeout_secs = searxng_config
-        .and_then(|c| c.timeout_seconds)
-        .unwrap_or(10);
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(timeout_secs))
-        .build()?;
-
-    let mut params: Vec<(&str, String)> = vec![
-        ("q", query.to_string()),
-        ("format", "json".to_string()),
-    ];
-
-    if let Some(engines) = searxng_config.and_then(|c| c.engines.as_ref()) {
-        params.push(("engines", engines.join(",")));
-    }
-    if let Some(lang) = searxng_config.and_then(|c| c.language.as_deref()) {
-        params.push(("language", lang.to_string()));
+/// Extract `(text, citations)` from an xAI Responses payload, tolerating
+/// malformed shapes (v2026.7.1 parity with upstream
+/// `extractXaiWebSearchContent` / `requireXaiResponseTextAndCitations`).
+///
+/// Walks `output[]` for a `message` entry with an `output_text` block (or an
+/// `output_text` entry directly), collecting `url_citation` annotations.
+/// Falls back to top-level `output_text`; the top-level `citations` string
+/// array, when non-empty, wins over annotation-derived citations. Returns
+/// `None` when no usable text exists.
+fn extract_xai_web_search_content(
+    data: &serde_json::Value,
+) -> Option<(String, Vec<serde_json::Value>)> {
+    fn url_citations(annotations: Option<&serde_json::Value>) -> Vec<String> {
+        let Some(arr) = annotations.and_then(|a| a.as_array()) else {
+            return Vec::new();
+        };
+        let mut seen = std::collections::HashSet::new();
+        arr.iter()
+            .filter_map(|ann| {
+                let ann = ann.as_object()?;
+                if ann.get("type")?.as_str()? != "url_citation" {
+                    return None;
+                }
+                let url = ann.get("url")?.as_str()?.to_string();
+                seen.insert(url.clone()).then_some(url)
+            })
+            .collect()
     }
 
-    let response = client
-        .get(&format!("{}/search", host))
-        .query(&params)
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        return Ok(ToolResult::error(format!(
-            "SearXNG returned status {}",
-            response.status()
-        )));
+    let mut found: Option<(String, Vec<String>)> = None;
+    if let Some(outputs) = data.get("output").and_then(|o| o.as_array()) {
+        'outer: for output in outputs {
+            let Some(output) = output.as_object() else {
+                continue;
+            };
+            let output_type = output.get("type").and_then(|t| t.as_str());
+            if output_type == Some("message") {
+                if let Some(blocks) = output.get("content").and_then(|c| c.as_array()) {
+                    for block in blocks {
+                        let Some(block) = block.as_object() else {
+                            continue;
+                        };
+                        if block.get("type").and_then(|t| t.as_str()) == Some("output_text") {
+                            if let Some(text) =
+                                block.get("text").and_then(|t| t.as_str()).filter(|t| !t.is_empty())
+                            {
+                                found = Some((
+                                    text.to_string(),
+                                    url_citations(block.get("annotations")),
+                                ));
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+            } else if output_type == Some("output_text") {
+                if let Some(text) =
+                    output.get("text").and_then(|t| t.as_str()).filter(|t| !t.is_empty())
+                {
+                    found = Some((text.to_string(), url_citations(output.get("annotations"))));
+                    break;
+                }
+            }
+        }
     }
 
-    let resp: serde_json::Value = response.json().await?;
+    let (text, annotation_citations) = match found {
+        Some(f) => f,
+        None => {
+            let text = data
+                .get("output_text")
+                .and_then(|t| t.as_str())
+                .filter(|t| !t.is_empty())?
+                .to_string();
+            (text, Vec::new())
+        }
+    };
 
-    let results: Vec<SearchResult> = resp["results"]
-        .as_array()
+    // Top-level `citations` (string array), when non-empty, wins over
+    // annotation-derived citations.
+    let top_level: Vec<String> = data
+        .get("citations")
+        .and_then(|c| c.as_array())
         .map(|arr| {
             arr.iter()
-                .take(max_results as usize)
-                .filter_map(|r| {
-                    Some(SearchResult {
-                        title: r["title"].as_str()?.to_string(),
-                        url: r["url"].as_str()?.to_string(),
-                        snippet: r["content"].as_str().unwrap_or("").to_string(),
-                    })
-                })
+                .filter_map(|c| c.as_str())
+                .map(String::from)
                 .collect()
         })
         .unwrap_or_default();
-
-    let output: Vec<serde_json::Value> = results
+    let urls = if top_level.is_empty() { annotation_citations } else { top_level };
+    let citations = urls
         .into_iter()
-        .map(|r| serde_json::json!({ "title": r.title, "url": r.url, "snippet": r.snippet }))
+        .map(|url| serde_json::json!({ "url": url }))
         .collect();
-
-    Ok(ToolResult::json(serde_json::json!({
-        "results": output,
-        "query": query,
-        "provider": "searxng"
-    })))
+    Some((text, citations))
 }
 
 // ============================================================================
@@ -739,59 +821,78 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn search_brave_uses_provided_base_url() {
-        use wiremock::matchers::{method, path, query_param};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+    // ---- xAI Responses parse hardening (v2026.7.1) -------------------------
 
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/res/v1/web/search"))
-            .and(query_param("q", "rustlang"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "web": {
-                    "results": [{
-                        "title": "Rust Programming Language",
-                        "url": "https://www.rust-lang.org",
-                        "description": "Empowering everyone to build reliable and efficient software."
-                    }]
-                }
-            })))
-            .mount(&server)
-            .await;
-
-        let base = format!("{}/res/v1/web/search", server.uri());
-        let result = search_brave("rustlang", 5, "fake-key", None, &base, false)
-            .await
-            .expect("brave search ok");
-
-        let payload = result.json.expect("brave search returns json");
-        let body = payload.to_string();
-        assert!(body.contains("Rust Programming Language"), "body: {body}");
-        assert!(body.contains("rust-lang.org"));
+    #[test]
+    fn xai_extracts_message_output_text_with_annotations() {
+        let data = serde_json::json!({
+            "output": [
+                null,
+                {"type": "reasoning"},
+                {"type": "message", "content": [
+                    null,
+                    {"type": "output_text", "text": "answer", "annotations": [
+                        null,
+                        {"type": "url_citation", "url": "https://a.example.com"},
+                        {"type": "other", "url": "https://ignored.example.com"},
+                        {"type": "url_citation", "url": "https://a.example.com"}
+                    ]}
+                ]}
+            ]
+        });
+        let (text, citations) = extract_xai_web_search_content(&data).unwrap();
+        assert_eq!(text, "answer");
+        assert_eq!(citations.len(), 1, "duplicate + non-url_citation dropped");
+        assert_eq!(citations[0]["url"], "https://a.example.com");
     }
 
-    #[tokio::test]
-    async fn search_brave_diagnostics_flag_does_not_alter_response() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+    #[test]
+    fn xai_falls_back_to_top_level_output_text() {
+        let data = serde_json::json!({
+            "output": "not-an-array",
+            "output_text": "fallback text"
+        });
+        let (text, citations) = extract_xai_web_search_content(&data).unwrap();
+        assert_eq!(text, "fallback text");
+        assert!(citations.is_empty());
+    }
 
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/res/v1/web/search"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "web": {"results": []}
-            })))
-            .mount(&server)
-            .await;
+    #[test]
+    fn xai_top_level_citations_win_over_annotations() {
+        let data = serde_json::json!({
+            "output": [{"type": "output_text", "text": "t", "annotations": [
+                {"type": "url_citation", "url": "https://ann.example.com"}
+            ]}],
+            "citations": ["https://top.example.com"]
+        });
+        let (_, citations) = extract_xai_web_search_content(&data).unwrap();
+        assert_eq!(citations.len(), 1);
+        assert_eq!(citations[0]["url"], "https://top.example.com");
+    }
 
-        let base = format!("{}/res/v1/web/search", server.uri());
-        let off = search_brave("q", 5, "k", None, &base, false).await.unwrap();
-        let on = search_brave("q", 5, "k", None, &base, true).await.unwrap();
+    #[test]
+    fn xai_malformed_payloads_yield_none() {
+        for data in [
+            serde_json::json!({}),
+            serde_json::json!({"output": []}),
+            serde_json::json!({"output": [{"type": "message", "content": null}]}),
+            serde_json::json!({"output": [{"type": "message", "content": [{"type": "output_text", "text": ""}]}]}),
+            serde_json::json!({"output_text": 42}),
+            serde_json::json!(null),
+        ] {
+            assert!(
+                extract_xai_web_search_content(&data).is_none(),
+                "expected None for {data}"
+            );
+        }
+    }
 
-        // The diagnostic flag is a logging-only side effect; the JSON
-        // payload returned must be identical so plugins/agents observing
-        // the result aren't sensitive to operator log preferences.
-        assert_eq!(off.json, on.json);
+    #[test]
+    fn xai_tolerates_null_content_entries() {
+        let data = serde_json::json!({
+            "output": [{"type": "message", "content": [null, 17, {"type": "output_text", "text": "ok"}]}]
+        });
+        let (text, _) = extract_xai_web_search_content(&data).unwrap();
+        assert_eq!(text, "ok");
     }
 }

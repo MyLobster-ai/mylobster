@@ -33,6 +33,10 @@ pub(crate) struct OpenAiRequest {
 pub(crate) struct OpenAiMessage {
     pub role: String,
     pub content: serde_json::Value,
+    /// v2026.6.x: model refusals surface as assistant text instead of being
+    /// dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -57,6 +61,29 @@ pub(crate) struct OpenAiChoice {
 pub(crate) struct OpenAiUsage {
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
+    /// v2026.6.x: cached prompt tokens (input_tokens - cached must clamp ≥0).
+    #[serde(default)]
+    pub prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+    /// v2026.6.x: reasoning tokens reported without double-counting output.
+    #[serde(default)]
+    pub completion_tokens_details: Option<OpenAiCompletionTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct OpenAiPromptTokensDetails {
+    pub cached_tokens: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct OpenAiCompletionTokensDetails {
+    pub reasoning_tokens: Option<u64>,
+}
+
+/// Clamp `input_tokens - cached_tokens` at zero (v2026.6.x: some providers
+/// report cached counts exceeding prompt counts; the uncached remainder must
+/// never underflow).
+pub fn clamp_uncached_input_tokens(input_tokens: u64, cached_tokens: u64) -> u64 {
+    input_tokens.saturating_sub(cached_tokens)
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +101,8 @@ pub(crate) struct OpenAiStreamChoice {
 #[derive(Debug, Deserialize)]
 pub(crate) struct OpenAiStreamDelta {
     pub content: Option<String>,
+    #[serde(default)]
+    pub refusal: Option<String>,
     pub tool_calls: Option<Vec<serde_json::Value>>,
 }
 
@@ -88,6 +117,7 @@ pub(crate) fn convert_messages(messages: Vec<ProviderMessage>) -> Vec<OpenAiMess
         .map(|m| OpenAiMessage {
             role: m.role,
             content: m.content,
+            refusal: None,
             name: m.name,
             tool_call_id: m.tool_call_id,
             tool_calls: m.tool_calls,
@@ -95,17 +125,465 @@ pub(crate) fn convert_messages(messages: Vec<ProviderMessage>) -> Vec<OpenAiMess
         .collect()
 }
 
+/// Normalize parameter-free tool schemas before OpenAI submission
+/// (v2026.5.2, issue #75362): MCP tools whose top-level object `parameters`
+/// (`properties`) is missing, null, or invalid would otherwise be rejected by
+/// OpenAI. Any function tool whose `parameters` is not an object schema — or
+/// is an object schema whose `properties` is missing/null/invalid — gets a
+/// canonical empty object schema.
+pub(crate) fn normalize_parameter_free_tool_schemas(tools: &mut [serde_json::Value]) {
+    for tool in tools.iter_mut() {
+        let Some(function) = tool.get_mut("function").and_then(|f| f.as_object_mut()) else {
+            continue;
+        };
+        let needs_normalization = match function.get("parameters") {
+            None | Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::Object(params)) => {
+                let type_ok = matches!(
+                    params.get("type").and_then(|t| t.as_str()),
+                    Some("object")
+                );
+                let properties_ok =
+                    matches!(params.get("properties"), Some(serde_json::Value::Object(_)));
+                !type_ok || !properties_ok
+            }
+            Some(_) => true,
+        };
+        if needs_normalization {
+            // Preserve declared required entries only when the schema stays
+            // parameter-free — an invalid schema collapses to no params.
+            function.insert(
+                "parameters".to_string(),
+                serde_json::json!({"type": "object", "properties": {}}),
+            );
+        }
+    }
+}
+
+/// Deterministic tool-payload ordering (v2026.7.1): stable-sort tool
+/// definitions by function name so serialized tool payloads are byte-stable
+/// across turns, keeping provider prompt caches warm.
+pub(crate) fn sort_tools_deterministic(tools: &mut [serde_json::Value]) {
+    tools.sort_by(|a, b| {
+        let name = |t: &serde_json::Value| {
+            t.pointer("/function/name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        name(a).cmp(&name(b))
+    });
+}
+
 /// Build an OpenAI-compatible request body.
 pub(crate) fn build_request(request: ProviderRequest, stream: bool) -> OpenAiRequest {
+    let tools = request.tools.map(|mut tools| {
+        normalize_parameter_free_tool_schemas(&mut tools);
+        sort_tools_deterministic(&mut tools);
+        tools
+    });
     OpenAiRequest {
         model: request.model,
         messages: convert_messages(request.messages),
         max_tokens: request.max_tokens,
         temperature: request.temperature,
         stream: if stream { Some(true) } else { None },
-        tools: request.tools,
+        tools,
         tool_choice: request.tool_choice,
     }
+}
+
+// ============================================================================
+// Streaming tool-call argument accumulation (v2026.6.x: parallel tool-call
+// argument buffers must be separated by choice index)
+// ============================================================================
+
+/// Accumulates streamed tool-call fragments into complete tool calls, keyed
+/// by the wire `index` so parallel tool calls never interleave their
+/// argument buffers.
+#[derive(Debug, Default)]
+pub struct ToolCallAccumulator {
+    calls: std::collections::BTreeMap<u64, AccumulatedToolCall>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct AccumulatedToolCall {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+impl ToolCallAccumulator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Push one streamed tool-call delta fragment.
+    pub fn push(&mut self, fragment: &serde_json::Value) {
+        let index = fragment.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+        let entry = self.calls.entry(index).or_default();
+        if let Some(id) = fragment.get("id").and_then(|v| v.as_str()) {
+            if !id.is_empty() {
+                entry.id = Some(id.to_string());
+            }
+        }
+        if let Some(name) = fragment.pointer("/function/name").and_then(|v| v.as_str()) {
+            if !name.is_empty() {
+                entry.name = Some(name.to_string());
+            }
+        }
+        if let Some(args) = fragment.pointer("/function/arguments").and_then(|v| v.as_str()) {
+            entry.arguments.push_str(args);
+        }
+    }
+
+    /// Finish accumulation, returning complete tool calls in index order.
+    pub fn finish(self) -> Vec<serde_json::Value> {
+        self.calls
+            .into_iter()
+            .map(|(index, call)| {
+                serde_json::json!({
+                    "index": index,
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": if call.arguments.is_empty() {
+                            "{}".to_string()
+                        } else {
+                            call.arguments
+                        },
+                    }
+                })
+            })
+            .collect()
+    }
+}
+
+// ============================================================================
+// Azure OpenAI Responses defaults (v2026.5.14)
+// ============================================================================
+
+/// Default Azure OpenAI API version when unset (`preview` routes through the
+/// current `/openai/v1/responses` surface).
+pub const AZURE_OPENAI_DEFAULT_API_VERSION: &str = "preview";
+
+/// Resolve the Azure OpenAI API version, defaulting unset/blank to
+/// `preview`.
+pub fn resolve_azure_api_version(configured: Option<&str>) -> &str {
+    configured
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or(AZURE_OPENAI_DEFAULT_API_VERSION)
+}
+
+/// Build the Azure OpenAI Responses URL for a resource base URL. The
+/// `preview` version routes through `/openai/v1/responses`; pinned GA
+/// versions keep the legacy query-versioned route.
+pub fn azure_responses_url(base_url: &str, api_version: Option<&str>) -> String {
+    let base = base_url.trim_end_matches('/');
+    let version = resolve_azure_api_version(api_version);
+    if version == AZURE_OPENAI_DEFAULT_API_VERSION {
+        format!("{}/openai/v1/responses?api-version={}", base, version)
+    } else {
+        format!("{}/openai/responses?api-version={}", base, version)
+    }
+}
+
+// ============================================================================
+// Compat capability knobs (v2026.5.x–6.x)
+// ============================================================================
+
+/// Per-model OpenAI-compat capability knobs (subset of upstream
+/// `compat`): schema-strict providers declare what they cannot accept and
+/// the transport strips accordingly.
+#[derive(Debug, Clone, Default)]
+pub struct CompatKnobs {
+    /// Reasoning wire format (`openai`/`openrouter`/`deepseek`/`together`/
+    /// `zai`/`qwen`/`qwen-chat-template`).
+    pub thinking_format: Option<String>,
+    /// Strip messages down to `role` + `content` (+`tool_call_id`/`tool_calls`).
+    pub strict_message_keys: bool,
+    /// `false` strips tool payloads entirely before submission.
+    pub supports_tools: bool,
+    /// JSON-schema keywords the model rejects; stripped recursively.
+    pub unsupported_schema_keywords: Vec<String>,
+    /// Opt into `stream_options.include_usage` (Volcengine/Ark reject it by
+    /// default).
+    pub include_usage_opt_in: bool,
+}
+
+impl CompatKnobs {
+    pub fn permissive() -> Self {
+        Self {
+            thinking_format: None,
+            strict_message_keys: false,
+            supports_tools: true,
+            unsupported_schema_keywords: Vec::new(),
+            include_usage_opt_in: false,
+        }
+    }
+}
+
+const STRICT_MESSAGE_KEYS: &[&str] = &["role", "content", "tool_call_id", "tool_calls", "name"];
+
+/// `compat.strictMessageKeys`: strip completion messages down to the
+/// role/content core so schema-strict providers do not reject extra keys.
+pub fn strip_messages_to_role_content(messages: &mut [serde_json::Value]) {
+    for msg in messages.iter_mut() {
+        let Some(obj) = msg.as_object_mut() else {
+            continue;
+        };
+        obj.retain(|key, _| STRICT_MESSAGE_KEYS.contains(&key.as_str()));
+    }
+}
+
+/// `compat.supportsTools: false`: strip tool payloads before submission.
+pub fn strip_tool_payloads(request: &mut ProviderRequest) {
+    request.tools = None;
+    request.tool_choice = None;
+}
+
+fn strip_keywords_recursive(value: &mut serde_json::Value, keywords: &[String]) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.retain(|key, _| !keywords.iter().any(|k| k == key));
+            for child in map.values_mut() {
+                strip_keywords_recursive(child, keywords);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                strip_keywords_recursive(item, keywords);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Model-declared unsupported-schema-keyword stripping: recursively remove
+/// rejected JSON-schema keywords (e.g. `minLength`, `format`) from tool
+/// parameter schemas.
+pub fn strip_unsupported_schema_keywords(
+    tools: &mut [serde_json::Value],
+    keywords: &[String],
+) {
+    if keywords.is_empty() {
+        return;
+    }
+    for tool in tools.iter_mut() {
+        if let Some(params) = tool.pointer_mut("/function/parameters") {
+            strip_keywords_recursive(params, keywords);
+        }
+    }
+}
+
+// ============================================================================
+// Reasoning-effort / schema hardening shared helpers (v2026.5.x–6.x)
+// ============================================================================
+
+/// Shared thinking-level → `reasoning_effort` normalization: maps a
+/// requested level onto the provider's supported set, downgrading/upgrading
+/// to the nearest supported effort (`max` → `xhigh` → `high` …). Returns
+/// `None` for `off` or when nothing is supported.
+pub fn normalize_reasoning_effort(level: &str, supported: &[&str]) -> Option<String> {
+    const ORDER: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+    let level = level.trim().to_ascii_lowercase();
+    if level.is_empty() || level == "off" || supported.is_empty() {
+        return None;
+    }
+    if supported.iter().any(|s| s.eq_ignore_ascii_case(&level)) {
+        return Some(level);
+    }
+    let requested_rank = ORDER.iter().position(|l| *l == level)?;
+    // Walk down from the requested rank to the highest supported level.
+    for rank in (0..=requested_rank).rev() {
+        if supported.iter().any(|s| s.eq_ignore_ascii_case(ORDER[rank])) {
+            return Some(ORDER[rank].to_string());
+        }
+    }
+    // Nothing lower is supported; take the lowest supported level.
+    ORDER
+        .iter()
+        .find(|l| supported.iter().any(|s| s.eq_ignore_ascii_case(l)))
+        .map(|l| l.to_string())
+}
+
+/// DeepSeek schema hardening (v2026.5.x): collapse `anyOf: [<schema>,
+/// {type: "null"}]` pairs into the base schema so schema-strict DeepSeek
+/// deployments accept optional-parameter tools.
+pub fn normalize_anyof_schemas(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let collapsed = map.get("anyOf").and_then(|any_of| {
+                let items = any_of.as_array()?;
+                if items.len() != 2 {
+                    return None;
+                }
+                let is_null = |v: &serde_json::Value| {
+                    v.get("type").and_then(|t| t.as_str()) == Some("null")
+                };
+                match (is_null(&items[0]), is_null(&items[1])) {
+                    (false, true) => Some(items[0].clone()),
+                    (true, false) => Some(items[1].clone()),
+                    _ => None,
+                }
+            });
+            if let Some(serde_json::Value::Object(base)) = collapsed {
+                map.remove("anyOf");
+                for (k, v) in base {
+                    map.entry(k).or_insert(v);
+                }
+            }
+            for child in map.values_mut() {
+                normalize_anyof_schemas(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                normalize_anyof_schemas(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+// ============================================================================
+// Generic OpenAI-compatible embeddings (v2026.6.2 core embedding provider)
+// ============================================================================
+
+/// Embed texts through any OpenAI-compatible `/embeddings` endpoint. This is
+/// the provider-side core of the v2026.6.2 "core OpenAI-compatible embedding
+/// provider" — `memory/embeddings.rs` integration is the memory cluster's
+/// half.
+pub async fn openai_compat_embed(
+    client: &Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    texts: &[String],
+    provider_name: &str,
+) -> Result<Vec<Vec<f32>>> {
+    let resp = client
+        .post(format!("{}/embeddings", base_url.trim_end_matches('/')))
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": model,
+            "input": texts,
+            "encoding_format": "float",
+        }))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("{} embeddings API error ({}): {}", provider_name, status, text);
+    }
+    let payload: serde_json::Value = resp.json().await?;
+    let rows = payload
+        .get("data")
+        .and_then(|d| d.as_array())
+        .ok_or_else(|| anyhow::anyhow!("{}: malformed embeddings response", provider_name))?;
+    let mut indexed: Vec<(usize, Vec<f32>)> = Vec::new();
+    for (fallback_index, row) in rows.iter().enumerate() {
+        let index = row
+            .get("index")
+            .and_then(|i| i.as_u64())
+            .map(|i| i as usize)
+            .unwrap_or(fallback_index);
+        let embedding = row
+            .get("embedding")
+            .and_then(|e| e.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_f64().map(|f| f as f32))
+                    .collect::<Vec<f32>>()
+            })
+            .unwrap_or_default();
+        indexed.push((index, embedding));
+    }
+    indexed.sort_by_key(|(i, _)| *i);
+    Ok(indexed.into_iter().map(|(_, e)| e).collect())
+}
+
+// ============================================================================
+// OpenAI-compatible TTS (v2026.5.2 extraBody passthrough, issue #39900)
+// ============================================================================
+
+/// Build a `/audio/speech` request body for OpenAI-compatible TTS endpoints.
+///
+/// `extra_body` fields are spread into the body last (after the canonical
+/// fields), so custom speech servers can receive provider-specific fields
+/// such as `lang`. Prototype-pollution-style keys are dropped for parity with
+/// the upstream sanitizer.
+///
+/// NOTE (cross-cluster handoff): this is the provider-side plumbing only —
+/// the TTS pipeline (voice-note queueing, directives) is owned elsewhere and
+/// should call `build_speech_request_body` + `openai_compat_speech`.
+pub fn build_speech_request_body(
+    model: &str,
+    input: &str,
+    voice: &str,
+    response_format: Option<&str>,
+    speed: Option<f64>,
+    instructions: Option<&str>,
+    extra_body: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    body.insert("model".to_string(), serde_json::Value::String(model.to_string()));
+    body.insert("input".to_string(), serde_json::Value::String(input.to_string()));
+    body.insert("voice".to_string(), serde_json::Value::String(voice.to_string()));
+    if let Some(format) = response_format {
+        body.insert(
+            "response_format".to_string(),
+            serde_json::Value::String(format.to_string()),
+        );
+    }
+    if let Some(speed) = speed {
+        if let Some(number) = serde_json::Number::from_f64(speed) {
+            body.insert("speed".to_string(), serde_json::Value::Number(number));
+        }
+    }
+    if let Some(instructions) = instructions {
+        body.insert(
+            "instructions".to_string(),
+            serde_json::Value::String(instructions.to_string()),
+        );
+    }
+    if let Some(extra) = extra_body {
+        for (key, value) in extra {
+            if key == "__proto__" || key == "constructor" || key == "prototype" {
+                continue;
+            }
+            body.insert(key.clone(), value.clone());
+        }
+    }
+    serde_json::Value::Object(body)
+}
+
+/// POST a speech request to an OpenAI-compatible `/audio/speech` endpoint and
+/// return the audio bytes.
+pub async fn openai_compat_speech(
+    client: &Client,
+    base_url: &str,
+    api_key: &str,
+    body: &serde_json::Value,
+    provider_name: &str,
+) -> Result<Vec<u8>> {
+    let resp = client
+        .post(format!("{}/audio/speech", base_url.trim_end_matches('/')))
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(body)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("{} TTS API error ({}): {}", provider_name, status, text);
+    }
+    Ok(resp.bytes().await?.to_vec())
 }
 
 /// Parse an OpenAI-compatible response into our ProviderResponse.
@@ -121,6 +599,16 @@ pub(crate) fn parse_openai_response(api_resp: OpenAiResponse) -> Result<Provider
     if let Some(text) = choice.message.content.as_str() {
         if !text.is_empty() {
             content.push(ContentBlock::Text(text.to_string()));
+        }
+    }
+
+    // v2026.6.x: surface refusals as assistant text so the turn is visible
+    // instead of coming back empty.
+    if content.is_empty() {
+        if let Some(refusal) = choice.message.refusal.as_deref() {
+            if !refusal.is_empty() {
+                content.push(ContentBlock::Text(refusal.to_string()));
+            }
         }
     }
 
@@ -152,15 +640,27 @@ pub(crate) fn parse_openai_response(api_resp: OpenAiResponse) -> Result<Provider
     let usage = api_resp.usage.unwrap_or(OpenAiUsage {
         prompt_tokens: None,
         completion_tokens: None,
+        prompt_tokens_details: None,
+        completion_tokens_details: None,
     });
+
+    let cached_tokens = usage
+        .prompt_tokens_details
+        .as_ref()
+        .and_then(|d| d.cached_tokens);
+    // v2026.6.x: uncached input = prompt - cached, clamped at zero.
+    let input_tokens = match (usage.prompt_tokens, cached_tokens) {
+        (Some(prompt), Some(cached)) => Some(clamp_uncached_input_tokens(prompt, cached)),
+        (prompt, _) => prompt,
+    };
 
     Ok(ProviderResponse {
         content,
         stop_reason: choice.finish_reason,
         usage: crate::gateway::TokenUsage {
-            input_tokens: usage.prompt_tokens,
+            input_tokens,
             output_tokens: usage.completion_tokens,
-            cache_read_tokens: None,
+            cache_read_tokens: cached_tokens,
             cache_write_tokens: None,
         },
     })
@@ -264,32 +764,48 @@ pub(crate) async fn openai_compat_stream_chat(
             if line.is_empty() || line.starts_with(':') {
                 continue;
             }
-            if let Some(data) = line.strip_prefix("data: ") {
-                if data == "[DONE]" {
-                    break;
+            // Replay/streaming safety (v2026.7.1, #96503): some non-conforming
+            // OpenAI-compatible providers return event streams mislabeled as
+            // JSON — chunk lines arrive without the `data: ` prefix. Accept
+            // bare JSON chunk lines instead of dropping the whole stream.
+            let data = match line.strip_prefix("data: ") {
+                Some(data) => data,
+                None if line.starts_with('{') || line == "[DONE]" => line,
+                None => continue,
+            };
+            if data == "[DONE]" {
+                break;
+            }
+            match serde_json::from_str::<OpenAiStreamChunk>(data) {
+                Ok(chunk) => {
+                    if let Some(usage) = chunk.usage {
+                        total_input = usage.prompt_tokens;
+                        total_output = usage.completion_tokens;
+                    }
+                    for choice in chunk.choices {
+                        if let Some(content) = choice.delta.content {
+                            if !content.is_empty() {
+                                let _ = tx.send(StreamEvent::Delta(content)).await;
+                            }
+                        }
+                        // v2026.6.x: a refusal arrives on its own delta field
+                        // with `content` null. Surface it as assistant text —
+                        // matching the non-streaming path — otherwise a refused
+                        // turn streams as a completely empty reply.
+                        if let Some(refusal) = choice.delta.refusal {
+                            if !refusal.is_empty() {
+                                let _ = tx.send(StreamEvent::Delta(refusal)).await;
+                            }
+                        }
+                        if let Some(tool_calls) = choice.delta.tool_calls {
+                            for tc in tool_calls {
+                                let _ = tx.send(StreamEvent::ToolCall(tc)).await;
+                            }
+                        }
+                    }
                 }
-                match serde_json::from_str::<OpenAiStreamChunk>(data) {
-                    Ok(chunk) => {
-                        if let Some(usage) = chunk.usage {
-                            total_input = usage.prompt_tokens;
-                            total_output = usage.completion_tokens;
-                        }
-                        for choice in chunk.choices {
-                            if let Some(content) = choice.delta.content {
-                                if !content.is_empty() {
-                                    let _ = tx.send(StreamEvent::Delta(content)).await;
-                                }
-                            }
-                            if let Some(tool_calls) = choice.delta.tool_calls {
-                                for tc in tool_calls {
-                                    let _ = tx.send(StreamEvent::ToolCall(tc)).await;
-                                }
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        // Skip unparseable chunks
-                    }
+                Err(_) => {
+                    // Skip unparseable chunks
                 }
             }
         }
@@ -914,6 +1430,193 @@ mod tests {
         assert!(!saw_after, "[DONE] sentinel must terminate the stream");
     }
 
+    // ------------------------------------------------------------------
+    // MCP parameter-free tool schema normalization (v2026.5.2 #75362)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn normalizes_missing_parameters() {
+        let mut tools = vec![json!({"type": "function", "function": {"name": "f"}})];
+        normalize_parameter_free_tool_schemas(&mut tools);
+        assert_eq!(
+            tools[0]["function"]["parameters"],
+            json!({"type": "object", "properties": {}})
+        );
+    }
+
+    #[test]
+    fn normalizes_null_and_invalid_parameters() {
+        let mut tools = vec![
+            json!({"type": "function", "function": {"name": "a", "parameters": null}}),
+            json!({"type": "function", "function": {"name": "b", "parameters": "bogus"}}),
+            json!({"type": "function", "function": {"name": "c",
+                "parameters": {"type": "object", "properties": null}}}),
+            json!({"type": "function", "function": {"name": "d",
+                "parameters": {"properties": {}}}}),
+        ];
+        normalize_parameter_free_tool_schemas(&mut tools);
+        for tool in &tools {
+            assert_eq!(
+                tool["function"]["parameters"],
+                json!({"type": "object", "properties": {}}),
+                "tool {} should be normalized",
+                tool["function"]["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn leaves_valid_parameter_schemas_untouched() {
+        let schema = json!({"type": "object", "properties": {"x": {"type": "string"}},
+            "required": ["x"]});
+        let mut tools =
+            vec![json!({"type": "function", "function": {"name": "f", "parameters": schema}})];
+        normalize_parameter_free_tool_schemas(&mut tools);
+        assert_eq!(
+            tools[0]["function"]["parameters"]["properties"]["x"]["type"],
+            "string"
+        );
+        assert_eq!(tools[0]["function"]["parameters"]["required"][0], "x");
+    }
+
+    #[test]
+    fn ignores_non_function_tools() {
+        let mut tools = vec![json!({"type": "web_search"})];
+        normalize_parameter_free_tool_schemas(&mut tools);
+        assert_eq!(tools[0], json!({"type": "web_search"}));
+    }
+
+    #[test]
+    fn build_request_normalizes_tool_schemas() {
+        let mut r = req("gpt-4o");
+        r.tools = Some(vec![json!({"type": "function", "function": {"name": "f"}})]);
+        let body = serde_json::to_value(build_request(r, false)).unwrap();
+        assert_eq!(
+            body["tools"][0]["function"]["parameters"],
+            json!({"type": "object", "properties": {}})
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // TTS extra_body passthrough (v2026.5.2 #39900)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn speech_body_includes_canonical_fields() {
+        let body = build_speech_request_body("tts-1", "hello", "alloy", Some("mp3"), None, None, None);
+        assert_eq!(body["model"], "tts-1");
+        assert_eq!(body["input"], "hello");
+        assert_eq!(body["voice"], "alloy");
+        assert_eq!(body["response_format"], "mp3");
+        assert!(body.get("speed").is_none());
+        assert!(body.get("instructions").is_none());
+    }
+
+    #[test]
+    fn speech_body_spreads_extra_body_fields() {
+        let extra = json!({"lang": "id", "emotion": "warm"});
+        let body = build_speech_request_body(
+            "tts-1",
+            "halo",
+            "alloy",
+            Some("mp3"),
+            Some(1.1),
+            Some("gently"),
+            extra.as_object(),
+        );
+        assert_eq!(body["lang"], "id");
+        assert_eq!(body["emotion"], "warm");
+        assert_eq!(body["speed"], 1.1);
+        assert_eq!(body["instructions"], "gently");
+    }
+
+    #[test]
+    fn speech_body_extra_body_overrides_canonical_fields() {
+        // Upstream spreads extraBody last: custom servers may override
+        // canonical fields.
+        let extra = json!({"voice": "custom-voice"});
+        let body =
+            build_speech_request_body("tts-1", "x", "alloy", None, None, None, extra.as_object());
+        assert_eq!(body["voice"], "custom-voice");
+    }
+
+    #[test]
+    fn speech_body_drops_prototype_pollution_keys() {
+        let extra = json!({"__proto__": {"x": 1}, "constructor": 1, "prototype": 2, "ok": 3});
+        let body =
+            build_speech_request_body("tts-1", "x", "alloy", None, None, None, extra.as_object());
+        assert!(body.get("__proto__").is_none());
+        assert!(body.get("constructor").is_none());
+        assert!(body.get("prototype").is_none());
+        assert_eq!(body["ok"], 3);
+    }
+
+    #[tokio::test]
+    async fn speech_posts_to_audio_speech_and_returns_bytes() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/speech"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![1u8, 2, 3]))
+            .mount(&server)
+            .await;
+        let client = Client::new();
+        let body = build_speech_request_body("tts-1", "hi", "alloy", None, None, None, None);
+        let bytes = openai_compat_speech(&client, &server.uri(), "k", &body, "OpenAI")
+            .await
+            .unwrap();
+        assert_eq!(bytes, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn speech_error_includes_provider_and_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/speech"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad voice"))
+            .mount(&server)
+            .await;
+        let client = Client::new();
+        let body = build_speech_request_body("tts-1", "hi", "alloy", None, None, None, None);
+        let err = openai_compat_speech(&client, &server.uri(), "k", &body, "DeepInfra")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("400"));
+        assert!(err.contains("DeepInfra"));
+    }
+
+    // ------------------------------------------------------------------
+    // Streaming safety: bare-JSON chunk lines (v2026.7.1 #96503)
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn stream_accepts_bare_json_chunk_lines() {
+        let body = concat!(
+            "{\"choices\":[{\"delta\":{\"content\":\"mis\"}}]}\n",
+            "{\"choices\":[{\"delta\":{\"content\":\"labeled\"}}]}\n",
+            "[DONE]\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(sse_response(body))
+            .mount(&server)
+            .await;
+        let client = Client::new();
+        let rx = openai_compat_stream_chat(&client, &server.uri(), "k", req("gpt-4o"), "OpenAI")
+            .await
+            .unwrap();
+        let events = collect_stream(rx).await;
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Delta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["mis", "labeled"]);
+    }
+
     #[tokio::test]
     async fn stream_emits_error_on_non_2xx() {
         let server = MockServer::start().await;
@@ -934,5 +1637,220 @@ mod tests {
             }
             other => panic!("expected Error last, got {:?}", other.is_some()),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // v2026.7.1 — refusal, usage clamp, accumulator, azure, knobs, embed
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn refusal_surfaces_as_assistant_text() {
+        let server = mock_with_body(json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": null,
+                            "refusal": "I cannot help with that."},
+                "finish_reason": "stop"
+            }]
+        }))
+        .await;
+        let client = Client::new();
+        let r = openai_compat_chat(&client, &server.uri(), "k", req("gpt-5.6"), "OpenAI")
+            .await
+            .unwrap();
+        assert_eq!(r.content_text(), "I cannot help with that.");
+    }
+
+    #[tokio::test]
+    async fn stream_refusal_deltas_surface_as_text() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"refusal\":\"no\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(sse_response(body))
+            .mount(&server)
+            .await;
+        let client = Client::new();
+        let rx = openai_compat_stream_chat(&client, &server.uri(), "k", req("gpt-5.6"), "OpenAI")
+            .await
+            .unwrap();
+        let events = collect_stream(rx).await;
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Delta(t) if t == "no")));
+    }
+
+    #[tokio::test]
+    async fn cached_tokens_clamp_and_report() {
+        let server = mock_with_body(json!({
+            "choices": [{"message": {"role": "assistant", "content": "x"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 1,
+                      "prompt_tokens_details": {"cached_tokens": 25}}
+        }))
+        .await;
+        let client = Client::new();
+        let r = openai_compat_chat(&client, &server.uri(), "k", req("gpt-5.6"), "OpenAI")
+            .await
+            .unwrap();
+        // 10 - 25 clamps to 0 instead of underflowing.
+        assert_eq!(r.usage.input_tokens, Some(0));
+        assert_eq!(r.usage.cache_read_tokens, Some(25));
+    }
+
+    #[test]
+    fn clamp_uncached_never_underflows() {
+        assert_eq!(clamp_uncached_input_tokens(100, 30), 70);
+        assert_eq!(clamp_uncached_input_tokens(10, 25), 0);
+    }
+
+    #[test]
+    fn tool_call_accumulator_separates_parallel_buffers() {
+        let mut acc = ToolCallAccumulator::new();
+        acc.push(&json!({"index": 0, "id": "call_a", "function": {"name": "alpha", "arguments": "{\"x\":"}}));
+        acc.push(&json!({"index": 1, "id": "call_b", "function": {"name": "beta", "arguments": "{\"y\":"}}));
+        acc.push(&json!({"index": 0, "function": {"arguments": "1}"}}));
+        acc.push(&json!({"index": 1, "function": {"arguments": "2}"}}));
+        let calls = acc.finish();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["function"]["arguments"], "{\"x\":1}");
+        assert_eq!(calls[1]["function"]["arguments"], "{\"y\":2}");
+        assert_eq!(calls[0]["id"], "call_a");
+        assert_eq!(calls[1]["function"]["name"], "beta");
+    }
+
+    #[test]
+    fn tool_call_accumulator_defaults_empty_args() {
+        let mut acc = ToolCallAccumulator::new();
+        acc.push(&json!({"index": 0, "id": "c", "function": {"name": "f"}}));
+        let calls = acc.finish();
+        assert_eq!(calls[0]["function"]["arguments"], "{}");
+    }
+
+    #[test]
+    fn deterministic_tool_ordering_sorts_by_name() {
+        let mut r = req("gpt-5.6");
+        r.tools = Some(vec![
+            json!({"type": "function", "function": {"name": "zeta", "parameters": {"type": "object", "properties": {}}}}),
+            json!({"type": "function", "function": {"name": "alpha", "parameters": {"type": "object", "properties": {}}}}),
+        ]);
+        let body = serde_json::to_value(build_request(r, false)).unwrap();
+        assert_eq!(body["tools"][0]["function"]["name"], "alpha");
+        assert_eq!(body["tools"][1]["function"]["name"], "zeta");
+    }
+
+    #[test]
+    fn azure_api_version_defaults_to_preview() {
+        assert_eq!(resolve_azure_api_version(None), "preview");
+        assert_eq!(resolve_azure_api_version(Some("  ")), "preview");
+        assert_eq!(resolve_azure_api_version(Some("2025-04-01")), "2025-04-01");
+    }
+
+    #[test]
+    fn azure_preview_routes_openai_v1_responses() {
+        assert_eq!(
+            azure_responses_url("https://res.openai.azure.com/", None),
+            "https://res.openai.azure.com/openai/v1/responses?api-version=preview"
+        );
+        assert_eq!(
+            azure_responses_url("https://res.openai.azure.com", Some("2025-04-01")),
+            "https://res.openai.azure.com/openai/responses?api-version=2025-04-01"
+        );
+    }
+
+    #[test]
+    fn strict_message_keys_strips_extra_fields() {
+        let mut msgs = vec![json!({"role": "assistant", "content": "x",
+            "reasoning_content": "r", "cache_control": {"type": "ephemeral"}})];
+        strip_messages_to_role_content(&mut msgs);
+        let obj = msgs[0].as_object().unwrap();
+        assert!(obj.contains_key("role"));
+        assert!(obj.contains_key("content"));
+        assert!(!obj.contains_key("reasoning_content"));
+        assert!(!obj.contains_key("cache_control"));
+    }
+
+    #[test]
+    fn supports_tools_false_strips_tool_payloads() {
+        let mut r = req("m");
+        r.tools = Some(vec![json!({"type": "function", "function": {"name": "f"}})]);
+        r.tool_choice = Some(json!("auto"));
+        strip_tool_payloads(&mut r);
+        assert!(r.tools.is_none());
+        assert!(r.tool_choice.is_none());
+    }
+
+    #[test]
+    fn unsupported_schema_keywords_stripped_recursively() {
+        let mut tools = vec![json!({"type": "function", "function": {"name": "f",
+            "parameters": {"type": "object", "properties": {
+                "a": {"type": "string", "minLength": 2,
+                      "items": {"type": "string", "format": "uri"}}}}}})];
+        strip_unsupported_schema_keywords(
+            &mut tools,
+            &["minLength".to_string(), "format".to_string()],
+        );
+        assert!(tools[0].pointer("/function/parameters/properties/a/minLength").is_none());
+        assert!(tools[0]
+            .pointer("/function/parameters/properties/a/items/format")
+            .is_none());
+    }
+
+    #[test]
+    fn reasoning_effort_normalization_walks_supported_set() {
+        let supported = ["low", "medium", "high"];
+        assert_eq!(normalize_reasoning_effort("high", &supported).as_deref(), Some("high"));
+        // max downgrades to nearest supported (high).
+        assert_eq!(normalize_reasoning_effort("max", &supported).as_deref(), Some("high"));
+        assert_eq!(normalize_reasoning_effort("xhigh", &supported).as_deref(), Some("high"));
+        // minimal upgrades to lowest supported when nothing lower exists.
+        assert_eq!(normalize_reasoning_effort("minimal", &supported).as_deref(), Some("low"));
+        assert_eq!(normalize_reasoning_effort("off", &supported), None);
+        assert_eq!(normalize_reasoning_effort("high", &[]), None);
+    }
+
+    #[test]
+    fn anyof_null_pairs_collapse_to_base_schema() {
+        let mut schema = json!({"type": "object", "properties": {
+            "opt": {"anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}]}}});
+        normalize_anyof_schemas(&mut schema);
+        let opt = schema.pointer("/properties/opt").unwrap();
+        assert!(opt.get("anyOf").is_none());
+        assert_eq!(opt["type"], "string");
+    }
+
+    #[test]
+    fn anyof_multi_variant_untouched() {
+        let mut schema = json!({"anyOf": [{"type": "string"}, {"type": "number"}]});
+        normalize_anyof_schemas(&mut schema);
+        assert!(schema.get("anyOf").is_some());
+    }
+
+    #[tokio::test]
+    async fn generic_embed_returns_ordered_vectors() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    {"index": 1, "embedding": [0.3, 0.4]},
+                    {"index": 0, "embedding": [0.1, 0.2]}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let client = Client::new();
+        let out = openai_compat_embed(
+            &client,
+            &server.uri(),
+            "k",
+            "text-embedding-3-small",
+            &["a".to_string(), "b".to_string()],
+            "OpenAI",
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, vec![vec![0.1, 0.2], vec![0.3, 0.4]]);
     }
 }
